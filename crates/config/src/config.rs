@@ -1,9 +1,11 @@
 //! Configuration files.
+use alloy_primitives::Address;
 use reth_network_types::{PeersConfig, SessionsConfig};
 use reth_prune_types::{PruneModes, MINIMUM_UNWIND_SAFE_DISTANCE};
 use reth_stages_types::ExecutionStageThresholds;
 use reth_static_file_types::{StaticFileMap, StaticFileSegment};
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -14,6 +16,12 @@ const EXTENSION: &str = "toml";
 
 /// The default prune block interval
 pub const DEFAULT_BLOCK_INTERVAL: usize = 5;
+
+/// Default number of blocks for retaining BAL history in partial-state mode.
+pub const DEFAULT_PARTIAL_STATE_BAL_RETENTION: u64 = 256;
+
+/// Minimum BAL retention window for partial-state mode.
+pub const MIN_PARTIAL_STATE_BAL_RETENTION: u64 = 64;
 
 /// Configuration for the reth node.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -32,12 +40,66 @@ pub struct Config {
     /// Configuration for static files.
     #[cfg_attr(feature = "serde", serde(default))]
     pub static_files: StaticFilesConfig,
+    /// Configuration for partial-state mode.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub partial_state: PartialStateConfig,
 }
 
 impl Config {
     /// Sets the pruning configuration.
     pub fn set_prune_config(&mut self, prune_config: PruneConfig) {
         self.prune = prune_config;
+    }
+
+    /// Sets the partial-state configuration.
+    pub fn set_partial_state_config(&mut self, partial_state: PartialStateConfig) {
+        self.partial_state = partial_state;
+    }
+}
+
+/// Configuration for partial-state mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+pub struct PartialStateConfig {
+    /// Enables partial-state mode.
+    pub enabled: bool,
+    /// Contracts whose storage and bytecode should be retained.
+    pub contracts: BTreeSet<Address>,
+    /// Optional JSON contract list path.
+    pub contracts_file: Option<PathBuf>,
+    /// Number of recent blocks of BAL history to retain.
+    pub bal_retention: u64,
+}
+
+impl Default for PartialStateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            contracts: BTreeSet::new(),
+            contracts_file: None,
+            bal_retention: DEFAULT_PARTIAL_STATE_BAL_RETENTION,
+        }
+    }
+}
+
+impl PartialStateConfig {
+    /// Returns whether this configuration is the default one.
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// Validates the partial-state configuration.
+    pub fn validate(&self) -> eyre::Result<()> {
+        if self.enabled && self.bal_retention < MIN_PARTIAL_STATE_BAL_RETENTION {
+            eyre::bail!(
+                "partial-state BAL retention must be at least {} blocks, got {}",
+                MIN_PARTIAL_STATE_BAL_RETENTION,
+                self.bal_retention
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -645,7 +707,12 @@ mod tests {
     use reth_prune_types::{
         PruneMode, PruneModes, ReceiptsLogPruneConfig, MINIMUM_UNWIND_SAFE_DISTANCE,
     };
-    use std::{collections::BTreeMap, path::Path, str::FromStr, time::Duration};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        path::{Path, PathBuf},
+        str::FromStr,
+        time::Duration,
+    };
 
     fn with_tempdir(filename: &str, proc: fn(&std::path::Path)) {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -769,6 +836,31 @@ mod tests {
 
             // Compare the loaded config with the original config
             assert_eq!(config, loaded_config);
+        })
+    }
+
+    #[test]
+    fn test_load_partial_state_config() {
+        with_tempdir("config-load-partial-state-test", |config_path| {
+            let mut config = Config::default();
+            config.partial_state.enabled = true;
+            config.partial_state.contracts = BTreeSet::from([
+                Address::from_str("0x0000000000000000000000000000000000000001").unwrap(),
+                Address::from_str("0x0000000000000000000000000000000000000002").unwrap(),
+            ]);
+            config.partial_state.contracts_file = Some(PathBuf::from("partial-contracts.json"));
+            config.partial_state.bal_retention = 128;
+
+            std::fs::write(
+                config_path,
+                toml::to_string(&config).expect("Failed to serialize config"),
+            )
+            .expect("Failed to write config file");
+
+            let loaded_config = Config::from_path(config_path).unwrap();
+
+            assert_eq!(config, loaded_config);
+            loaded_config.partial_state.validate().unwrap();
         })
     }
 

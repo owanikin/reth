@@ -141,12 +141,23 @@ impl LaunchContext {
     /// Attaches both the `NodeConfig` and the loaded `reth.toml` config to the launch context.
     pub fn with_loaded_toml_config<ChainSpec>(
         self,
-        config: NodeConfig<ChainSpec>,
+        mut config: NodeConfig<ChainSpec>,
     ) -> eyre::Result<LaunchContextWith<WithConfigs<ChainSpec>>>
     where
         ChainSpec: EthChainSpec + reth_chainspec::EthereumHardforks,
     {
         let toml_config = self.load_toml_config(&config)?;
+        config.partial_state =
+            config.partial_state.merge_with_toml_config(&toml_config.partial_state)?;
+        if config.partial_state.is_enabled() {
+            info!(
+                target: "reth::cli",
+                tracked_contracts = config.partial_state.contracts.len(),
+                bal_retention = config.partial_state.bal_retention(),
+                contracts_file = ?config.partial_state.contracts_file,
+                "Partial-state mode configured"
+            );
+        }
         Ok(self.with(WithConfigs { config, toml_config }))
     }
 

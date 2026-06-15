@@ -30,6 +30,7 @@ alloy-eips.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-rpc-types-engine.workspace = true
+alloy-rlp.workspace = true
 
 auto_impl.workspace = true
 serde_json = { workspace = true, optional = true }
@@ -47,6 +48,7 @@ std = [
     "alloy-consensus/std",
     "alloy-eips/std",
     "alloy-primitives/std",
+    "alloy-rlp/std",
     "alloy-rpc-types-engine/std",
     "reth-primitives-traits/std",
     "reth-stages-types/std",

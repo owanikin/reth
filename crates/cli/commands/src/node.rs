@@ -10,8 +10,8 @@ use reth_node_builder::NodeBuilder;
 use reth_node_core::{
     args::{
         DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, EraArgs, MetricArgs,
-        NetworkArgs, PayloadBuilderArgs, PruningArgs, RpcServerArgs, StaticFilesArgs, StorageArgs,
-        TxPoolArgs,
+        NetworkArgs, PartialStateArgs, PayloadBuilderArgs, PruningArgs, RpcServerArgs,
+        StaticFilesArgs, StorageArgs, TxPoolArgs,
     },
     node_config::NodeConfig,
     version,
@@ -119,6 +119,10 @@ pub struct NodeCommand<C: ChainSpecParser, Ext: clap::Args + fmt::Debug = NoArgs
     #[command(flatten, next_help_heading = "Storage")]
     pub storage: StorageArgs,
 
+    /// Partial-state mode arguments.
+    #[command(flatten)]
+    pub partial_state: PartialStateArgs,
+
     /// Additional cli arguments
     #[command(flatten, next_help_heading = "Extension")]
     pub ext: Ext,
@@ -175,10 +179,12 @@ where
             era,
             static_files,
             storage,
+            partial_state,
             ext,
         } = self;
 
         engine.validate()?;
+        let partial_state = partial_state.into_config()?;
 
         // set up node config
         let mut node_config = NodeConfig {
@@ -199,13 +205,14 @@ where
             era,
             static_files,
             storage,
+            partial_state,
         };
 
         let data_dir = node_config.datadir();
         let db_path = data_dir.db();
 
         tracing::info!(target: "reth::cli", path = ?db_path, "Opening database");
-        let database = init_db(db_path.clone(), self.db.database_args())?.with_metrics();
+        let database = init_db(db_path.clone(), node_config.db.database_args())?.with_metrics();
 
         if with_unused_ports {
             node_config = node_config.with_unused_ports();
@@ -353,6 +360,23 @@ mod tests {
 
         let db_path = data_dir.db();
         assert_eq!(db_path, Path::new("my/custom/path/db"));
+    }
+
+    #[test]
+    fn parse_partial_state_args() {
+        let cmd: NodeCommand<EthereumChainSpecParser> = NodeCommand::try_parse_args_from([
+            "reth",
+            "--partial-state",
+            "--partial-state.contracts",
+            "0x0000000000000000000000000000000000000001,0x0000000000000000000000000000000000000002",
+            "--partial-state.bal-retention",
+            "128",
+        ])
+        .unwrap();
+
+        assert!(cmd.partial_state.enabled);
+        assert_eq!(cmd.partial_state.contracts.len(), 2);
+        assert_eq!(cmd.partial_state.bal_retention, 128);
     }
 
     #[test]

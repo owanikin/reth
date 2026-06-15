@@ -1150,6 +1150,21 @@ Storage:
           [default: true]
           [possible values: true, false]
 
+Partial State:
+      --partial-state
+          Enable partial-state mode
+
+      --partial-state.contracts <ADDRESS>
+          Comma-separated contract addresses whose storage and bytecode should be retained
+
+      --partial-state.contracts-file <PATH>
+          JSON file containing contract addresses to retain
+
+      --partial-state.bal-retention <BLOCKS>
+          Number of recent blocks of BAL history to retain for reorg handling
+
+          [default: 256]
+
 Logging:
       --log.stdout.format <FORMAT>
           The format to use for logs written to stdout

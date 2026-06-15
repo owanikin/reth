@@ -17,6 +17,9 @@ reth-prune-types.workspace = true
 reth-stages-types.workspace = true
 reth-static-file-types.workspace = true
 
+# ethereum
+alloy-primitives.workspace = true
+
 # serde
 serde = { workspace = true, optional = true }
 humantime-serde = { workspace = true, optional = true }

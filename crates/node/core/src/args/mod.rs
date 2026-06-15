@@ -80,5 +80,9 @@ pub use static_files::{StaticFilesArgs, MINIMAL_BLOCKS_PER_FILE};
 mod storage;
 pub use storage::{DefaultStorageValues, StorageArgs};
 
+/// `PartialStateArgs` for configuring partial-state mode.
+mod partial_state;
+pub use partial_state::{PartialStateArgs, PartialStateConfig};
+
 mod error;
 pub mod types;

@@ -2,15 +2,15 @@
 
 use crate::{
     args::{
-        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, NetworkArgs, PayloadBuilderArgs,
-        PruningArgs, RpcServerArgs, StaticFilesArgs, StorageArgs, TxPoolArgs,
+        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, NetworkArgs, PartialStateConfig,
+        PayloadBuilderArgs, PruningArgs, RpcServerArgs, StaticFilesArgs, StorageArgs, TxPoolArgs,
     },
     dirs::{ChainPath, DataDirPath},
     utils::get_single_header,
 };
 use alloy_consensus::BlockHeader;
 use alloy_eips::BlockHashOrNumber;
-use alloy_primitives::{BlockNumber, B256, U256};
+use alloy_primitives::{Address, BlockNumber, B256, U256};
 use eyre::eyre;
 use reth_chainspec::{ChainSpec, EthChainSpec, MAINNET};
 use reth_config::config::PruneConfig;
@@ -154,6 +154,9 @@ pub struct NodeConfig<ChainSpec> {
 
     /// All storage related arguments with --storage prefix
     pub storage: StorageArgs,
+
+    /// Partial-state mode configuration.
+    pub partial_state: PartialStateConfig,
 }
 
 impl NodeConfig<ChainSpec> {
@@ -186,6 +189,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             era: EraArgs::default(),
             static_files: StaticFilesArgs::default(),
             storage: StorageArgs::default(),
+            partial_state: PartialStateConfig::default(),
         }
     }
 
@@ -261,6 +265,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             era,
             static_files,
             storage,
+            partial_state,
             ..
         } = self;
         NodeConfig {
@@ -281,6 +286,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             era,
             static_files,
             storage,
+            partial_state,
         }
     }
 
@@ -361,6 +367,32 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
     pub const fn with_storage(mut self, storage: StorageArgs) -> Self {
         self.storage = storage;
         self
+    }
+
+    /// Set the partial-state configuration for the node.
+    pub fn with_partial_state(mut self, partial_state: PartialStateConfig) -> Self {
+        self.partial_state = partial_state;
+        self
+    }
+
+    /// Returns the partial-state configuration.
+    pub const fn partial_state(&self) -> &PartialStateConfig {
+        &self.partial_state
+    }
+
+    /// Returns whether partial-state mode is enabled.
+    pub const fn is_partial_state_enabled(&self) -> bool {
+        self.partial_state.is_enabled()
+    }
+
+    /// Returns whether the given contract is tracked by this node.
+    pub fn is_partial_state_contract_tracked(&self, address: &Address) -> bool {
+        self.partial_state.is_contract_tracked(address)
+    }
+
+    /// Returns the configured partial-state BAL retention window.
+    pub const fn partial_state_bal_retention(&self) -> u64 {
+        self.partial_state.bal_retention()
     }
 
     /// Returns pruning configuration.
@@ -579,6 +611,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             era: self.era,
             static_files: self.static_files,
             storage: self.storage,
+            partial_state: self.partial_state,
         }
     }
 
@@ -621,6 +654,7 @@ impl<ChainSpec> Clone for NodeConfig<ChainSpec> {
             era: self.era.clone(),
             static_files: self.static_files,
             storage: self.storage,
+            partial_state: self.partial_state.clone(),
         }
     }
 }
