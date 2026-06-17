@@ -3,7 +3,7 @@ use alloy_eips::{
     eip7928::{bal::DecodedBal, compute_block_access_list_hash, BlockAccessList},
     NumHash,
 };
-use alloy_primitives::{Address, BlockHash, BlockNumber, Bytes, Sealed, B256};
+use alloy_primitives::{keccak256, Address, BlockHash, BlockNumber, Bytes, Sealed, B256};
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
 
 use crate::{BalStoreHandle, SealedBal};
@@ -22,6 +22,18 @@ pub trait ContractFilter: Send + Sync {
     /// Returns `true` if bytecode for this contract should be downloaded and retained.
     fn should_sync_code(&self, address: &Address) -> bool;
 
+    /// Returns `true` if storage for the account hash should be downloaded and retained.
+    ///
+    /// Snap sync range responses identify accounts by `keccak256(address)`, so partial-state
+    /// filtering needs hash-based checks before the account address is available.
+    fn should_sync_storage_by_hash(&self, account_hash: &B256) -> bool;
+
+    /// Returns `true` if bytecode for the account hash should be downloaded and retained.
+    ///
+    /// Snap sync range responses identify accounts by `keccak256(address)`, so partial-state
+    /// filtering needs hash-based checks before the account address is available.
+    fn should_sync_code_by_hash(&self, account_hash: &B256) -> bool;
+
     /// Returns `true` if this contract is tracked by the partial-state node.
     fn is_tracked(&self, address: &Address) -> bool;
 }
@@ -30,12 +42,16 @@ pub trait ContractFilter: Send + Sync {
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct ConfiguredContractFilter {
     contracts: BTreeSet<Address>,
+    contract_hashes: BTreeSet<B256>,
 }
 
 impl ConfiguredContractFilter {
     /// Creates a new configured filter from a list of tracked contract addresses.
     pub fn new(contracts: impl IntoIterator<Item = Address>) -> Self {
-        Self { contracts: contracts.into_iter().collect() }
+        let contracts = contracts.into_iter().collect::<BTreeSet<_>>();
+        let contract_hashes = contracts.iter().map(keccak256).collect();
+
+        Self { contracts, contract_hashes }
     }
 
     /// Returns the tracked contracts.
@@ -46,6 +62,11 @@ impl ConfiguredContractFilter {
     /// Returns `true` if no contracts are tracked.
     pub fn is_empty(&self) -> bool {
         self.contracts.is_empty()
+    }
+
+    /// Returns the precomputed account hashes for tracked contracts.
+    pub const fn contract_hashes(&self) -> &BTreeSet<B256> {
+        &self.contract_hashes
     }
 }
 
@@ -64,6 +85,14 @@ impl ContractFilter for ConfiguredContractFilter {
         self.contracts.contains(address)
     }
 
+    fn should_sync_storage_by_hash(&self, account_hash: &B256) -> bool {
+        self.contract_hashes.contains(account_hash)
+    }
+
+    fn should_sync_code_by_hash(&self, account_hash: &B256) -> bool {
+        self.contract_hashes.contains(account_hash)
+    }
+
     fn is_tracked(&self, address: &Address) -> bool {
         self.contracts.contains(address)
     }
@@ -79,6 +108,14 @@ impl ContractFilter for AllowAllContractFilter {
     }
 
     fn should_sync_code(&self, _address: &Address) -> bool {
+        true
+    }
+
+    fn should_sync_storage_by_hash(&self, _account_hash: &B256) -> bool {
+        true
+    }
+
+    fn should_sync_code_by_hash(&self, _account_hash: &B256) -> bool {
         true
     }
 
@@ -219,6 +256,38 @@ mod tests {
     }
 
     #[test]
+    fn configured_filter_matches_contract_hashes() {
+        let tracked = address!("0000000000000000000000000000000000000001");
+        let untracked = address!("0000000000000000000000000000000000000002");
+        let filter = ConfiguredContractFilter::new([tracked]);
+
+        let tracked_hash = keccak256(tracked);
+        let untracked_hash = keccak256(untracked);
+
+        assert!(filter.contract_hashes().contains(&tracked_hash));
+        assert_eq!(
+            filter.should_sync_storage(&tracked),
+            filter.should_sync_storage_by_hash(&tracked_hash)
+        );
+        assert_eq!(
+            filter.should_sync_code(&tracked),
+            filter.should_sync_code_by_hash(&tracked_hash)
+        );
+        assert!(!filter.should_sync_storage_by_hash(&untracked_hash));
+        assert!(!filter.should_sync_code_by_hash(&untracked_hash));
+    }
+
+    #[test]
+    fn empty_configured_filter_rejects_contract_hashes() {
+        let filter = ConfiguredContractFilter::default();
+        let account_hash = keccak256(address!("0000000000000000000000000000000000000001"));
+
+        assert!(filter.contract_hashes().is_empty());
+        assert!(!filter.should_sync_storage_by_hash(&account_hash));
+        assert!(!filter.should_sync_code_by_hash(&account_hash));
+    }
+
+    #[test]
     fn allow_all_filter_tracks_everything() {
         let address = address!("0000000000000000000000000000000000000001");
         let filter = AllowAllContractFilter;
@@ -226,6 +295,8 @@ mod tests {
         assert!(filter.is_tracked(&address));
         assert!(filter.should_sync_storage(&address));
         assert!(filter.should_sync_code(&address));
+        assert!(filter.should_sync_storage_by_hash(&keccak256(address)));
+        assert!(filter.should_sync_code_by_hash(&keccak256(address)));
     }
 
     #[test]
