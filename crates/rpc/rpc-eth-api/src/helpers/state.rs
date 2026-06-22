@@ -67,7 +67,10 @@ pub trait EthState: LoadState + SpawnBlocking {
         address: Address,
         block_id: Option<BlockId>,
     ) -> impl Future<Output = Result<Bytes, Self::Error>> + Send {
-        LoadState::get_code(self, address, block_id)
+        async move {
+            self.ensure_partial_state_code_available(address)?;
+            LoadState::get_code(self, address, block_id).await
+        }
     }
 
     /// Returns balance of given account, at given blocknumber.
@@ -93,7 +96,11 @@ pub trait EthState: LoadState + SpawnBlocking {
         index: JsonStorageKey,
         block_id: Option<BlockId>,
     ) -> impl Future<Output = Result<B256, Self::Error>> + Send {
-        self.spawn_blocking_io_fut(async move |this| {
+        if let Err(err) = self.ensure_partial_state_storage_available(address) {
+            return futures::future::Either::Left(async move { Err(err) })
+        }
+
+        futures::future::Either::Right(self.spawn_blocking_io_fut(async move |this| {
             Ok(B256::new(
                 this.state_at_block_id_or_latest(block_id)
                     .await?
@@ -102,7 +109,7 @@ pub trait EthState: LoadState + SpawnBlocking {
                     .unwrap_or_default()
                     .to_be_bytes(),
             ))
-        })
+        }))
     }
 
     /// Returns values from multiple storage positions across multiple addresses.
@@ -127,6 +134,9 @@ pub trait EthState: LoadState + SpawnBlocking {
                         "total slot count {total_slots} exceeds limit {DEFAULT_MAX_STORAGE_VALUES_SLOTS}",
                     ),
                 )));
+            }
+            for address in requests.keys() {
+                self.ensure_partial_state_storage_available(*address)?;
             }
 
             self.spawn_blocking_io_fut(async move |this| {
@@ -165,6 +175,10 @@ pub trait EthState: LoadState + SpawnBlocking {
         Self: EthApiSpec,
     {
         Ok(async move {
+            if !keys.is_empty() {
+                self.ensure_partial_state_storage_available(address)?;
+            }
+
             let _permit = self
                 .acquire_owned_tracing()
                 .await
@@ -259,6 +273,22 @@ pub trait LoadState:
         RpcConvert: RpcConvert<Network = Self::NetworkTypes>,
     > + RpcNodeCoreExt
 {
+    /// Ensures storage is available for this address in partial-state mode.
+    fn ensure_partial_state_storage_available(&self, address: Address) -> Result<(), Self::Error> {
+        if self.partial_state_enabled() && !self.is_partial_state_contract_tracked(&address) {
+            return Err(Self::Error::from_eth_err(EthApiError::StorageNotTracked(address)))
+        }
+        Ok(())
+    }
+
+    /// Ensures bytecode is available for this address in partial-state mode.
+    fn ensure_partial_state_code_available(&self, address: Address) -> Result<(), Self::Error> {
+        if self.partial_state_enabled() && !self.is_partial_state_contract_tracked(&address) {
+            return Err(Self::Error::from_eth_err(EthApiError::CodeNotTracked(address)))
+        }
+        Ok(())
+    }
+
     /// Returns the state at the given block number
     fn state_at_hash(&self, block_hash: B256) -> Result<StateProviderBox, Self::Error> {
         self.provider().history_by_block_hash(block_hash).map_err(Self::Error::from_eth_err)
@@ -453,7 +483,11 @@ pub trait LoadState:
     where
         Self: SpawnBlocking,
     {
-        self.spawn_blocking_io_fut(async move |this| {
+        if let Err(err) = self.ensure_partial_state_code_available(address) {
+            return futures::future::Either::Left(async move { Err(err) })
+        }
+
+        futures::future::Either::Right(self.spawn_blocking_io_fut(async move |this| {
             Ok(this
                 .state_at_block_id_or_latest(block_id)
                 .await?
@@ -461,6 +495,6 @@ pub trait LoadState:
                 .map_err(Self::Error::from_eth_err)?
                 .unwrap_or_default()
                 .original_bytes())
-        })
+        }))
     }
 }

@@ -223,10 +223,41 @@ impl<F> PartialState<F> {
         self.state_root
     }
 
+    /// Returns `true` if the BAL hashes to the expected block header commitment.
+    pub fn validate_bal_hash(access_list: &BlockAccessList, expected_hash: B256) -> bool {
+        compute_block_access_list_hash(access_list) == expected_hash
+    }
+
+    /// Stores the canonical BAL for a block and advances the locally tracked state root.
+    ///
+    /// Reth's engine validates and executes BAL-carrying payloads before they reach this helper.
+    /// This method records the already-accepted BAL in the configured history store and tracks the
+    /// resulting state root for partial-state bookkeeping.
+    pub fn record_canonical_bal(
+        &mut self,
+        num_hash: NumHash,
+        access_list: &BlockAccessList,
+        state_root: B256,
+    ) -> ProviderResult<()> {
+        self.history.store_alloy(num_hash, access_list)?;
+        self.state_root = state_root;
+        Ok(())
+    }
+
+    /// Resets the locally tracked root to a known ancestor during reorg handling.
+    ///
+    /// Applying the new canonical branch still belongs to the engine/provider layer, which has the
+    /// block bodies, decoded BALs, and trie-root machinery needed to validate each block.
+    pub const fn reset_to_ancestor_root(&mut self, ancestor_root: B256) {
+        self.state_root = ancestor_root;
+    }
+
     /// Applies a BAL and computes the next state root.
     ///
-    /// This is a phase-3/4 hook. Phase 1 only establishes the manager and makes the
-    /// unimplemented boundary explicit.
+    /// Direct BAL-to-trie mutation is intentionally not implemented in `reth-storage-api`: this
+    /// type does not own a provider, database transaction, or trie writer. Reth's engine currently
+    /// validates BAL payloads by executing them through the BAL-aware payload processor, then the
+    /// accepted BAL can be recorded with [`Self::record_canonical_bal`].
     pub fn apply_bal_and_compute_root(
         &mut self,
         _current_root: B256,
@@ -322,5 +353,45 @@ mod tests {
             partial_state.apply_bal_and_compute_root(root, &BlockAccessList::default()),
             Err(ProviderError::UnsupportedProvider)
         ));
+    }
+
+    #[test]
+    fn partial_state_validates_bal_hash() {
+        let access_list = BlockAccessList::default();
+        let hash = compute_block_access_list_hash(&access_list);
+
+        assert!(PartialState::<ConfiguredContractFilter>::validate_bal_hash(&access_list, hash));
+        assert!(!PartialState::<ConfiguredContractFilter>::validate_bal_hash(
+            &access_list,
+            B256::ZERO
+        ));
+    }
+
+    #[test]
+    fn partial_state_records_canonical_bal_and_root() {
+        let filter = ConfiguredContractFilter::default();
+        let history = BalHistory::new(BalStoreHandle::default(), 64);
+        let mut partial_state = PartialState::new(filter, history);
+        let root = keccak256("new root");
+        let num_hash = NumHash::new(1, keccak256("block"));
+        let access_list = BlockAccessList::default();
+
+        partial_state.record_canonical_bal(num_hash, &access_list, root).unwrap();
+
+        assert_eq!(partial_state.root(), root);
+    }
+
+    #[test]
+    fn partial_state_resets_to_ancestor_root() {
+        let filter = ConfiguredContractFilter::default();
+        let history = BalHistory::new(BalStoreHandle::default(), 64);
+        let mut partial_state = PartialState::new(filter, history);
+        let head = keccak256("head");
+        let ancestor = keccak256("ancestor");
+
+        partial_state.set_root(head);
+        partial_state.reset_to_ancestor_root(ancestor);
+
+        assert_eq!(partial_state.root(), ancestor);
     }
 }

@@ -102,6 +102,7 @@ impl PartialStateConfig {
         Ok(merged)
     }
 
+    /// Loads and merges contracts from the configured contracts file, if one is set.
     pub fn load_contracts_file(&mut self) -> eyre::Result<()> {
         if let Some(path) = &self.contracts_file {
             let file = PartialStateContractsFile::read(path)?;
@@ -151,7 +152,7 @@ impl PartialStateArgs {
     pub fn into_config(self) -> eyre::Result<PartialStateConfig> {
         let Self { enabled, contracts, contracts_file, bal_retention } = self;
 
-        let mut contracts: BTreeSet<_> = contracts.into_iter().collect();
+        let contracts: BTreeSet<_> = contracts.into_iter().collect();
 
         let mut config = PartialStateConfig { enabled, contracts, contracts_file, bal_retention };
         config.load_contracts_file()?;

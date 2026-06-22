@@ -27,6 +27,7 @@ use reth_node_api::{
     NodeAddOns, NodeTypes, PayloadTypes, PayloadValidator, PrimitivesTy, TreeConfig,
 };
 use reth_node_core::{
+    args::PartialStateConfig,
     cli::config::RethTransactionPoolConfig,
     node_config::NodeConfig,
     version::{version_metadata, CLIENT_CODE},
@@ -1115,10 +1116,12 @@ where
             cache_new_blocks_task(c, new_canonical_blocks).await;
         });
 
+        let partial_state = config.partial_state.clone();
         let eth_config = config.rpc.eth_config().max_batch_size(config.txpool.max_batch_size());
         let ctx = EthApiCtx {
             components: &node,
             config: eth_config,
+            partial_state,
             cache,
             engine_handle: beacon_engine_handle.clone(),
         };
@@ -1289,6 +1292,8 @@ pub struct EthApiCtx<'a, N: FullNodeTypes> {
     pub components: &'a N,
     /// Eth API configuration
     pub config: EthConfig,
+    /// Partial-state RPC availability configuration.
+    pub partial_state: PartialStateConfig,
     /// Cache for eth state
     pub cache: EthStateCache<PrimitivesTy<N::Types>>,
     /// Handle to the beacon consensus engine
@@ -1315,6 +1320,10 @@ impl<'a, N: FullNodeComponents<Types: NodeTypes<ChainSpec: Hardforks + EthereumH
             .raw_tx_forwarder(self.config.raw_tx_forwarder)
             .evm_memory_limit(self.config.rpc_evm_memory_limit)
             .force_blob_sidecar_upcasting(self.config.force_blob_sidecar_upcasting)
+            .partial_state(
+                self.partial_state.is_enabled(),
+                self.partial_state.contracts.iter().copied(),
+            )
     }
 }
 

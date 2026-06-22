@@ -107,6 +107,12 @@ pub enum EthApiError {
     /// Thrown when the target block for proof computation exceeds the maximum configured window.
     #[error("distance to target block exceeds maximum proof window")]
     ExceedsMaxProofWindow,
+    /// Storage for this address is not available on a partial-state node.
+    #[error("storage for address {0} is not tracked by this partial-state node")]
+    StorageNotTracked(Address),
+    /// Bytecode for this address is not available on a partial-state node.
+    #[error("bytecode for address {0} is not tracked by this partial-state node")]
+    CodeNotTracked(Address),
     /// An internal error where prevrandao is not set in the evm's environment
     #[error("prevrandao not in the EVM's environment after merge")]
     PrevrandaoNotSet,
@@ -316,6 +322,8 @@ impl From<EthApiError> for jsonrpsee_types::error::ErrorObject<'static> {
                     block_id_to_str(end_id),
                 ),
             ),
+            EthApiError::StorageNotTracked(_) => rpc_error_with_code(-32001, error.to_string()),
+            EthApiError::CodeNotTracked(_) => rpc_error_with_code(-32002, error.to_string()),
             err @ EthApiError::TransactionConfirmationTimeout { .. } => rpc_error_with_code(
                 EthRpcErrorCode::TransactionConfirmationTimeout.code(),
                 err.to_string(),
@@ -1212,6 +1220,20 @@ mod tests {
         let err: jsonrpsee_types::error::ErrorObject<'static> =
             EthApiError::ReceiptsNotFound(BlockId::earliest()).into();
         assert_eq!(err.message(), "block not found: earliest");
+    }
+
+    #[test]
+    fn partial_state_unavailable_errors_use_stable_codes() {
+        let address = Address::ZERO;
+        let err: jsonrpsee_types::error::ErrorObject<'static> =
+            EthApiError::StorageNotTracked(address).into();
+        assert_eq!(err.code(), -32001);
+        assert!(err.message().contains("storage for address"));
+
+        let err: jsonrpsee_types::error::ErrorObject<'static> =
+            EthApiError::CodeNotTracked(address).into();
+        assert_eq!(err.code(), -32002);
+        assert!(err.message().contains("bytecode for address"));
     }
 
     #[test]

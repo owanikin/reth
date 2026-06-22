@@ -1,5 +1,6 @@
 //! Helper trait for interfacing with [`FullNodeComponents`].
 
+use alloy_primitives::Address;
 use reth_chain_state::CanonStateSubscriptions;
 use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks, Hardforks};
 use reth_evm::ConfigureEvm;
@@ -99,6 +100,16 @@ where
 pub trait RpcNodeCoreExt: RpcNodeCore<Provider: BlockReader> {
     /// Returns handle to RPC cache service.
     fn cache(&self) -> &EthStateCache<Self::Primitives>;
+
+    /// Returns `true` if partial-state mode is active for RPC availability checks.
+    fn partial_state_enabled(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` if storage and bytecode are available for this contract address.
+    fn is_partial_state_contract_tracked(&self, _address: &Address) -> bool {
+        true
+    }
 }
 
 /// An adapter that allows to construct [`RpcNodeCore`] from components.

@@ -1,13 +1,13 @@
 //! Implementation of the [`jsonrpsee`] generated [`EthApiServer`](crate::EthApi) trait
 //! Handles RPC requests for the `eth_` namespace.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use crate::{eth::helpers::types::EthRpcConverter, EthApiBuilder};
 use alloy_consensus::BlockHeader;
 use alloy_eips::BlockNumberOrTag;
 use alloy_network::Ethereum;
-use alloy_primitives::{Bytes, U256};
+use alloy_primitives::{Address, Bytes, U256};
 use alloy_rpc_client::RpcClient;
 use derive_more::Deref;
 use reth_chainspec::{ChainSpec, ChainSpecProvider};
@@ -183,6 +183,16 @@ where
     fn cache(&self) -> &EthStateCache<N::Primitives> {
         self.inner.cache()
     }
+
+    #[inline]
+    fn partial_state_enabled(&self) -> bool {
+        self.inner.partial_state_enabled()
+    }
+
+    #[inline]
+    fn is_partial_state_contract_tracked(&self, address: &Address) -> bool {
+        self.inner.is_partial_state_contract_tracked(address)
+    }
 }
 
 impl<N, Rpc> std::fmt::Debug for EthApi<N, Rpc>
@@ -285,6 +295,12 @@ pub struct EthApiInner<N: RpcNodeCore, Rpc: RpcConvert> {
 
     /// Whether to force upcasting EIP-4844 blob sidecars to EIP-7594 format when Osaka is active.
     force_blob_sidecar_upcasting: bool,
+
+    /// Whether partial-state RPC availability checks are active.
+    partial_state_enabled: bool,
+
+    /// Contracts whose storage and bytecode are available in partial-state mode.
+    partial_state_tracked_contracts: BTreeSet<Address>,
 }
 
 impl<N, Rpc> EthApiInner<N, Rpc>
@@ -314,6 +330,8 @@ where
         send_raw_transaction_sync_timeout: Duration,
         evm_memory_limit: u64,
         force_blob_sidecar_upcasting: bool,
+        partial_state_enabled: bool,
+        partial_state_tracked_contracts: BTreeSet<Address>,
     ) -> Self {
         let signers = parking_lot::RwLock::new(Default::default());
         // get the block number of the latest block
@@ -359,6 +377,8 @@ where
             blob_sidecar_converter: BlobSidecarConverter::new(),
             evm_memory_limit,
             force_blob_sidecar_upcasting,
+            partial_state_enabled,
+            partial_state_tracked_contracts,
         }
     }
 }
@@ -384,6 +404,16 @@ where
     #[inline]
     pub const fn cache(&self) -> &EthStateCache<N::Primitives> {
         &self.eth_cache
+    }
+
+    /// Returns true if partial-state RPC availability checks are active.
+    pub const fn partial_state_enabled(&self) -> bool {
+        self.partial_state_enabled
+    }
+
+    /// Returns true if storage and bytecode are available for this contract address.
+    pub fn is_partial_state_contract_tracked(&self, address: &Address) -> bool {
+        !self.partial_state_enabled || self.partial_state_tracked_contracts.contains(address)
     }
 
     /// Returns a handle to the pending block.

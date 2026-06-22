@@ -2,6 +2,7 @@
 
 use crate::{eth::core::EthApiInner, EthApi};
 use alloy_network::Ethereum;
+use alloy_primitives::Address;
 use reth_chain_state::CanonStateSubscriptions;
 use reth_chainspec::ChainSpecProvider;
 use reth_primitives_traits::HeaderTy;
@@ -19,7 +20,7 @@ use reth_rpc_server_types::constants::{
     DEFAULT_PROOF_PERMITS,
 };
 use reth_tasks::{pool::BlockingTaskPool, Runtime};
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 /// A helper to build the `EthApi` handler instance.
 ///
@@ -48,6 +49,8 @@ pub struct EthApiBuilder<N: RpcNodeCore, Rpc, NextEnv = ()> {
     send_raw_transaction_sync_timeout: Duration,
     evm_memory_limit: u64,
     force_blob_sidecar_upcasting: bool,
+    partial_state_enabled: bool,
+    partial_state_tracked_contracts: BTreeSet<Address>,
 }
 
 impl<Provider, Pool, Network, EvmConfig, ChainSpec>
@@ -101,6 +104,8 @@ impl<N: RpcNodeCore, Rpc, NextEnv> EthApiBuilder<N, Rpc, NextEnv> {
             send_raw_transaction_sync_timeout,
             evm_memory_limit,
             force_blob_sidecar_upcasting,
+            partial_state_enabled,
+            partial_state_tracked_contracts,
         } = self;
         EthApiBuilder {
             components,
@@ -124,6 +129,8 @@ impl<N: RpcNodeCore, Rpc, NextEnv> EthApiBuilder<N, Rpc, NextEnv> {
             send_raw_transaction_sync_timeout,
             evm_memory_limit,
             force_blob_sidecar_upcasting,
+            partial_state_enabled,
+            partial_state_tracked_contracts,
         }
     }
 }
@@ -158,6 +165,8 @@ where
             send_raw_transaction_sync_timeout: Duration::from_secs(30),
             evm_memory_limit: (1 << 32) - 1,
             force_blob_sidecar_upcasting: false,
+            partial_state_enabled: false,
+            partial_state_tracked_contracts: BTreeSet::new(),
         }
     }
 }
@@ -199,6 +208,8 @@ where
             send_raw_transaction_sync_timeout,
             evm_memory_limit,
             force_blob_sidecar_upcasting,
+            partial_state_enabled,
+            partial_state_tracked_contracts,
         } = self;
         EthApiBuilder {
             components,
@@ -222,6 +233,8 @@ where
             send_raw_transaction_sync_timeout,
             evm_memory_limit,
             force_blob_sidecar_upcasting,
+            partial_state_enabled,
+            partial_state_tracked_contracts,
         }
     }
 
@@ -252,6 +265,8 @@ where
             send_raw_transaction_sync_timeout,
             evm_memory_limit,
             force_blob_sidecar_upcasting,
+            partial_state_enabled,
+            partial_state_tracked_contracts,
         } = self;
         EthApiBuilder {
             components,
@@ -275,6 +290,8 @@ where
             send_raw_transaction_sync_timeout,
             evm_memory_limit,
             force_blob_sidecar_upcasting,
+            partial_state_enabled,
+            partial_state_tracked_contracts,
         }
     }
 
@@ -511,6 +528,8 @@ where
             send_raw_transaction_sync_timeout,
             evm_memory_limit,
             force_blob_sidecar_upcasting,
+            partial_state_enabled,
+            partial_state_tracked_contracts,
         } = self;
 
         let provider = components.provider().clone();
@@ -563,6 +582,8 @@ where
             send_raw_transaction_sync_timeout,
             evm_memory_limit,
             force_blob_sidecar_upcasting,
+            partial_state_enabled,
+            partial_state_tracked_contracts,
         )
     }
 
@@ -597,6 +618,17 @@ where
     /// Sets whether to force upcasting EIP-4844 blob sidecars to EIP-7594 format.
     pub const fn force_blob_sidecar_upcasting(mut self, force: bool) -> Self {
         self.force_blob_sidecar_upcasting = force;
+        self
+    }
+
+    /// Sets partial-state RPC availability policy.
+    pub fn partial_state(
+        mut self,
+        enabled: bool,
+        tracked_contracts: impl IntoIterator<Item = Address>,
+    ) -> Self {
+        self.partial_state_enabled = enabled;
+        self.partial_state_tracked_contracts = tracked_contracts.into_iter().collect();
         self
     }
 }
