@@ -32,7 +32,6 @@ use reth_revm::{
 };
 use reth_rpc_convert::{RpcConvert, RpcTxReq};
 use reth_rpc_eth_types::{
-    cache::db::StateProviderTraitObjWrapper,
     error::{AsEthApiError, FromEthApiError},
     simulate::{self, EthSimulateError},
     EthApiError, StateCacheDb,
@@ -472,6 +471,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
     {
         self.spawn_blocking_io_fut(async move |this| {
             let state = this.state_at_block_id(at).await?;
+            let state = this.state_provider_for_rpc_execution(state);
             let mut db = State::builder().with_database(StateProviderDatabase::new(state)).build();
 
             if let Some(state_overrides) = state_override {
@@ -667,7 +667,9 @@ pub trait Call:
         self.spawn_blocking_io_fut(async move |this| {
             let state = this.state_at_block_id(at).await?;
             let db = State::builder()
-                .with_database(StateProviderDatabase::new(StateProviderTraitObjWrapper(state)))
+                .with_database(StateProviderDatabase::new(
+                    this.state_provider_for_rpc_execution(state),
+                ))
                 .build();
             f(this, db)
         })

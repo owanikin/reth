@@ -8,7 +8,7 @@ use reth_db_api::{database_metrics::DatabaseMetrics, Database};
 use reth_engine_primitives::{ConsensusEngineEvent, ConsensusEngineHandle};
 use reth_evm::ConfigureEvm;
 use reth_network_api::FullNetwork;
-use reth_node_core::node_config::NodeConfig;
+use reth_node_core::{args::PartialStateConfig, node_config::NodeConfig};
 use reth_node_types::{NodeTypes, NodeTypesWithDBAdapter, TxTy};
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_provider::FullProvider;
@@ -109,6 +109,8 @@ pub struct AddOnsContext<'a, N: FullNodeComponents> {
     pub node: N,
     /// Node configuration.
     pub config: &'a NodeConfig<<N::Types as NodeTypes>::ChainSpec>,
+    /// Resolved partial-state runtime configuration.
+    pub partial_state: PartialStateConfig,
     /// Handle to the beacon consensus engine.
     pub beacon_engine_handle: ConsensusEngineHandle<<N::Types as NodeTypes>::Payload>,
     /// Notification channel for engine API events

@@ -2,7 +2,7 @@
 
 use crate::{
     args::{
-        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, NetworkArgs, PartialStateConfig,
+        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, NetworkArgs, PartialStateArgs,
         PayloadBuilderArgs, PruningArgs, RpcServerArgs, StaticFilesArgs, StorageArgs, TxPoolArgs,
     },
     dirs::{ChainPath, DataDirPath},
@@ -155,8 +155,8 @@ pub struct NodeConfig<ChainSpec> {
     /// All storage related arguments with --storage prefix
     pub storage: StorageArgs,
 
-    /// Partial-state mode configuration.
-    pub partial_state: PartialStateConfig,
+    /// Partial-state mode arguments.
+    pub partial_state: PartialStateArgs,
 }
 
 impl NodeConfig<ChainSpec> {
@@ -189,7 +189,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             era: EraArgs::default(),
             static_files: StaticFilesArgs::default(),
             storage: StorageArgs::default(),
-            partial_state: PartialStateConfig::default(),
+            partial_state: PartialStateArgs::default(),
         }
     }
 
@@ -369,30 +369,30 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
         self
     }
 
-    /// Set the partial-state configuration for the node.
-    pub fn with_partial_state(mut self, partial_state: PartialStateConfig) -> Self {
+    /// Set the partial-state arguments for the node.
+    pub fn with_partial_state(mut self, partial_state: PartialStateArgs) -> Self {
         self.partial_state = partial_state;
         self
     }
 
-    /// Returns the partial-state configuration.
-    pub const fn partial_state(&self) -> &PartialStateConfig {
+    /// Returns the partial-state arguments.
+    pub const fn partial_state(&self) -> &PartialStateArgs {
         &self.partial_state
     }
 
     /// Returns whether partial-state mode is enabled.
     pub const fn is_partial_state_enabled(&self) -> bool {
-        self.partial_state.is_enabled()
+        self.partial_state.enabled
     }
 
     /// Returns whether the given contract is tracked by this node.
     pub fn is_partial_state_contract_tracked(&self, address: &Address) -> bool {
-        self.partial_state.is_contract_tracked(address)
+        !self.partial_state.enabled || self.partial_state.contracts.contains(address)
     }
 
     /// Returns the configured partial-state BAL retention window.
     pub const fn partial_state_bal_retention(&self) -> u64 {
-        self.partial_state.bal_retention()
+        self.partial_state.bal_retention
     }
 
     /// Returns pruning configuration.

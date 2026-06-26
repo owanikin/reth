@@ -185,6 +185,7 @@ impl EngineNodeLauncher {
         let add_ons_ctx = AddOnsContext {
             node: ctx.node_adapter().clone(),
             config: ctx.node_config(),
+            partial_state: ctx.configs().partial_state.clone(),
             beacon_engine_handle: beacon_engine_handle.clone(),
             jwt_secret,
             engine_events: event_sender.clone(),

@@ -159,6 +159,14 @@ impl PartialStateArgs {
         config.validate()?;
         Ok(config)
     }
+
+    /// Converts CLI args and merges them with the persisted TOML partial-state configuration.
+    pub fn merge_with_toml_config(
+        &self,
+        toml_config: &reth_config::PartialStateConfig,
+    ) -> eyre::Result<PartialStateConfig> {
+        self.clone().into_config()?.merge_with_toml_config(toml_config)
+    }
 }
 
 impl Default for PartialStateArgs {

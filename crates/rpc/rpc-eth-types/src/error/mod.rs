@@ -524,6 +524,8 @@ impl From<reth_errors::ProviderError> for EthApiError {
             ProviderError::FinalizedBlockNotFound => Self::HeaderNotFound(BlockId::finalized()),
             ProviderError::SafeBlockNotFound => Self::HeaderNotFound(BlockId::safe()),
             ProviderError::BlockExpired { .. } => Self::PrunedHistoryUnavailable,
+            ProviderError::StorageNotTracked(address) => Self::StorageNotTracked(address),
+            ProviderError::CodeNotTracked(address) => Self::CodeNotTracked(address),
             err => Self::Internal(err.into()),
         }
     }
@@ -1234,6 +1236,12 @@ mod tests {
             EthApiError::CodeNotTracked(address).into();
         assert_eq!(err.code(), -32002);
         assert!(err.message().contains("bytecode for address"));
+
+        let err: EthApiError = reth_errors::ProviderError::StorageNotTracked(address).into();
+        assert!(matches!(err, EthApiError::StorageNotTracked(addr) if addr == address));
+
+        let err: EthApiError = reth_errors::ProviderError::CodeNotTracked(address).into();
+        assert!(matches!(err, EthApiError::CodeNotTracked(addr) if addr == address));
     }
 
     #[test]

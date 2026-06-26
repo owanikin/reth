@@ -14,6 +14,7 @@ use reth_evm::{ConfigureEvm, EvmEnvFor};
 use reth_primitives_traits::SealedHeaderFor;
 use reth_rpc_convert::{RpcConvert, RpcTxReq};
 use reth_rpc_eth_types::{
+    cache::db::StateProviderTraitObjWrapper,
     error::{FromEvmError, IntoEthApiError},
     EthApiError, PendingBlockEnv, RpcInvalidTransactionError, SignError,
 };
@@ -287,6 +288,21 @@ pub trait LoadState:
             return Err(Self::Error::from_eth_err(EthApiError::CodeNotTracked(address)))
         }
         Ok(())
+    }
+
+    /// Wraps state used by RPC execution so missing partial-state data is reported explicitly.
+    fn state_provider_for_rpc_execution(
+        &self,
+        state: StateProviderBox,
+    ) -> StateProviderTraitObjWrapper {
+        if !self.partial_state_enabled() {
+            return StateProviderTraitObjWrapper::new(state)
+        }
+
+        let this = self.clone();
+        StateProviderTraitObjWrapper::with_partial_state_tracker(state, move |address| {
+            this.is_partial_state_contract_tracked(address)
+        })
     }
 
     /// Returns the state at the given block number

@@ -6,9 +6,7 @@ use alloy_rpc_types_eth::BlockId;
 use reth_errors::RethError;
 use reth_evm::{block::BlockExecutor, ConfigureEvm, Evm};
 use reth_revm::{database::StateProviderDatabase, State};
-use reth_rpc_eth_types::{
-    cache::db::StateProviderTraitObjWrapper, error::FromEthApiError, EthApiError,
-};
+use reth_rpc_eth_types::{error::FromEthApiError, EthApiError};
 use reth_storage_api::StateProviderFactory;
 
 use crate::{
@@ -41,8 +39,9 @@ pub trait GetBlockAccessList: Trace + Call + LoadBlock + RpcNodeCoreExt {
                     .state_by_block_id(block.parent_hash().into())
                     .map_err(Self::Error::from_eth_err)?;
 
+                let state = eth_api.state_provider_for_rpc_execution(state);
                 let mut db = State::builder()
-                    .with_database(StateProviderDatabase::new(StateProviderTraitObjWrapper(state)))
+                    .with_database(StateProviderDatabase::new(state))
                     .with_bal_builder()
                     .build();
 

@@ -126,6 +126,12 @@ pub enum ProviderError {
     /// Provider does not support this particular request.
     #[error("this provider does not support this request")]
     UnsupportedProvider,
+    /// Storage for this address is unavailable because the partial-state node does not track it.
+    #[error("storage for address {0} is not tracked by this partial-state node")]
+    StorageNotTracked(Address),
+    /// Bytecode for this address is unavailable because the partial-state node does not track it.
+    #[error("bytecode for address {0} is not tracked by this partial-state node")]
+    CodeNotTracked(Address),
     /// Static File is not found at specified path.
     #[cfg(feature = "std")]
     #[error("not able to find {_0} static file at {_1:?}")]

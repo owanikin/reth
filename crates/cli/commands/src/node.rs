@@ -184,8 +184,6 @@ where
         } = self;
 
         engine.validate()?;
-        let partial_state = partial_state.into_config()?;
-
         // set up node config
         let mut node_config = NodeConfig {
             datadir,
