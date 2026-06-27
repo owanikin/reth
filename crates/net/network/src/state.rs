@@ -435,6 +435,30 @@ impl<N: NetworkPrimitives> NetworkState<N> {
                         (request, response)
                     }
                 }
+                BlockRequest::GetAccountRange(request) => {
+                    let (response, rx) = oneshot::channel();
+                    let request = PeerRequest::GetAccountRange { request, response };
+                    let response = PeerResponse::AccountRange { response: rx };
+                    (request, response)
+                }
+                BlockRequest::GetStorageRanges(request) => {
+                    let (response, rx) = oneshot::channel();
+                    let request = PeerRequest::GetStorageRanges { request, response };
+                    let response = PeerResponse::StorageRanges { response: rx };
+                    (request, response)
+                }
+                BlockRequest::GetByteCodes(request) => {
+                    let (response, rx) = oneshot::channel();
+                    let request = PeerRequest::GetByteCodes { request, response };
+                    let response = PeerResponse::ByteCodes { response: rx };
+                    (request, response)
+                }
+                BlockRequest::GetTrieNodes(request) => {
+                    let (response, rx) = oneshot::channel();
+                    let request = PeerRequest::GetTrieNodes { request, response };
+                    let response = PeerResponse::TrieNodes { response: rx };
+                    (request, response)
+                }
             };
             let _ = peer.request_tx.to_session_tx.try_send(request);
             peer.pending_response = Some(response);
@@ -490,6 +514,7 @@ impl<N: NetworkPrimitives> NetworkState<N> {
             PeerResponseResult::BlockAccessLists(res) => {
                 self.state_fetcher.on_block_access_lists_response(peer, res)
             }
+            PeerResponseResult::Snap(res) => self.state_fetcher.on_snap_response(peer, res),
             _ => None,
         };
 

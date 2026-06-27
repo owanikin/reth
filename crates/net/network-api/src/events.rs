@@ -1,11 +1,13 @@
 //! API related to listening for network events.
 
 use reth_eth_wire_types::{
-    message::RequestPair, BlockAccessLists, BlockBodies, BlockHeaders, Capabilities, Cells,
-    DisconnectReason, EthMessage, EthNetworkPrimitives, EthVersion, GetBlockAccessLists,
-    GetBlockBodies, GetBlockHeaders, GetCells, GetNodeData, GetPooledTransactions, GetReceipts,
-    GetReceipts70, NetworkPrimitives, NodeData, PooledTransactions, Receipts, Receipts69,
-    Receipts70, UnifiedStatus,
+    message::RequestPair, AccountRangeMessage, BlockAccessLists, BlockBodies, BlockHeaders,
+    ByteCodesMessage, Capabilities, Cells, DisconnectReason, EthMessage, EthNetworkPrimitives,
+    EthVersion, GetAccountRangeMessage, GetBlockAccessLists, GetBlockBodies, GetBlockHeaders,
+    GetByteCodesMessage, GetCells, GetNodeData, GetPooledTransactions, GetReceipts, GetReceipts70,
+    GetStorageRangesMessage, GetTrieNodesMessage, NetworkPrimitives, NodeData, PooledTransactions,
+    Receipts, Receipts69, Receipts70, SnapProtocolMessage, StorageRangesMessage, TrieNodesMessage,
+    UnifiedStatus,
 };
 use reth_ethereum_forks::ForkId;
 use reth_network_p2p::error::{RequestError, RequestResult};
@@ -271,6 +273,42 @@ pub enum PeerRequest<N: NetworkPrimitives = EthNetworkPrimitives> {
         /// The channel to send the response for cells.
         response: oneshot::Sender<RequestResult<Cells>>,
     },
+    /// Requests an account range through snap.
+    ///
+    /// The response should be sent through the channel.
+    GetAccountRange {
+        /// The request for an account range.
+        request: GetAccountRangeMessage,
+        /// The channel to send the response for an account range.
+        response: oneshot::Sender<RequestResult<AccountRangeMessage>>,
+    },
+    /// Requests storage ranges through snap.
+    ///
+    /// The response should be sent through the channel.
+    GetStorageRanges {
+        /// The request for storage ranges.
+        request: GetStorageRangesMessage,
+        /// The channel to send the response for storage ranges.
+        response: oneshot::Sender<RequestResult<StorageRangesMessage>>,
+    },
+    /// Requests bytecodes through snap.
+    ///
+    /// The response should be sent through the channel.
+    GetByteCodes {
+        /// The request for bytecodes.
+        request: GetByteCodesMessage,
+        /// The channel to send the response for bytecodes.
+        response: oneshot::Sender<RequestResult<ByteCodesMessage>>,
+    },
+    /// Requests trie nodes through snap.
+    ///
+    /// The response should be sent through the channel.
+    GetTrieNodes {
+        /// The request for trie nodes.
+        request: GetTrieNodesMessage,
+        /// The channel to send the response for trie nodes.
+        response: oneshot::Sender<RequestResult<TrieNodesMessage>>,
+    },
 }
 
 // === impl PeerRequest ===
@@ -293,6 +331,10 @@ impl<N: NetworkPrimitives> PeerRequest<N> {
             Self::GetReceipts70 { response, .. } => response.send(Err(err)).ok(),
             Self::GetBlockAccessLists { response, .. } => response.send(Err(err)).ok(),
             Self::GetCells { response, .. } => response.send(Err(err)).ok(),
+            Self::GetAccountRange { response, .. } => response.send(Err(err)).ok(),
+            Self::GetStorageRanges { response, .. } => response.send(Err(err)).ok(),
+            Self::GetByteCodes { response, .. } => response.send(Err(err)).ok(),
+            Self::GetTrieNodes { response, .. } => response.send(Err(err)).ok(),
         };
     }
 
@@ -302,6 +344,10 @@ impl<N: NetworkPrimitives> PeerRequest<N> {
         match self {
             Self::GetBlockAccessLists { .. } => version >= EthVersion::Eth71,
             Self::GetCells { .. } => version >= EthVersion::Eth72,
+            Self::GetAccountRange { .. } |
+            Self::GetStorageRanges { .. } |
+            Self::GetByteCodes { .. } |
+            Self::GetTrieNodes { .. } => true,
             _ => true,
         }
     }
@@ -339,6 +385,42 @@ impl<N: NetworkPrimitives> PeerRequest<N> {
             Self::GetCells { request, .. } => {
                 EthMessage::GetCells(RequestPair { request_id, message: request.clone() })
             }
+            Self::GetAccountRange { .. } |
+            Self::GetStorageRanges { .. } |
+            Self::GetByteCodes { .. } |
+            Self::GetTrieNodes { .. } => {
+                unreachable!("snap requests use create_snap_request_message")
+            }
+        }
+    }
+
+    /// Returns the [`SnapProtocolMessage`] for snap request variants.
+    ///
+    /// The session assigns the request id so callers don't need to coordinate request id spaces
+    /// across eth and snap requests.
+    pub fn create_snap_request_message(&self, request_id: u64) -> Option<SnapProtocolMessage> {
+        match self {
+            Self::GetAccountRange { request, .. } => {
+                let mut request = request.clone();
+                request.request_id = request_id;
+                Some(SnapProtocolMessage::GetAccountRange(request))
+            }
+            Self::GetStorageRanges { request, .. } => {
+                let mut request = request.clone();
+                request.request_id = request_id;
+                Some(SnapProtocolMessage::GetStorageRanges(request))
+            }
+            Self::GetByteCodes { request, .. } => {
+                let mut request = request.clone();
+                request.request_id = request_id;
+                Some(SnapProtocolMessage::GetByteCodes(request))
+            }
+            Self::GetTrieNodes { request, .. } => {
+                let mut request = request.clone();
+                request.request_id = request_id;
+                Some(SnapProtocolMessage::GetTrieNodes(request))
+            }
+            _ => None,
         }
     }
 

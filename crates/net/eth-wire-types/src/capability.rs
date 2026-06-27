@@ -177,6 +177,24 @@ impl Capability {
         self.name == "eth" && self.version == 72
     }
 
+    /// Whether this is snap v1.
+    #[inline]
+    pub fn is_snap_v1(&self) -> bool {
+        self.name == "snap" && self.version == 1
+    }
+
+    /// Whether this is snap v2.
+    #[inline]
+    pub fn is_snap_v2(&self) -> bool {
+        self.name == "snap" && self.version == 2
+    }
+
+    /// Whether this is any snap version.
+    #[inline]
+    pub fn is_snap(&self) -> bool {
+        self.is_snap_v1() || self.is_snap_v2()
+    }
+
     /// Whether this is any eth version.
     #[inline]
     pub fn is_eth(&self) -> bool {
@@ -224,6 +242,8 @@ pub struct Capabilities {
     eth_70: bool,
     eth_71: bool,
     eth_72: bool,
+    snap_1: bool,
+    snap_2: bool,
 }
 
 impl Capabilities {
@@ -237,6 +257,8 @@ impl Capabilities {
             eth_70: value.iter().any(Capability::is_eth_v70),
             eth_71: value.iter().any(Capability::is_eth_v71),
             eth_72: value.iter().any(Capability::is_eth_v72),
+            snap_1: value.iter().any(Capability::is_snap_v1),
+            snap_2: value.iter().any(Capability::is_snap_v2),
             inner: value,
         }
     }
@@ -332,6 +354,24 @@ impl Capabilities {
     pub const fn supports_eth_v71(&self) -> bool {
         self.eth_71
     }
+
+    /// Whether this peer supports snap v1 protocol.
+    #[inline]
+    pub const fn supports_snap_v1(&self) -> bool {
+        self.snap_1
+    }
+
+    /// Whether this peer supports snap v2 protocol.
+    #[inline]
+    pub const fn supports_snap_v2(&self) -> bool {
+        self.snap_2
+    }
+
+    /// Whether the peer supports any snap sub-protocol version.
+    #[inline]
+    pub const fn supports_snap(&self) -> bool {
+        self.snap_1 || self.snap_2
+    }
 }
 
 impl From<Vec<Capability>> for Capabilities {
@@ -358,6 +398,8 @@ impl Decodable for Capabilities {
             eth_70: inner.iter().any(Capability::is_eth_v70),
             eth_71: inner.iter().any(Capability::is_eth_v71),
             eth_72: inner.iter().any(Capability::is_eth_v72),
+            snap_1: inner.iter().any(Capability::is_snap_v1),
+            snap_2: inner.iter().any(Capability::is_snap_v2),
             inner,
         })
     }

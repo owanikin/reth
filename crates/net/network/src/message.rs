@@ -9,13 +9,21 @@ use alloy_primitives::{Bytes, B256};
 use futures::FutureExt;
 use reth_eth_wire::{
     message::RequestPair, BlockBodies, BlockHeaders, BlockRangeUpdate, Cells, EthMessage,
-    EthNetworkPrimitives, GetBlockAccessLists, GetBlockBodies, GetBlockHeaders, GetReceipts,
-    NetworkPrimitives, NewBlock, NewBlockHashes, NewBlockPayload, NewPooledTransactionHashes,
-    NodeData, PooledTransactions, Receipts, SharedTransactions, Transactions,
+    EthNetworkPrimitives, GetAccountRangeMessage, GetBlockAccessLists, GetBlockBodies,
+    GetBlockHeaders, GetByteCodesMessage, GetReceipts, GetStorageRangesMessage,
+    GetTrieNodesMessage, NetworkPrimitives, NewBlock, NewBlockHashes, NewBlockPayload,
+    NewPooledTransactionHashes, NodeData, PooledTransactions, Receipts, SharedTransactions,
+    Transactions,
 };
-use reth_eth_wire_types::RawCapabilityMessage;
+use reth_eth_wire_types::{
+    AccountRangeMessage, ByteCodesMessage, RawCapabilityMessage, StorageRangesMessage,
+    TrieNodesMessage,
+};
 use reth_network_api::PeerRequest;
-use reth_network_p2p::error::{RequestError, RequestResult};
+use reth_network_p2p::{
+    error::{RequestError, RequestResult},
+    snap::client::SnapResponse,
+};
 use reth_primitives_traits::Block;
 use std::{
     sync::Arc,
@@ -128,6 +136,14 @@ pub enum BlockRequest {
     ///
     /// The response should be sent through the channel.
     GetReceipts(GetReceipts),
+    /// Requests an account range from the peer through snap.
+    GetAccountRange(GetAccountRangeMessage),
+    /// Requests storage ranges from the peer through snap.
+    GetStorageRanges(GetStorageRangesMessage),
+    /// Requests bytecodes from the peer through snap.
+    GetByteCodes(GetByteCodesMessage),
+    /// Requests trie nodes from the peer through snap.
+    GetTrieNodes(GetTrieNodesMessage),
 }
 
 /// Corresponding variant for [`PeerRequest`].
@@ -183,6 +199,26 @@ pub enum PeerResponse<N: NetworkPrimitives = EthNetworkPrimitives> {
         /// The receiver channel for the response to a cells request.
         response: oneshot::Receiver<RequestResult<Cells>>,
     },
+    /// Represents a response to a snap account range request.
+    AccountRange {
+        /// The receiver channel for the response to an account range request.
+        response: oneshot::Receiver<RequestResult<AccountRangeMessage>>,
+    },
+    /// Represents a response to a snap storage ranges request.
+    StorageRanges {
+        /// The receiver channel for the response to a storage ranges request.
+        response: oneshot::Receiver<RequestResult<StorageRangesMessage>>,
+    },
+    /// Represents a response to a snap bytecodes request.
+    ByteCodes {
+        /// The receiver channel for the response to a bytecodes request.
+        response: oneshot::Receiver<RequestResult<ByteCodesMessage>>,
+    },
+    /// Represents a response to a snap trie nodes request.
+    TrieNodes {
+        /// The receiver channel for the response to a trie nodes request.
+        response: oneshot::Receiver<RequestResult<TrieNodesMessage>>,
+    },
 }
 
 // === impl PeerResponse ===
@@ -230,6 +266,22 @@ impl<N: NetworkPrimitives> PeerResponse<N> {
                 Ok(res) => PeerResponseResult::Cells(res),
                 Err(err) => PeerResponseResult::Cells(Err(err.into())),
             },
+            Self::AccountRange { response } => match ready!(response.poll_unpin(cx)) {
+                Ok(res) => PeerResponseResult::Snap(res.map(SnapResponse::AccountRange)),
+                Err(err) => PeerResponseResult::Snap(Err(err.into())),
+            },
+            Self::StorageRanges { response } => match ready!(response.poll_unpin(cx)) {
+                Ok(res) => PeerResponseResult::Snap(res.map(SnapResponse::StorageRanges)),
+                Err(err) => PeerResponseResult::Snap(Err(err.into())),
+            },
+            Self::ByteCodes { response } => match ready!(response.poll_unpin(cx)) {
+                Ok(res) => PeerResponseResult::Snap(res.map(SnapResponse::ByteCodes)),
+                Err(err) => PeerResponseResult::Snap(Err(err.into())),
+            },
+            Self::TrieNodes { response } => match ready!(response.poll_unpin(cx)) {
+                Ok(res) => PeerResponseResult::Snap(res.map(SnapResponse::TrieNodes)),
+                Err(err) => PeerResponseResult::Snap(Err(err.into())),
+            },
         };
         Poll::Ready(res)
     }
@@ -256,6 +308,8 @@ pub enum PeerResponseResult<N: NetworkPrimitives = EthNetworkPrimitives> {
     BlockAccessLists(RequestResult<BlockAccessLists>),
     /// Represents a result containing cells or an error.
     Cells(RequestResult<Cells>),
+    /// Represents a result containing a snap response or an error.
+    Snap(RequestResult<SnapResponse>),
 }
 
 // === impl PeerResponseResult ===
@@ -314,6 +368,10 @@ impl<N: NetworkPrimitives> PeerResponseResult<N> {
                 }
                 Err(err) => Err(err),
             },
+            Self::Snap(resp) => match resp {
+                Ok(_) => Err(RequestError::UnsupportedCapability),
+                Err(err) => Err(err),
+            },
         }
     }
 
@@ -329,6 +387,7 @@ impl<N: NetworkPrimitives> PeerResponseResult<N> {
             Self::Receipts70(res) => res.as_ref().err(),
             Self::BlockAccessLists(res) => res.as_ref().err(),
             Self::Cells(res) => res.as_ref().err(),
+            Self::Snap(res) => res.as_ref().err(),
         }
     }
 

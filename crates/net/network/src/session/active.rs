@@ -29,7 +29,8 @@ use metrics::{Counter, Gauge};
 use reth_eth_wire::{
     errors::{EthHandshakeError, EthStreamError},
     message::{EthBroadcastMessage, MessageError},
-    Capabilities, DisconnectP2P, DisconnectReason, EthMessage, NetworkPrimitives, NewBlockPayload,
+    Capabilities, Capability, DisconnectP2P, DisconnectReason, EthMessage, NetworkPrimitives,
+    NewBlockPayload, SnapProtocolMessage, SnapVersion,
 };
 use reth_eth_wire_types::{message::RequestPair, NewPooledTransactionHashes, RawCapabilityMessage};
 use reth_metrics::common::mpsc::MeteredPollSender;
@@ -398,9 +399,17 @@ impl<N: NetworkPrimitives> ActiveSession<N> {
 
         let request_id = self.next_id();
         trace!(?request, peer_id=?self.remote_peer_id, ?request_id, "sending request to peer");
-        let msg = request.create_request_message(request_id).map_versioned(version);
+        let msg = if let Some(snap_msg) = request.create_snap_request_message(request_id) {
+            let Some(msg) = self.snap_raw_message(snap_msg) else {
+                request.send_err_response(RequestError::UnsupportedCapability);
+                return;
+            };
+            OutgoingMessage::Raw(msg)
+        } else {
+            request.create_request_message(request_id).map_versioned(version).into()
+        };
 
-        self.queued_outgoing.push_back(msg.into());
+        self.queued_outgoing.push_back(msg);
         let req = InflightRequest {
             request: RequestState::Waiting(request),
             timestamp: Instant::now(),
@@ -412,6 +421,21 @@ impl<N: NetworkPrimitives> ActiveSession<N> {
     #[inline]
     fn is_request_supported_for_version(request: &PeerRequest<N>, version: EthVersion) -> bool {
         request.is_supported_by_eth_version(version)
+    }
+
+    /// Encodes a snap message as a raw capability message using the negotiated snap capability.
+    fn snap_raw_message(&self, msg: SnapProtocolMessage) -> Option<RawCapabilityMessage> {
+        let encoded = msg.encode();
+        let (message_id, payload) = encoded.split_first()?;
+
+        let shared_caps = self.conn.inner().shared_capabilities();
+        let snap = Capability::snap(SnapVersion::V1);
+        let relative_id = shared_caps.relative_message_id(&snap, *message_id).or_else(|| {
+            let snap = Capability::snap(SnapVersion::V2);
+            shared_caps.relative_message_id(&snap, *message_id)
+        })?;
+
+        Some(RawCapabilityMessage::new(relative_id as usize, payload.to_vec().into()))
     }
 
     /// Handle a message received from the internal network

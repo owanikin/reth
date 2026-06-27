@@ -50,6 +50,7 @@ use reth_network_api::{
     test_utils::PeersHandle,
     EthProtocolInfo, NetworkEvent, NetworkStatus, PeerInfo, PeerRequest,
 };
+use reth_network_p2p::error::RequestError;
 use reth_network_peers::{NodeRecord, PeerId};
 use reth_network_types::ReputationChangeKind;
 use reth_storage_api::BlockNumReader;
@@ -581,6 +582,9 @@ impl<N: NetworkPrimitives> NetworkManager<N> {
                     request,
                     response,
                 });
+            }
+            request => {
+                request.send_err_response(RequestError::UnsupportedCapability);
             }
         }
     }
