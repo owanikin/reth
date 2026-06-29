@@ -8224,6 +8224,7 @@ dependencies = [
  "reth-chainspec",
  "reth-config",
  "reth-consensus",
+ "reth-eth-wire-types",
  "reth-ethereum-primitives",
  "reth-metrics",
  "reth-network-p2p",
