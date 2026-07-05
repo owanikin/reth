@@ -1,16 +1,24 @@
 //! Partial-state snap downloader scaffolding.
 
+use alloy_consensus::constants::{EMPTY_ROOT_HASH, KECCAK_EMPTY};
 use alloy_primitives::B256;
+use alloy_rlp::Decodable;
 use futures::{Future, Stream};
 use futures_util::FutureExt;
-use reth_eth_wire_types::snap::{AccountRangeMessage, GetAccountRangeMessage};
+use reth_eth_wire_types::snap::{
+    AccountRangeMessage, ByteCodesMessage, GetAccountRangeMessage, GetByteCodesMessage,
+    GetStorageRangesMessage, StorageRangesMessage,
+};
 use reth_network_p2p::{
     error::{PeerRequestResult, RequestError},
     priority::Priority,
     snap::client::{SnapClient, SnapResponse},
 };
 use reth_network_peers::PeerId;
+use reth_storage_api::{AllowAllContractFilter, ContractFilter};
+use reth_trie_common::TrieAccount;
 use std::{
+    collections::VecDeque,
     pin::Pin,
     task::{ready, Context, Poll},
 };
@@ -55,10 +63,37 @@ impl Default for PartialStateSnapDownloaderConfig {
 pub struct PartialStateSnapProgress {
     /// Number of account leaves returned by peers.
     pub accounts: u64,
+    /// Number of account leaf bytes returned by peers.
+    pub account_bytes: u64,
     /// Number of account proof nodes returned by peers.
     pub account_proofs: u64,
+    /// Number of account proof bytes returned by peers.
+    pub account_proof_bytes: u64,
+    /// Number of storage range requests completed successfully.
+    pub storage_range_responses: u64,
+    /// Number of storage slots returned by peers.
+    pub storage_slots: u64,
+    /// Number of storage slot/proof bytes returned by peers.
+    pub storage_bytes: u64,
+    /// Number of storage tries skipped because the account is untracked.
+    pub storage_skipped: u64,
+    /// Number of bytecode requests completed successfully.
+    pub bytecode_responses: u64,
+    /// Number of bytecodes returned by peers.
+    pub bytecodes: u64,
+    /// Number of bytecode bytes returned by peers.
+    pub bytecode_bytes: u64,
+    /// Number of bytecodes skipped because the account is untracked.
+    pub bytecodes_skipped: u64,
     /// Number of account-range requests completed successfully.
     pub account_range_responses: u64,
+}
+
+impl PartialStateSnapProgress {
+    /// Returns the total downloaded state payload bytes seen by this downloader.
+    pub const fn state_bytes(&self) -> u64 {
+        self.account_bytes + self.account_proof_bytes + self.storage_bytes + self.bytecode_bytes
+    }
 }
 
 /// Stream item emitted by the partial-state snap downloader.
@@ -70,6 +105,24 @@ pub enum PartialStateSnapEvent {
         peer_id: PeerId,
         /// Account range response.
         response: AccountRangeMessage,
+        /// Progress after applying this response.
+        progress: PartialStateSnapProgress,
+    },
+    /// Storage ranges returned by a snap peer.
+    StorageRanges {
+        /// Peer that served the response.
+        peer_id: PeerId,
+        /// Storage ranges response.
+        response: StorageRangesMessage,
+        /// Progress after applying this response.
+        progress: PartialStateSnapProgress,
+    },
+    /// Bytecodes returned by a snap peer.
+    ByteCodes {
+        /// Peer that served the response.
+        peer_id: PeerId,
+        /// Bytecodes response.
+        response: ByteCodesMessage,
         /// Progress after applying this response.
         progress: PartialStateSnapProgress,
     },
@@ -87,6 +140,14 @@ pub enum PartialStateSnapDownloaderError {
     /// Snap request failed.
     #[error(transparent)]
     Request(#[from] RequestError),
+    /// Account leaf body failed to decode.
+    #[error("failed to decode snap account {account_hash}")]
+    AccountDecode {
+        /// Account hash whose body failed to decode.
+        account_hash: B256,
+        /// RLP decoding error.
+        source: alloy_rlp::Error,
+    },
     /// Peer returned a snap response that does not match the active request.
     #[error("unexpected snap response: {0}")]
     UnexpectedResponse(&'static str),
@@ -99,9 +160,14 @@ pub enum PartialStateSnapDownloaderError {
 /// account leaves available locally.
 #[must_use = "Stream does nothing unless polled"]
 #[derive(Debug)]
-pub struct PartialStateSnapDownloader<C: SnapClient> {
+pub struct PartialStateSnapDownloader<C: SnapClient, F = AllowAllContractFilter>
+where
+    F: ContractFilter,
+{
     /// Client used to send snap requests.
     client: C,
+    /// Optional partial-state filter.
+    filter: Option<F>,
     /// Downloader configuration.
     config: PartialStateSnapDownloaderConfig,
     /// Active account range target.
@@ -110,13 +176,21 @@ pub struct PartialStateSnapDownloader<C: SnapClient> {
     next_account_hash: B256,
     /// Account-range request in flight.
     in_flight_account_range: Option<AccountRangeRequestFuture<C::Output>>,
+    /// Storage range requests waiting to be sent.
+    pending_storage_ranges: VecDeque<GetStorageRangesMessage>,
+    /// Bytecode requests waiting to be sent.
+    pending_bytecodes: VecDeque<GetByteCodesMessage>,
+    /// Storage range request in flight.
+    in_flight_storage_ranges: Option<StorageRangesRequestFuture<C::Output>>,
+    /// Bytecode request in flight.
+    in_flight_bytecodes: Option<ByteCodesRequestFuture<C::Output>>,
     /// Progress counters.
     progress: PartialStateSnapProgress,
     /// Whether the configured target has completed.
     finished: bool,
 }
 
-impl<C> PartialStateSnapDownloader<C>
+impl<C> PartialStateSnapDownloader<C, AllowAllContractFilter>
 where
     C: SnapClient,
 {
@@ -126,18 +200,43 @@ where
     }
 
     /// Creates a new partial-state snap downloader with the given configuration.
-    pub const fn with_config(client: C, config: PartialStateSnapDownloaderConfig) -> Self {
+    pub fn with_config(client: C, config: PartialStateSnapDownloaderConfig) -> Self {
         Self {
             client,
+            filter: None,
             config,
             target: None,
             next_account_hash: B256::ZERO,
             in_flight_account_range: None,
-            progress: PartialStateSnapProgress {
-                accounts: 0,
-                account_proofs: 0,
-                account_range_responses: 0,
-            },
+            pending_storage_ranges: VecDeque::new(),
+            pending_bytecodes: VecDeque::new(),
+            in_flight_storage_ranges: None,
+            in_flight_bytecodes: None,
+            progress: PartialStateSnapProgress::new(),
+            finished: false,
+        }
+    }
+}
+
+impl<C, F> PartialStateSnapDownloader<C, F>
+where
+    C: SnapClient,
+    F: ContractFilter,
+{
+    /// Creates a new partial-state snap downloader with a contract filter.
+    pub fn with_filter(client: C, config: PartialStateSnapDownloaderConfig, filter: F) -> Self {
+        Self {
+            client,
+            filter: Some(filter),
+            config,
+            target: None,
+            next_account_hash: B256::ZERO,
+            in_flight_account_range: None,
+            pending_storage_ranges: VecDeque::new(),
+            pending_bytecodes: VecDeque::new(),
+            in_flight_storage_ranges: None,
+            in_flight_bytecodes: None,
+            progress: PartialStateSnapProgress::new(),
             finished: false,
         }
     }
@@ -147,8 +246,11 @@ where
         self.target = Some(target);
         self.next_account_hash = target.starting_hash;
         self.in_flight_account_range = None;
-        self.progress =
-            PartialStateSnapProgress { accounts: 0, account_proofs: 0, account_range_responses: 0 };
+        self.pending_storage_ranges.clear();
+        self.pending_bytecodes.clear();
+        self.in_flight_storage_ranges = None;
+        self.in_flight_bytecodes = None;
+        self.progress = PartialStateSnapProgress::new();
         self.finished = false;
     }
 
@@ -169,7 +271,7 @@ where
 
     /// Queues the next account-range request if no request is currently in flight.
     fn queue_next_account_range(&mut self) -> Result<bool, PartialStateSnapDownloaderError> {
-        if self.finished || self.in_flight_account_range.is_some() {
+        if self.finished || self.in_flight_account_range.is_some() || self.has_state_work() {
             return Ok(false)
         }
 
@@ -198,8 +300,14 @@ where
         response: AccountRangeMessage,
     ) -> Result<PartialStateSnapEvent, PartialStateSnapDownloaderError> {
         self.progress.accounts += response.accounts.len() as u64;
+        self.progress.account_bytes +=
+            response.accounts.iter().map(|account| account.body.len() as u64).sum::<u64>();
         self.progress.account_proofs += response.proof.len() as u64;
+        self.progress.account_proof_bytes +=
+            response.proof.iter().map(|proof| proof.len() as u64).sum::<u64>();
         self.progress.account_range_responses += 1;
+
+        self.queue_state_requests_from_accounts(&response)?;
 
         let Some(last_account) = response.accounts.last() else {
             self.finished = true;
@@ -220,19 +328,214 @@ where
 
         Ok(PartialStateSnapEvent::AccountRange { peer_id, response, progress: self.progress })
     }
+
+    /// Handles a storage-ranges response and updates progress counters.
+    fn on_storage_ranges_response(
+        &mut self,
+        peer_id: PeerId,
+        response: StorageRangesMessage,
+    ) -> PartialStateSnapEvent {
+        self.progress.storage_range_responses += 1;
+        self.progress.storage_slots +=
+            response.slots.iter().map(|slots| slots.len() as u64).sum::<u64>();
+        self.progress.storage_bytes +=
+            response.slots.iter().flatten().map(|slot| slot.data.len() as u64).sum::<u64>();
+        self.progress.storage_bytes +=
+            response.proof.iter().map(|proof| proof.len() as u64).sum::<u64>();
+
+        PartialStateSnapEvent::StorageRanges { peer_id, response, progress: self.progress }
+    }
+
+    /// Handles a bytecodes response and updates progress counters.
+    fn on_bytecodes_response(
+        &mut self,
+        peer_id: PeerId,
+        response: ByteCodesMessage,
+    ) -> PartialStateSnapEvent {
+        self.progress.bytecode_responses += 1;
+        self.progress.bytecodes += response.codes.len() as u64;
+        self.progress.bytecode_bytes +=
+            response.codes.iter().map(|code| code.len() as u64).sum::<u64>();
+
+        PartialStateSnapEvent::ByteCodes { peer_id, response, progress: self.progress }
+    }
+
+    /// Queues storage and bytecode requests derived from the returned account leaves.
+    fn queue_state_requests_from_accounts(
+        &mut self,
+        response: &AccountRangeMessage,
+    ) -> Result<(), PartialStateSnapDownloaderError> {
+        let mut storage_account_hashes = Vec::new();
+        let mut bytecode_hashes = Vec::new();
+
+        for account in &response.accounts {
+            let trie_account =
+                TrieAccount::decode(&mut account.body.as_ref()).map_err(|source| {
+                    PartialStateSnapDownloaderError::AccountDecode {
+                        account_hash: account.hash,
+                        source,
+                    }
+                })?;
+
+            if trie_account.storage_root != EMPTY_ROOT_HASH {
+                if self.should_sync_storage(account.hash) {
+                    storage_account_hashes.push(account.hash);
+                } else {
+                    self.progress.storage_skipped += 1;
+                }
+            }
+            if trie_account.code_hash != KECCAK_EMPTY {
+                if self.should_sync_code(account.hash) {
+                    bytecode_hashes.push(trie_account.code_hash);
+                } else {
+                    self.progress.bytecodes_skipped += 1;
+                }
+            }
+        }
+
+        if !storage_account_hashes.is_empty() {
+            let target = self.target.ok_or(PartialStateSnapDownloaderError::MissingTarget)?;
+            self.pending_storage_ranges.push_back(GetStorageRangesMessage {
+                request_id: 0,
+                root_hash: target.root_hash,
+                account_hashes: storage_account_hashes,
+                starting_hash: B256::ZERO,
+                limit_hash: B256::repeat_byte(0xff),
+                response_bytes: self.config.response_bytes,
+            });
+        }
+        if !bytecode_hashes.is_empty() {
+            self.pending_bytecodes.push_back(GetByteCodesMessage {
+                request_id: 0,
+                hashes: bytecode_hashes,
+                response_bytes: self.config.response_bytes,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Returns true if any derived storage or bytecode work is queued or in flight.
+    fn has_state_work(&self) -> bool {
+        !self.pending_storage_ranges.is_empty() ||
+            !self.pending_bytecodes.is_empty() ||
+            self.in_flight_storage_ranges.is_some() ||
+            self.in_flight_bytecodes.is_some()
+    }
+
+    /// Returns whether storage should be downloaded for the account hash.
+    fn should_sync_storage(&self, account_hash: B256) -> bool {
+        self.filter.as_ref().is_none_or(|filter| filter.should_sync_storage_by_hash(&account_hash))
+    }
+
+    /// Returns whether bytecode should be downloaded for the account hash.
+    fn should_sync_code(&self, account_hash: B256) -> bool {
+        self.filter.as_ref().is_none_or(|filter| filter.should_sync_code_by_hash(&account_hash))
+    }
+
+    /// Queues a storage request from the pending queue if none is currently in flight.
+    fn queue_storage_ranges(&mut self) {
+        if self.in_flight_storage_ranges.is_none() {
+            if let Some(request) = self.pending_storage_ranges.pop_front() {
+                let fut =
+                    self.client.get_storage_ranges_with_priority(request.clone(), Priority::High);
+                self.in_flight_storage_ranges = Some(StorageRangesRequestFuture { request, fut });
+            }
+        }
+    }
+
+    /// Queues a bytecodes request from the pending queue if none is currently in flight.
+    fn queue_bytecodes(&mut self) {
+        if self.in_flight_bytecodes.is_none() {
+            if let Some(request) = self.pending_bytecodes.pop_front() {
+                let fut = self.client.get_byte_codes_with_priority(request.clone(), Priority::High);
+                self.in_flight_bytecodes = Some(ByteCodesRequestFuture { request, fut });
+            }
+        }
+    }
 }
 
-impl<C> Stream for PartialStateSnapDownloader<C>
+impl<C, F> Stream for PartialStateSnapDownloader<C, F>
 where
     C: SnapClient + Unpin,
+    F: ContractFilter + Unpin,
 {
     type Item = Result<PartialStateSnapEvent, PartialStateSnapDownloaderError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
-        if this.finished {
+        if this.finished && !this.has_state_work() {
             return Poll::Ready(None)
+        }
+
+        this.queue_storage_ranges();
+        this.queue_bytecodes();
+
+        if let Some(mut request) = this.in_flight_storage_ranges.take() {
+            match request.poll_unpin(cx) {
+                Poll::Ready(StorageRangesRequestOutcome { outcome, .. }) => match outcome {
+                    Ok(response) => {
+                        let (peer_id, response) = response.split();
+                        return match response {
+                            SnapResponse::StorageRanges(response) => Poll::Ready(Some(Ok(
+                                this.on_storage_ranges_response(peer_id, response)
+                            ))),
+                            SnapResponse::AccountRange(_) => Poll::Ready(Some(Err(
+                                PartialStateSnapDownloaderError::UnexpectedResponse(
+                                    "account range",
+                                ),
+                            ))),
+                            SnapResponse::ByteCodes(_) => Poll::Ready(Some(Err(
+                                PartialStateSnapDownloaderError::UnexpectedResponse("bytecodes"),
+                            ))),
+                            SnapResponse::TrieNodes(_) => Poll::Ready(Some(Err(
+                                PartialStateSnapDownloaderError::UnexpectedResponse("trie nodes"),
+                            ))),
+                        }
+                    }
+                    Err(error) => return Poll::Ready(Some(Err(error.into()))),
+                },
+                Poll::Pending => {
+                    this.in_flight_storage_ranges = Some(request);
+                }
+            }
+        }
+
+        if let Some(mut request) = this.in_flight_bytecodes.take() {
+            match request.poll_unpin(cx) {
+                Poll::Ready(ByteCodesRequestOutcome { outcome, .. }) => match outcome {
+                    Ok(response) => {
+                        let (peer_id, response) = response.split();
+                        return match response {
+                            SnapResponse::ByteCodes(response) => {
+                                Poll::Ready(Some(Ok(this.on_bytecodes_response(peer_id, response))))
+                            }
+                            SnapResponse::AccountRange(_) => Poll::Ready(Some(Err(
+                                PartialStateSnapDownloaderError::UnexpectedResponse(
+                                    "account range",
+                                ),
+                            ))),
+                            SnapResponse::StorageRanges(_) => Poll::Ready(Some(Err(
+                                PartialStateSnapDownloaderError::UnexpectedResponse(
+                                    "storage ranges",
+                                ),
+                            ))),
+                            SnapResponse::TrieNodes(_) => Poll::Ready(Some(Err(
+                                PartialStateSnapDownloaderError::UnexpectedResponse("trie nodes"),
+                            ))),
+                        }
+                    }
+                    Err(error) => return Poll::Ready(Some(Err(error.into()))),
+                },
+                Poll::Pending => {
+                    this.in_flight_bytecodes = Some(request);
+                }
+            }
+        }
+
+        if this.has_state_work() {
+            return Poll::Pending
         }
 
         if let Err(error) = this.queue_next_account_range() {
@@ -274,6 +577,26 @@ where
     }
 }
 
+impl PartialStateSnapProgress {
+    const fn new() -> Self {
+        Self {
+            accounts: 0,
+            account_bytes: 0,
+            account_proofs: 0,
+            account_proof_bytes: 0,
+            storage_range_responses: 0,
+            storage_slots: 0,
+            storage_bytes: 0,
+            storage_skipped: 0,
+            bytecode_responses: 0,
+            bytecodes: 0,
+            bytecode_bytes: 0,
+            bytecodes_skipped: 0,
+            account_range_responses: 0,
+        }
+    }
+}
+
 /// Future returned for an account-range request.
 #[derive(Debug)]
 struct AccountRangeRequestFuture<F> {
@@ -303,6 +626,64 @@ struct AccountRangeRequestOutcome {
     outcome: PeerRequestResult<SnapResponse>,
 }
 
+/// Future returned for a storage-ranges request.
+#[derive(Debug)]
+struct StorageRangesRequestFuture<F> {
+    request: GetStorageRangesMessage,
+    fut: F,
+}
+
+impl<F> Future for StorageRangesRequestFuture<F>
+where
+    F: Future<Output = PeerRequestResult<SnapResponse>> + Send + Sync + Unpin,
+{
+    type Output = StorageRangesRequestOutcome;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let outcome = ready!(this.fut.poll_unpin(cx));
+
+        Poll::Ready(StorageRangesRequestOutcome { request: this.request.clone(), outcome })
+    }
+}
+
+/// Storage-ranges request outcome.
+#[derive(Debug)]
+struct StorageRangesRequestOutcome {
+    #[allow(dead_code)]
+    request: GetStorageRangesMessage,
+    outcome: PeerRequestResult<SnapResponse>,
+}
+
+/// Future returned for a bytecodes request.
+#[derive(Debug)]
+struct ByteCodesRequestFuture<F> {
+    request: GetByteCodesMessage,
+    fut: F,
+}
+
+impl<F> Future for ByteCodesRequestFuture<F>
+where
+    F: Future<Output = PeerRequestResult<SnapResponse>> + Send + Sync + Unpin,
+{
+    type Output = ByteCodesRequestOutcome;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let outcome = ready!(this.fut.poll_unpin(cx));
+
+        Poll::Ready(ByteCodesRequestOutcome { request: this.request.clone(), outcome })
+    }
+}
+
+/// Bytecodes request outcome.
+#[derive(Debug)]
+struct ByteCodesRequestOutcome {
+    #[allow(dead_code)]
+    request: GetByteCodesMessage,
+    outcome: PeerRequestResult<SnapResponse>,
+}
+
 /// Returns the next account hash after `hash`.
 fn next_hash(mut hash: B256) -> Option<B256> {
     for byte in hash.as_mut_slice().iter_mut().rev() {
@@ -318,16 +699,17 @@ fn next_hash(mut hash: B256) -> Option<B256> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::Bytes;
+    use alloy_primitives::{Address, Bytes, U256};
     use futures_util::StreamExt;
     use reth_eth_wire_types::snap::{
-        ByteCodesMessage, GetByteCodesMessage, GetStorageRangesMessage, GetTrieNodesMessage,
-        StorageRangesMessage, TrieNodesMessage,
+        AccountData, ByteCodesMessage, GetByteCodesMessage, GetStorageRangesMessage,
+        GetTrieNodesMessage, StorageData, StorageRangesMessage, TrieNodesMessage,
     };
     use reth_network_p2p::download::DownloadClient;
     use reth_network_peers::WithPeerId;
+    use reth_storage_api::ContractFilter;
     use std::{
-        collections::VecDeque,
+        collections::{BTreeSet, VecDeque},
         fmt,
         sync::{Arc, Mutex},
     };
@@ -366,9 +748,10 @@ mod tests {
                 peer_id: peer,
                 response,
                 progress: PartialStateSnapProgress {
-                    accounts: 0,
                     account_proofs: 1,
+                    account_proof_bytes: 1,
                     account_range_responses: 1,
+                    ..Default::default()
                 },
             }
         );
@@ -381,15 +764,13 @@ mod tests {
         let peer = PeerId::repeat_byte(0x22);
         let first_hash = B256::repeat_byte(0x01);
         let second_hash = B256::repeat_byte(0x02);
+        let account_body = encoded_account(EMPTY_ROOT_HASH, KECCAK_EMPTY);
         let client = MockSnapClient::new([
             Ok(WithPeerId::new(
                 peer,
                 SnapResponse::AccountRange(AccountRangeMessage {
                     request_id: 0,
-                    accounts: vec![reth_eth_wire_types::snap::AccountData {
-                        hash: first_hash,
-                        body: Bytes::new(),
-                    }],
+                    accounts: vec![AccountData { hash: first_hash, body: account_body.clone() }],
                     proof: vec![],
                 }),
             )),
@@ -397,10 +778,7 @@ mod tests {
                 peer,
                 SnapResponse::AccountRange(AccountRangeMessage {
                     request_id: 0,
-                    accounts: vec![reth_eth_wire_types::snap::AccountData {
-                        hash: second_hash,
-                        body: Bytes::new(),
-                    }],
+                    accounts: vec![AccountData { hash: second_hash, body: account_body.clone() }],
                     proof: vec![],
                 }),
             )),
@@ -427,8 +805,142 @@ mod tests {
         assert!(downloader.is_finished());
         assert_eq!(
             downloader.progress(),
-            PartialStateSnapProgress { accounts: 2, account_proofs: 0, account_range_responses: 2 }
+            PartialStateSnapProgress {
+                accounts: 2,
+                account_bytes: account_body.len() as u64 * 2,
+                account_range_responses: 2,
+                ..Default::default()
+            }
         );
+    }
+
+    #[tokio::test]
+    async fn downloads_tracked_state_and_counts_skips() {
+        let root = B256::repeat_byte(0x11);
+        let peer = PeerId::repeat_byte(0x22);
+        let tracked_hash = B256::with_last_byte(1);
+        let untracked_hash = B256::with_last_byte(2);
+        let tracked_storage_root = B256::repeat_byte(0x33);
+        let tracked_code_hash = B256::repeat_byte(0x44);
+        let untracked_storage_root = B256::repeat_byte(0x55);
+        let untracked_code_hash = B256::repeat_byte(0x66);
+        let storage_response = StorageRangesMessage {
+            request_id: 0,
+            slots: vec![vec![StorageData {
+                hash: B256::repeat_byte(0x77),
+                data: Bytes::from_static(&[0xaa, 0xbb]),
+            }]],
+            proof: vec![Bytes::from_static(&[0xcc])],
+        };
+        let bytecodes_response =
+            ByteCodesMessage { request_id: 0, codes: vec![Bytes::from_static(&[0x60, 0x00])] };
+        let client = MockSnapClient::new([
+            Ok(WithPeerId::new(
+                peer,
+                SnapResponse::AccountRange(AccountRangeMessage {
+                    request_id: 0,
+                    accounts: vec![
+                        AccountData {
+                            hash: tracked_hash,
+                            body: encoded_account(tracked_storage_root, tracked_code_hash),
+                        },
+                        AccountData {
+                            hash: untracked_hash,
+                            body: encoded_account(untracked_storage_root, untracked_code_hash),
+                        },
+                    ],
+                    proof: vec![],
+                }),
+            )),
+            Ok(WithPeerId::new(peer, SnapResponse::StorageRanges(storage_response.clone()))),
+            Ok(WithPeerId::new(peer, SnapResponse::ByteCodes(bytecodes_response.clone()))),
+        ]);
+        let mut downloader = PartialStateSnapDownloader::with_filter(
+            client.clone(),
+            PartialStateSnapDownloaderConfig { response_bytes: 1024 },
+            TestHashFilter::new([tracked_hash]),
+        );
+
+        downloader.start(PartialStateSnapTarget {
+            root_hash: root,
+            starting_hash: tracked_hash,
+            limit_hash: untracked_hash,
+        });
+
+        assert!(matches!(
+            downloader.next().await.unwrap().unwrap(),
+            PartialStateSnapEvent::AccountRange { .. }
+        ));
+        assert_eq!(downloader.progress().storage_skipped, 1);
+        assert_eq!(downloader.progress().bytecodes_skipped, 1);
+
+        let storage_event = downloader.next().await.unwrap().unwrap();
+        assert_eq!(
+            client.storage_range_requests(),
+            vec![GetStorageRangesMessage {
+                request_id: 0,
+                root_hash: root,
+                account_hashes: vec![tracked_hash],
+                starting_hash: B256::ZERO,
+                limit_hash: B256::repeat_byte(0xff),
+                response_bytes: 1024,
+            }]
+        );
+        assert_eq!(
+            client.bytecode_requests(),
+            vec![GetByteCodesMessage {
+                request_id: 0,
+                hashes: vec![tracked_code_hash],
+                response_bytes: 1024,
+            }]
+        );
+
+        assert_eq!(
+            storage_event,
+            PartialStateSnapEvent::StorageRanges {
+                peer_id: peer,
+                response: storage_response,
+                progress: PartialStateSnapProgress {
+                    accounts: 2,
+                    account_bytes: encoded_account(tracked_storage_root, tracked_code_hash).len()
+                        as u64 +
+                        encoded_account(untracked_storage_root, untracked_code_hash).len() as u64,
+                    storage_range_responses: 1,
+                    storage_slots: 1,
+                    storage_bytes: 3,
+                    storage_skipped: 1,
+                    bytecodes_skipped: 1,
+                    account_range_responses: 1,
+                    ..Default::default()
+                },
+            }
+        );
+
+        let bytecodes_event = downloader.next().await.unwrap().unwrap();
+        assert_eq!(
+            bytecodes_event,
+            PartialStateSnapEvent::ByteCodes {
+                peer_id: peer,
+                response: bytecodes_response,
+                progress: PartialStateSnapProgress {
+                    accounts: 2,
+                    account_bytes: encoded_account(tracked_storage_root, tracked_code_hash).len()
+                        as u64 +
+                        encoded_account(untracked_storage_root, untracked_code_hash).len() as u64,
+                    storage_range_responses: 1,
+                    storage_slots: 1,
+                    storage_bytes: 3,
+                    storage_skipped: 1,
+                    bytecode_responses: 1,
+                    bytecodes: 1,
+                    bytecode_bytes: 2,
+                    bytecodes_skipped: 1,
+                    account_range_responses: 1,
+                    ..Default::default()
+                },
+            }
+        );
+        assert!(downloader.next().await.is_none());
     }
 
     #[tokio::test]
@@ -462,6 +974,8 @@ mod tests {
     struct MockSnapClient {
         responses: Arc<Mutex<VecDeque<PeerRequestResult<SnapResponse>>>>,
         account_range_requests: Arc<Mutex<Vec<GetAccountRangeMessage>>>,
+        storage_range_requests: Arc<Mutex<Vec<GetStorageRangesMessage>>>,
+        bytecode_requests: Arc<Mutex<Vec<GetByteCodesMessage>>>,
     }
 
     impl MockSnapClient {
@@ -469,6 +983,8 @@ mod tests {
             Self {
                 responses: Arc::new(Mutex::new(responses.into_iter().collect())),
                 account_range_requests: Default::default(),
+                storage_range_requests: Default::default(),
+                bytecode_requests: Default::default(),
             }
         }
 
@@ -480,6 +996,14 @@ mod tests {
 
         fn account_range_requests(&self) -> Vec<GetAccountRangeMessage> {
             self.account_range_requests.lock().unwrap().clone()
+        }
+
+        fn storage_range_requests(&self) -> Vec<GetStorageRangesMessage> {
+            self.storage_range_requests.lock().unwrap().clone()
+        }
+
+        fn bytecode_requests(&self) -> Vec<GetByteCodesMessage> {
+            self.bytecode_requests.lock().unwrap().clone()
         }
     }
 
@@ -518,17 +1042,11 @@ mod tests {
 
         fn get_storage_ranges_with_priority(
             &self,
-            _request: GetStorageRangesMessage,
+            request: GetStorageRangesMessage,
             _priority: Priority,
         ) -> Self::Output {
-            Box::pin(futures::future::ready(Ok(WithPeerId::new(
-                PeerId::default(),
-                SnapResponse::StorageRanges(StorageRangesMessage {
-                    request_id: 0,
-                    slots: vec![],
-                    proof: vec![],
-                }),
-            ))))
+            self.storage_range_requests.lock().unwrap().push(request);
+            self.next_response()
         }
 
         fn get_byte_codes(&self, request: GetByteCodesMessage) -> Self::Output {
@@ -537,13 +1055,11 @@ mod tests {
 
         fn get_byte_codes_with_priority(
             &self,
-            _request: GetByteCodesMessage,
+            request: GetByteCodesMessage,
             _priority: Priority,
         ) -> Self::Output {
-            Box::pin(futures::future::ready(Ok(WithPeerId::new(
-                PeerId::default(),
-                SnapResponse::ByteCodes(ByteCodesMessage { request_id: 0, codes: vec![] }),
-            ))))
+            self.bytecode_requests.lock().unwrap().push(request);
+            self.next_response()
         }
 
         fn get_trie_nodes(&self, request: GetTrieNodesMessage) -> Self::Output {
@@ -560,5 +1076,47 @@ mod tests {
                 SnapResponse::TrieNodes(TrieNodesMessage { request_id: 0, nodes: vec![] }),
             ))))
         }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct TestHashFilter {
+        tracked: BTreeSet<B256>,
+    }
+
+    impl TestHashFilter {
+        fn new(hashes: impl IntoIterator<Item = B256>) -> Self {
+            Self { tracked: hashes.into_iter().collect() }
+        }
+    }
+
+    impl ContractFilter for TestHashFilter {
+        fn should_sync_storage(&self, _address: &Address) -> bool {
+            false
+        }
+
+        fn should_sync_code(&self, _address: &Address) -> bool {
+            false
+        }
+
+        fn should_sync_storage_by_hash(&self, account_hash: &B256) -> bool {
+            self.tracked.contains(account_hash)
+        }
+
+        fn should_sync_code_by_hash(&self, account_hash: &B256) -> bool {
+            self.tracked.contains(account_hash)
+        }
+
+        fn is_tracked(&self, _address: &Address) -> bool {
+            false
+        }
+    }
+
+    fn encoded_account(storage_root: B256, code_hash: B256) -> Bytes {
+        Bytes::from(alloy_rlp::encode(TrieAccount {
+            nonce: 0,
+            balance: U256::ZERO,
+            storage_root,
+            code_hash,
+        }))
     }
 }

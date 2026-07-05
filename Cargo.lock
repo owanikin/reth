@@ -8235,6 +8235,7 @@ dependencies = [
  "reth-tasks",
  "reth-testing-utils",
  "reth-tracing",
+ "reth-trie-common",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
