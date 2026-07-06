@@ -1,7 +1,7 @@
 //! Partial-state snap downloader scaffolding.
 
 use alloy_consensus::constants::{EMPTY_ROOT_HASH, KECCAK_EMPTY};
-use alloy_primitives::B256;
+use alloy_primitives::{B256, U256};
 use alloy_rlp::Decodable;
 use futures::{Future, Stream};
 use futures_util::FutureExt;
@@ -15,7 +15,7 @@ use reth_network_p2p::{
     snap::client::{SnapClient, SnapResponse},
 };
 use reth_network_peers::PeerId;
-use reth_storage_api::{AllowAllContractFilter, ContractFilter};
+use reth_storage_api::{AllowAllContractFilter, ContractFilter, PartialStateSnapWriter};
 use reth_trie_common::TrieAccount;
 use std::{
     collections::VecDeque,
@@ -613,31 +613,6 @@ impl PartialStateSnapProgress {
     }
 }
 
-/// Writes partial snap state records into durable storage.
-pub trait PartialStateSnapWriter {
-    /// Writer error type.
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    /// Persists an account leaf returned by snap sync.
-    fn write_account(
-        &mut self,
-        account_hash: B256,
-        account: TrieAccount,
-        encoded_account: &[u8],
-    ) -> Result<(), Self::Error>;
-
-    /// Persists a storage slot returned by snap sync.
-    fn write_storage(
-        &mut self,
-        account_hash: B256,
-        slot_hash: B256,
-        encoded_value: &[u8],
-    ) -> Result<(), Self::Error>;
-
-    /// Persists bytecode returned by snap sync.
-    fn write_bytecode(&mut self, code_hash: B256, bytecode: &[u8]) -> Result<(), Self::Error>;
-}
-
 /// Wraps a partial-state snap downloader and persists successful responses before yielding them.
 #[must_use = "Stream does nothing unless polled"]
 #[derive(Debug)]
@@ -689,6 +664,16 @@ where
         /// RLP decoding error.
         source: alloy_rlp::Error,
     },
+    /// Storage slot body failed to decode while persisting.
+    #[error("failed to decode snap storage slot {slot_hash} for account {account_hash}")]
+    StorageDecode {
+        /// Account hash whose storage slot failed to decode.
+        account_hash: B256,
+        /// Storage slot hash whose body failed to decode.
+        slot_hash: B256,
+        /// RLP decoding error.
+        source: alloy_rlp::Error,
+    },
     /// A snap response contained more records than its original request can identify.
     #[error("{kind} response contains {got} records, but request identifies {expected}")]
     ResponseLengthMismatch {
@@ -705,6 +690,7 @@ impl<D, W> Stream for PersistedPartialStateSnapDownloader<D, W>
 where
     D: Stream<Item = Result<PartialStateSnapEvent, PartialStateSnapDownloaderError>> + Unpin,
     W: PartialStateSnapWriter + Unpin,
+    W::Error: std::error::Error + Send + Sync + 'static,
 {
     type Item = Result<PartialStateSnapEvent, PartialStateSnapPersistenceError<W::Error>>;
 
@@ -730,6 +716,7 @@ pub fn persist_snap_event<W>(
 ) -> Result<(), PartialStateSnapPersistenceError<W::Error>>
 where
     W: PartialStateSnapWriter,
+    W::Error: std::error::Error + Send + Sync + 'static,
 {
     match event {
         PartialStateSnapEvent::AccountRange { response, .. } => {
@@ -742,7 +729,7 @@ where
                         }
                     })?;
                 writer
-                    .write_account(account.hash, decoded, account.body.as_ref())
+                    .write_account(account.hash, decoded)
                     .map_err(PartialStateSnapPersistenceError::Writer)?;
             }
         }
@@ -757,8 +744,15 @@ where
             for (account_hash, slots) in request.account_hashes.iter().copied().zip(&response.slots)
             {
                 for slot in slots {
+                    let value = U256::decode(&mut slot.data.as_ref()).map_err(|source| {
+                        PartialStateSnapPersistenceError::StorageDecode {
+                            account_hash,
+                            slot_hash: slot.hash,
+                            source,
+                        }
+                    })?;
                     writer
-                        .write_storage(account_hash, slot.hash, slot.data.as_ref())
+                        .write_storage(account_hash, slot.hash, value)
                         .map_err(PartialStateSnapPersistenceError::Writer)?;
                 }
             }
@@ -1133,7 +1127,8 @@ mod tests {
         let code_hash = B256::repeat_byte(0x44);
         let slot_hash = B256::repeat_byte(0x55);
         let account_body = encoded_account(storage_root, code_hash);
-        let storage_value = Bytes::from_static(&[0xaa, 0xbb]);
+        let storage_value = U256::from(0xaabbu64);
+        let encoded_storage_value = Bytes::from(alloy_rlp::encode(storage_value));
         let bytecode = Bytes::from_static(&[0x60, 0x00]);
         let client = MockSnapClient::new([
             Ok(WithPeerId::new(
@@ -1148,7 +1143,7 @@ mod tests {
                 peer,
                 SnapResponse::StorageRanges(StorageRangesMessage {
                     request_id: 0,
-                    slots: vec![vec![StorageData { hash: slot_hash, data: storage_value.clone() }]],
+                    slots: vec![vec![StorageData { hash: slot_hash, data: encoded_storage_value }]],
                     proof: vec![],
                 }),
             )),
@@ -1184,16 +1179,11 @@ mod tests {
             vec![RecordedAccount {
                 account_hash,
                 account: TrieAccount { nonce: 0, balance: U256::ZERO, storage_root, code_hash },
-                encoded: account_body.to_vec(),
             }]
         );
         assert_eq!(
             records.storage,
-            vec![RecordedStorage {
-                account_hash,
-                slot_hash,
-                encoded_value: storage_value.to_vec(),
-            }]
+            vec![RecordedStorage { account_hash, slot_hash, value: storage_value }]
         );
         assert_eq!(
             records.bytecodes,
@@ -1240,13 +1230,8 @@ mod tests {
             &mut self,
             account_hash: B256,
             account: TrieAccount,
-            encoded_account: &[u8],
         ) -> Result<(), Self::Error> {
-            self.records.lock().unwrap().accounts.push(RecordedAccount {
-                account_hash,
-                account,
-                encoded: encoded_account.to_vec(),
-            });
+            self.records.lock().unwrap().accounts.push(RecordedAccount { account_hash, account });
             Ok(())
         }
 
@@ -1254,12 +1239,12 @@ mod tests {
             &mut self,
             account_hash: B256,
             slot_hash: B256,
-            encoded_value: &[u8],
+            value: U256,
         ) -> Result<(), Self::Error> {
             self.records.lock().unwrap().storage.push(RecordedStorage {
                 account_hash,
                 slot_hash,
-                encoded_value: encoded_value.to_vec(),
+                value,
             });
             Ok(())
         }
@@ -1285,14 +1270,13 @@ mod tests {
     struct RecordedAccount {
         account_hash: B256,
         account: TrieAccount,
-        encoded: Vec<u8>,
     }
 
     #[derive(Debug, PartialEq, Eq)]
     struct RecordedStorage {
         account_hash: B256,
         slot_hash: B256,
-        encoded_value: Vec<u8>,
+        value: U256,
     }
 
     #[derive(Debug, PartialEq, Eq)]

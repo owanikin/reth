@@ -41,6 +41,9 @@ pub use either_writer::*;
 mod bal;
 pub use bal::{BalConfig, InMemoryBalStore};
 
+mod partial_snap;
+pub use partial_snap::PartialStateSnapDbWriter;
+
 pub use reth_chain_state::{
     CanonStateNotification, CanonStateNotificationSender, CanonStateNotificationStream,
     CanonStateNotifications, CanonStateSubscriptions,

@@ -3,8 +3,9 @@ use alloy_eips::{
     eip7928::{bal::DecodedBal, compute_block_access_list_hash, BlockAccessList},
     NumHash,
 };
-use alloy_primitives::{keccak256, Address, BlockHash, BlockNumber, Bytes, Sealed, B256};
+use alloy_primitives::{keccak256, Address, BlockHash, BlockNumber, Bytes, Sealed, B256, U256};
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
+use reth_trie_common::TrieAccount;
 
 use crate::{BalStoreHandle, SealedBal};
 
@@ -36,6 +37,34 @@ pub trait ContractFilter: Send + Sync {
 
     /// Returns `true` if this contract is tracked by the partial-state node.
     fn is_tracked(&self, address: &Address) -> bool;
+}
+
+/// Writes snap state records retained by partial-state sync.
+///
+/// Snap state responses identify accounts and storage slots by their trie hashes. Implementations
+/// should therefore persist these records into hash-keyed state tables unless they have a separate
+/// source for address and storage preimages.
+pub trait PartialStateSnapWriter {
+    /// Writer error type.
+    type Error;
+
+    /// Persists an account leaf returned by snap sync.
+    fn write_account(
+        &mut self,
+        account_hash: B256,
+        account: TrieAccount,
+    ) -> Result<(), Self::Error>;
+
+    /// Persists a storage slot returned by snap sync.
+    fn write_storage(
+        &mut self,
+        account_hash: B256,
+        slot_hash: B256,
+        value: U256,
+    ) -> Result<(), Self::Error>;
+
+    /// Persists bytecode returned by snap sync.
+    fn write_bytecode(&mut self, code_hash: B256, bytecode: &[u8]) -> Result<(), Self::Error>;
 }
 
 /// A contract filter backed by a static set of tracked contract addresses.

@@ -9708,6 +9708,7 @@ dependencies = [
  "reth-tokio-util",
  "reth-tracing",
  "reth-trie",
+ "reth-trie-common",
  "reth-trie-db",
  "revm-database",
  "revm-database-interface",
