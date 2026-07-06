@@ -101,6 +101,8 @@ impl PartialStateSnapProgress {
 pub enum PartialStateSnapEvent {
     /// Account range data returned by a snap peer.
     AccountRange {
+        /// Request that produced this response.
+        request: GetAccountRangeMessage,
         /// Peer that served the response.
         peer_id: PeerId,
         /// Account range response.
@@ -110,6 +112,8 @@ pub enum PartialStateSnapEvent {
     },
     /// Storage ranges returned by a snap peer.
     StorageRanges {
+        /// Request that produced this response.
+        request: GetStorageRangesMessage,
         /// Peer that served the response.
         peer_id: PeerId,
         /// Storage ranges response.
@@ -119,6 +123,8 @@ pub enum PartialStateSnapEvent {
     },
     /// Bytecodes returned by a snap peer.
     ByteCodes {
+        /// Request that produced this response.
+        request: GetByteCodesMessage,
         /// Peer that served the response.
         peer_id: PeerId,
         /// Bytecodes response.
@@ -155,9 +161,10 @@ pub enum PartialStateSnapDownloaderError {
 
 /// Downloads snap account ranges for a partial-state initial sync.
 ///
-/// This skeleton deliberately starts with account-range orchestration. The follow-up stages can use
-/// the emitted account hashes to derive filtered storage and bytecode requests while keeping all
-/// account leaves available locally.
+/// The downloader keeps every account leaf visible to the caller and derives filtered storage and
+/// bytecode requests from those account leaves. Successful events can be wrapped with
+/// [`PersistedPartialStateSnapDownloader`] to write the returned state records before yielding
+/// them.
 #[must_use = "Stream does nothing unless polled"]
 #[derive(Debug)]
 pub struct PartialStateSnapDownloader<C: SnapClient, F = AllowAllContractFilter>
@@ -296,6 +303,7 @@ where
     /// Handles an account-range response and advances the account cursor.
     fn on_account_range_response(
         &mut self,
+        request: GetAccountRangeMessage,
         peer_id: PeerId,
         response: AccountRangeMessage,
     ) -> Result<PartialStateSnapEvent, PartialStateSnapDownloaderError> {
@@ -312,6 +320,7 @@ where
         let Some(last_account) = response.accounts.last() else {
             self.finished = true;
             return Ok(PartialStateSnapEvent::AccountRange {
+                request,
                 peer_id,
                 response,
                 progress: self.progress,
@@ -326,12 +335,18 @@ where
                 .ok_or(PartialStateSnapDownloaderError::AccountRangeExhausted)?;
         }
 
-        Ok(PartialStateSnapEvent::AccountRange { peer_id, response, progress: self.progress })
+        Ok(PartialStateSnapEvent::AccountRange {
+            request,
+            peer_id,
+            response,
+            progress: self.progress,
+        })
     }
 
     /// Handles a storage-ranges response and updates progress counters.
     fn on_storage_ranges_response(
         &mut self,
+        request: GetStorageRangesMessage,
         peer_id: PeerId,
         response: StorageRangesMessage,
     ) -> PartialStateSnapEvent {
@@ -343,12 +358,13 @@ where
         self.progress.storage_bytes +=
             response.proof.iter().map(|proof| proof.len() as u64).sum::<u64>();
 
-        PartialStateSnapEvent::StorageRanges { peer_id, response, progress: self.progress }
+        PartialStateSnapEvent::StorageRanges { request, peer_id, response, progress: self.progress }
     }
 
     /// Handles a bytecodes response and updates progress counters.
     fn on_bytecodes_response(
         &mut self,
+        request: GetByteCodesMessage,
         peer_id: PeerId,
         response: ByteCodesMessage,
     ) -> PartialStateSnapEvent {
@@ -357,7 +373,7 @@ where
         self.progress.bytecode_bytes +=
             response.codes.iter().map(|code| code.len() as u64).sum::<u64>();
 
-        PartialStateSnapEvent::ByteCodes { peer_id, response, progress: self.progress }
+        PartialStateSnapEvent::ByteCodes { request, peer_id, response, progress: self.progress }
     }
 
     /// Queues storage and bytecode requests derived from the returned account leaves.
@@ -474,12 +490,12 @@ where
 
         if let Some(mut request) = this.in_flight_storage_ranges.take() {
             match request.poll_unpin(cx) {
-                Poll::Ready(StorageRangesRequestOutcome { outcome, .. }) => match outcome {
+                Poll::Ready(StorageRangesRequestOutcome { request, outcome }) => match outcome {
                     Ok(response) => {
                         let (peer_id, response) = response.split();
                         return match response {
                             SnapResponse::StorageRanges(response) => Poll::Ready(Some(Ok(
-                                this.on_storage_ranges_response(peer_id, response)
+                                this.on_storage_ranges_response(request, peer_id, response)
                             ))),
                             SnapResponse::AccountRange(_) => Poll::Ready(Some(Err(
                                 PartialStateSnapDownloaderError::UnexpectedResponse(
@@ -504,13 +520,13 @@ where
 
         if let Some(mut request) = this.in_flight_bytecodes.take() {
             match request.poll_unpin(cx) {
-                Poll::Ready(ByteCodesRequestOutcome { outcome, .. }) => match outcome {
+                Poll::Ready(ByteCodesRequestOutcome { request, outcome }) => match outcome {
                     Ok(response) => {
                         let (peer_id, response) = response.split();
                         return match response {
-                            SnapResponse::ByteCodes(response) => {
-                                Poll::Ready(Some(Ok(this.on_bytecodes_response(peer_id, response))))
-                            }
+                            SnapResponse::ByteCodes(response) => Poll::Ready(Some(Ok(
+                                this.on_bytecodes_response(request, peer_id, response)
+                            ))),
                             SnapResponse::AccountRange(_) => Poll::Ready(Some(Err(
                                 PartialStateSnapDownloaderError::UnexpectedResponse(
                                     "account range",
@@ -549,13 +565,13 @@ where
         let Some(mut request) = this.in_flight_account_range.take() else { return Poll::Pending };
 
         match request.poll_unpin(cx) {
-            Poll::Ready(AccountRangeRequestOutcome { outcome, .. }) => match outcome {
+            Poll::Ready(AccountRangeRequestOutcome { request, outcome }) => match outcome {
                 Ok(response) => {
                     let (peer_id, response) = response.split();
                     match response {
-                        SnapResponse::AccountRange(response) => {
-                            Poll::Ready(Some(this.on_account_range_response(peer_id, response)))
-                        }
+                        SnapResponse::AccountRange(response) => Poll::Ready(Some(
+                            this.on_account_range_response(request, peer_id, response),
+                        )),
                         SnapResponse::StorageRanges(_) => Poll::Ready(Some(Err(
                             PartialStateSnapDownloaderError::UnexpectedResponse("storage ranges"),
                         ))),
@@ -595,6 +611,174 @@ impl PartialStateSnapProgress {
             account_range_responses: 0,
         }
     }
+}
+
+/// Writes partial snap state records into durable storage.
+pub trait PartialStateSnapWriter {
+    /// Writer error type.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Persists an account leaf returned by snap sync.
+    fn write_account(
+        &mut self,
+        account_hash: B256,
+        account: TrieAccount,
+        encoded_account: &[u8],
+    ) -> Result<(), Self::Error>;
+
+    /// Persists a storage slot returned by snap sync.
+    fn write_storage(
+        &mut self,
+        account_hash: B256,
+        slot_hash: B256,
+        encoded_value: &[u8],
+    ) -> Result<(), Self::Error>;
+
+    /// Persists bytecode returned by snap sync.
+    fn write_bytecode(&mut self, code_hash: B256, bytecode: &[u8]) -> Result<(), Self::Error>;
+}
+
+/// Wraps a partial-state snap downloader and persists successful responses before yielding them.
+#[must_use = "Stream does nothing unless polled"]
+#[derive(Debug)]
+pub struct PersistedPartialStateSnapDownloader<D, W> {
+    downloader: D,
+    writer: W,
+}
+
+impl<D, W> PersistedPartialStateSnapDownloader<D, W> {
+    /// Creates a new persisted downloader wrapper.
+    pub const fn new(downloader: D, writer: W) -> Self {
+        Self { downloader, writer }
+    }
+
+    /// Returns the wrapped downloader and writer.
+    pub fn into_parts(self) -> (D, W) {
+        (self.downloader, self.writer)
+    }
+}
+
+impl<C, F> PartialStateSnapDownloader<C, F>
+where
+    C: SnapClient,
+    F: ContractFilter,
+{
+    /// Persists successful downloader events with the provided writer.
+    pub const fn persist_with<W>(self, writer: W) -> PersistedPartialStateSnapDownloader<Self, W> {
+        PersistedPartialStateSnapDownloader::new(self, writer)
+    }
+}
+
+/// Error returned while persisting partial snap state responses.
+#[derive(Debug, Error)]
+pub enum PartialStateSnapPersistenceError<E>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    /// Downloader error.
+    #[error(transparent)]
+    Downloader(#[from] PartialStateSnapDownloaderError),
+    /// Writer error.
+    #[error("partial-state snap writer failed: {0}")]
+    Writer(E),
+    /// Account leaf body failed to decode while persisting.
+    #[error("failed to decode snap account {account_hash} while persisting")]
+    AccountDecode {
+        /// Account hash whose body failed to decode.
+        account_hash: B256,
+        /// RLP decoding error.
+        source: alloy_rlp::Error,
+    },
+    /// A snap response contained more records than its original request can identify.
+    #[error("{kind} response contains {got} records, but request identifies {expected}")]
+    ResponseLengthMismatch {
+        /// Response kind.
+        kind: &'static str,
+        /// Number of identifiers available in the request.
+        expected: usize,
+        /// Number of records returned by the response.
+        got: usize,
+    },
+}
+
+impl<D, W> Stream for PersistedPartialStateSnapDownloader<D, W>
+where
+    D: Stream<Item = Result<PartialStateSnapEvent, PartialStateSnapDownloaderError>> + Unpin,
+    W: PartialStateSnapWriter + Unpin,
+{
+    type Item = Result<PartialStateSnapEvent, PartialStateSnapPersistenceError<W::Error>>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match ready!(Pin::new(&mut this.downloader).poll_next(cx)) {
+            Some(Ok(event)) => {
+                if let Err(error) = persist_snap_event(&mut this.writer, &event) {
+                    return Poll::Ready(Some(Err(error)))
+                }
+                Poll::Ready(Some(Ok(event)))
+            }
+            Some(Err(error)) => Poll::Ready(Some(Err(error.into()))),
+            None => Poll::Ready(None),
+        }
+    }
+}
+
+/// Persists a single partial snap event.
+pub fn persist_snap_event<W>(
+    writer: &mut W,
+    event: &PartialStateSnapEvent,
+) -> Result<(), PartialStateSnapPersistenceError<W::Error>>
+where
+    W: PartialStateSnapWriter,
+{
+    match event {
+        PartialStateSnapEvent::AccountRange { response, .. } => {
+            for account in &response.accounts {
+                let decoded =
+                    TrieAccount::decode(&mut account.body.as_ref()).map_err(|source| {
+                        PartialStateSnapPersistenceError::AccountDecode {
+                            account_hash: account.hash,
+                            source,
+                        }
+                    })?;
+                writer
+                    .write_account(account.hash, decoded, account.body.as_ref())
+                    .map_err(PartialStateSnapPersistenceError::Writer)?;
+            }
+        }
+        PartialStateSnapEvent::StorageRanges { request, response, .. } => {
+            if response.slots.len() > request.account_hashes.len() {
+                return Err(PartialStateSnapPersistenceError::ResponseLengthMismatch {
+                    kind: "storage ranges",
+                    expected: request.account_hashes.len(),
+                    got: response.slots.len(),
+                })
+            }
+            for (account_hash, slots) in request.account_hashes.iter().copied().zip(&response.slots)
+            {
+                for slot in slots {
+                    writer
+                        .write_storage(account_hash, slot.hash, slot.data.as_ref())
+                        .map_err(PartialStateSnapPersistenceError::Writer)?;
+                }
+            }
+        }
+        PartialStateSnapEvent::ByteCodes { request, response, .. } => {
+            if response.codes.len() > request.hashes.len() {
+                return Err(PartialStateSnapPersistenceError::ResponseLengthMismatch {
+                    kind: "bytecodes",
+                    expected: request.hashes.len(),
+                    got: response.codes.len(),
+                })
+            }
+            for (code_hash, bytecode) in request.hashes.iter().copied().zip(&response.codes) {
+                writer
+                    .write_bytecode(code_hash, bytecode.as_ref())
+                    .map_err(PartialStateSnapPersistenceError::Writer)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Future returned for an account-range request.
@@ -710,6 +894,7 @@ mod tests {
     use reth_storage_api::ContractFilter;
     use std::{
         collections::{BTreeSet, VecDeque},
+        convert::Infallible,
         fmt,
         sync::{Arc, Mutex},
     };
@@ -732,19 +917,18 @@ mod tests {
         downloader.start(PartialStateSnapTarget::full_range(root));
 
         let event = downloader.next().await.unwrap().unwrap();
-        assert_eq!(
-            client.account_range_requests(),
-            vec![GetAccountRangeMessage {
-                request_id: 0,
-                root_hash: root,
-                starting_hash: B256::ZERO,
-                limit_hash: B256::repeat_byte(0xff),
-                response_bytes: DEFAULT_PARTIAL_STATE_SNAP_RESPONSE_BYTES,
-            }]
-        );
+        let request = GetAccountRangeMessage {
+            request_id: 0,
+            root_hash: root,
+            starting_hash: B256::ZERO,
+            limit_hash: B256::repeat_byte(0xff),
+            response_bytes: DEFAULT_PARTIAL_STATE_SNAP_RESPONSE_BYTES,
+        };
+        assert_eq!(client.account_range_requests(), vec![request.clone()]);
         assert_eq!(
             event,
             PartialStateSnapEvent::AccountRange {
+                request,
                 peer_id: peer,
                 response,
                 progress: PartialStateSnapProgress {
@@ -875,29 +1059,25 @@ mod tests {
         assert_eq!(downloader.progress().bytecodes_skipped, 1);
 
         let storage_event = downloader.next().await.unwrap().unwrap();
-        assert_eq!(
-            client.storage_range_requests(),
-            vec![GetStorageRangesMessage {
-                request_id: 0,
-                root_hash: root,
-                account_hashes: vec![tracked_hash],
-                starting_hash: B256::ZERO,
-                limit_hash: B256::repeat_byte(0xff),
-                response_bytes: 1024,
-            }]
-        );
-        assert_eq!(
-            client.bytecode_requests(),
-            vec![GetByteCodesMessage {
-                request_id: 0,
-                hashes: vec![tracked_code_hash],
-                response_bytes: 1024,
-            }]
-        );
-
+        let storage_request = GetStorageRangesMessage {
+            request_id: 0,
+            root_hash: root,
+            account_hashes: vec![tracked_hash],
+            starting_hash: B256::ZERO,
+            limit_hash: B256::repeat_byte(0xff),
+            response_bytes: 1024,
+        };
+        let bytecode_request = GetByteCodesMessage {
+            request_id: 0,
+            hashes: vec![tracked_code_hash],
+            response_bytes: 1024,
+        };
+        assert_eq!(client.storage_range_requests(), vec![storage_request.clone()]);
+        assert_eq!(client.bytecode_requests(), vec![bytecode_request.clone()]);
         assert_eq!(
             storage_event,
             PartialStateSnapEvent::StorageRanges {
+                request: storage_request,
                 peer_id: peer,
                 response: storage_response,
                 progress: PartialStateSnapProgress {
@@ -920,6 +1100,7 @@ mod tests {
         assert_eq!(
             bytecodes_event,
             PartialStateSnapEvent::ByteCodes {
+                request: bytecode_request,
                 peer_id: peer,
                 response: bytecodes_response,
                 progress: PartialStateSnapProgress {
@@ -941,6 +1122,83 @@ mod tests {
             }
         );
         assert!(downloader.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn persisted_downloader_writes_successful_events() {
+        let root = B256::repeat_byte(0x11);
+        let peer = PeerId::repeat_byte(0x22);
+        let account_hash = B256::with_last_byte(1);
+        let storage_root = B256::repeat_byte(0x33);
+        let code_hash = B256::repeat_byte(0x44);
+        let slot_hash = B256::repeat_byte(0x55);
+        let account_body = encoded_account(storage_root, code_hash);
+        let storage_value = Bytes::from_static(&[0xaa, 0xbb]);
+        let bytecode = Bytes::from_static(&[0x60, 0x00]);
+        let client = MockSnapClient::new([
+            Ok(WithPeerId::new(
+                peer,
+                SnapResponse::AccountRange(AccountRangeMessage {
+                    request_id: 0,
+                    accounts: vec![AccountData { hash: account_hash, body: account_body.clone() }],
+                    proof: vec![],
+                }),
+            )),
+            Ok(WithPeerId::new(
+                peer,
+                SnapResponse::StorageRanges(StorageRangesMessage {
+                    request_id: 0,
+                    slots: vec![vec![StorageData { hash: slot_hash, data: storage_value.clone() }]],
+                    proof: vec![],
+                }),
+            )),
+            Ok(WithPeerId::new(
+                peer,
+                SnapResponse::ByteCodes(ByteCodesMessage {
+                    request_id: 0,
+                    codes: vec![bytecode.clone()],
+                }),
+            )),
+        ]);
+        let mut downloader = PartialStateSnapDownloader::with_filter(
+            client,
+            PartialStateSnapDownloaderConfig { response_bytes: 1024 },
+            TestHashFilter::new([account_hash]),
+        );
+        downloader.start(PartialStateSnapTarget {
+            root_hash: root,
+            starting_hash: account_hash,
+            limit_hash: account_hash,
+        });
+        let writer = RecordingSnapWriter::default();
+        let records = writer.records.clone();
+        let mut persisted = downloader.persist_with(writer);
+
+        while let Some(event) = persisted.next().await {
+            event.unwrap();
+        }
+
+        let records = records.lock().unwrap();
+        assert_eq!(
+            records.accounts,
+            vec![RecordedAccount {
+                account_hash,
+                account: TrieAccount { nonce: 0, balance: U256::ZERO, storage_root, code_hash },
+                encoded: account_body.to_vec(),
+            }]
+        );
+        assert_eq!(
+            records.storage,
+            vec![RecordedStorage {
+                account_hash,
+                slot_hash,
+                encoded_value: storage_value.to_vec(),
+            }]
+        );
+        assert_eq!(
+            records.bytecodes,
+            vec![RecordedBytecode { code_hash, bytecode: bytecode.to_vec() }]
+        );
     }
 
     #[tokio::test]
@@ -968,6 +1226,79 @@ mod tests {
         let mut expected = B256::ZERO;
         expected.as_mut_slice()[30] = 1;
         assert_eq!(next_hash(hash), Some(expected));
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct RecordingSnapWriter {
+        records: Arc<Mutex<RecordedSnapState>>,
+    }
+
+    impl PartialStateSnapWriter for RecordingSnapWriter {
+        type Error = Infallible;
+
+        fn write_account(
+            &mut self,
+            account_hash: B256,
+            account: TrieAccount,
+            encoded_account: &[u8],
+        ) -> Result<(), Self::Error> {
+            self.records.lock().unwrap().accounts.push(RecordedAccount {
+                account_hash,
+                account,
+                encoded: encoded_account.to_vec(),
+            });
+            Ok(())
+        }
+
+        fn write_storage(
+            &mut self,
+            account_hash: B256,
+            slot_hash: B256,
+            encoded_value: &[u8],
+        ) -> Result<(), Self::Error> {
+            self.records.lock().unwrap().storage.push(RecordedStorage {
+                account_hash,
+                slot_hash,
+                encoded_value: encoded_value.to_vec(),
+            });
+            Ok(())
+        }
+
+        fn write_bytecode(&mut self, code_hash: B256, bytecode: &[u8]) -> Result<(), Self::Error> {
+            self.records
+                .lock()
+                .unwrap()
+                .bytecodes
+                .push(RecordedBytecode { code_hash, bytecode: bytecode.to_vec() });
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordedSnapState {
+        accounts: Vec<RecordedAccount>,
+        storage: Vec<RecordedStorage>,
+        bytecodes: Vec<RecordedBytecode>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct RecordedAccount {
+        account_hash: B256,
+        account: TrieAccount,
+        encoded: Vec<u8>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct RecordedStorage {
+        account_hash: B256,
+        slot_hash: B256,
+        encoded_value: Vec<u8>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct RecordedBytecode {
+        code_hash: B256,
+        bytecode: Vec<u8>,
     }
 
     #[derive(Clone, Default)]
