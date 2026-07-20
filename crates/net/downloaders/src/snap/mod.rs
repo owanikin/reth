@@ -4,7 +4,7 @@ use alloy_consensus::constants::{EMPTY_ROOT_HASH, KECCAK_EMPTY};
 use alloy_primitives::{B256, U256};
 use alloy_rlp::Decodable;
 use futures::{Future, Stream};
-use futures_util::FutureExt;
+use futures_util::{FutureExt, StreamExt};
 use reth_eth_wire_types::snap::{
     AccountRangeMessage, ByteCodesMessage, GetAccountRangeMessage, GetByteCodesMessage,
     GetStorageRangesMessage, StorageRangesMessage,
@@ -21,6 +21,7 @@ use std::{
     collections::VecDeque,
     pin::Pin,
     task::{ready, Context, Poll},
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 
@@ -55,6 +56,19 @@ pub struct PartialStateSnapDownloaderConfig {
 impl Default for PartialStateSnapDownloaderConfig {
     fn default() -> Self {
         Self { response_bytes: DEFAULT_PARTIAL_STATE_SNAP_RESPONSE_BYTES }
+    }
+}
+
+/// Configuration for running a partial-state snap download to completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartialStateSnapRunConfig {
+    /// Minimum interval between progress logs.
+    pub progress_log_interval: Duration,
+}
+
+impl Default for PartialStateSnapRunConfig {
+    fn default() -> Self {
+        Self { progress_log_interval: Duration::from_secs(8) }
     }
 }
 
@@ -96,6 +110,15 @@ impl PartialStateSnapProgress {
     }
 }
 
+/// Result returned after running a partial-state snap download to completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartialStateSnapRunOutcome {
+    /// Final progress counters.
+    pub progress: PartialStateSnapProgress,
+    /// Number of persisted snap events.
+    pub events: u64,
+}
+
 /// Stream item emitted by the partial-state snap downloader.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PartialStateSnapEvent {
@@ -132,6 +155,17 @@ pub enum PartialStateSnapEvent {
         /// Progress after applying this response.
         progress: PartialStateSnapProgress,
     },
+}
+
+impl PartialStateSnapEvent {
+    /// Returns the progress counters attached to this event.
+    pub const fn progress(&self) -> PartialStateSnapProgress {
+        match self {
+            Self::AccountRange { progress, .. } |
+            Self::StorageRanges { progress, .. } |
+            Self::ByteCodes { progress, .. } => *progress,
+        }
+    }
 }
 
 /// Error returned by the partial-state snap downloader.
@@ -644,6 +678,46 @@ where
     }
 }
 
+impl<C, F> PartialStateSnapDownloader<C, F>
+where
+    C: SnapClient + Unpin,
+    F: ContractFilter + Unpin,
+{
+    /// Starts the downloader, persists every successful response, and drains it to completion.
+    pub async fn run_to_completion<W>(
+        mut self,
+        target: PartialStateSnapTarget,
+        writer: W,
+        config: PartialStateSnapRunConfig,
+    ) -> Result<PartialStateSnapRunOutcome, PartialStateSnapPersistenceError<W::Error>>
+    where
+        W: PartialStateSnapWriter + Unpin,
+        W::Error: std::error::Error + Send + Sync + 'static,
+    {
+        self.start(target);
+
+        let mut downloader = self.persist_with(writer);
+        let mut progress = PartialStateSnapProgress::default();
+        let mut events = 0;
+        let mut last_report = Instant::now();
+
+        while let Some(event) = downloader.next().await {
+            let event = event?;
+            progress = event.progress();
+            events += 1;
+
+            if should_report_partial_snap_progress(config.progress_log_interval, last_report) {
+                report_partial_snap_progress(progress);
+                last_report = Instant::now();
+            }
+        }
+
+        report_partial_snap_progress(progress);
+
+        Ok(PartialStateSnapRunOutcome { progress, events })
+    }
+}
+
 /// Error returned while persisting partial snap state responses.
 #[derive(Debug, Error)]
 pub enum PartialStateSnapPersistenceError<E>
@@ -773,6 +847,59 @@ where
         }
     }
     Ok(())
+}
+
+/// Returns true when a progress report should be emitted.
+fn should_report_partial_snap_progress(interval: Duration, last_report: Instant) -> bool {
+    interval.is_zero() || last_report.elapsed() >= interval
+}
+
+/// Emits a partial-state snap progress log in the same shape as the full state downloader logs.
+fn report_partial_snap_progress(progress: PartialStateSnapProgress) {
+    tracing::info!(
+        target: "downloaders::snap",
+        state = %format_bytes(progress.state_bytes()),
+        accounts = %format_count_bytes(progress.accounts, progress.account_bytes),
+        slots = %format_count_bytes(progress.storage_slots, progress.storage_bytes),
+        slotsSkipped = progress.storage_skipped,
+        codes = %format_count_bytes(progress.bytecodes, progress.bytecode_bytes),
+        codesSkipped = progress.bytecodes_skipped,
+        "Syncing: partial state download in progress"
+    );
+}
+
+/// Formats a count and byte-size pair for progress logs.
+fn format_count_bytes(count: u64, bytes: u64) -> String {
+    format!("{}@{}", format_count(count), format_bytes(bytes))
+}
+
+/// Formats an integer with thousands separators.
+fn format_count(value: u64) -> String {
+    let value = value.to_string();
+    let mut formatted = String::with_capacity(value.len() + value.len() / 3);
+
+    for (idx, ch) in value.chars().rev().enumerate() {
+        if idx != 0 && idx % 3 == 0 {
+            formatted.push(',');
+        }
+        formatted.push(ch);
+    }
+
+    formatted.chars().rev().collect()
+}
+
+/// Formats bytes using IEC units.
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+
+    format!("{value:.2}{}", UNITS[unit])
 }
 
 /// Future returned for an account-range request.
@@ -1192,6 +1319,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_to_completion_persists_events_and_returns_progress() {
+        let root = B256::repeat_byte(0x11);
+        let peer = PeerId::repeat_byte(0x22);
+        let account_hash = B256::with_last_byte(1);
+        let storage_root = B256::repeat_byte(0x33);
+        let code_hash = B256::repeat_byte(0x44);
+        let slot_hash = B256::repeat_byte(0x55);
+        let account_body = encoded_account(storage_root, code_hash);
+        let storage_value = U256::from(0xaabbu64);
+        let encoded_storage_value = Bytes::from(alloy_rlp::encode(storage_value));
+        let bytecode = Bytes::from_static(&[0x60, 0x00]);
+        let client = MockSnapClient::new([
+            Ok(WithPeerId::new(
+                peer,
+                SnapResponse::AccountRange(AccountRangeMessage {
+                    request_id: 0,
+                    accounts: vec![AccountData { hash: account_hash, body: account_body.clone() }],
+                    proof: vec![],
+                }),
+            )),
+            Ok(WithPeerId::new(
+                peer,
+                SnapResponse::StorageRanges(StorageRangesMessage {
+                    request_id: 0,
+                    slots: vec![vec![StorageData {
+                        hash: slot_hash,
+                        data: encoded_storage_value.clone(),
+                    }]],
+                    proof: vec![],
+                }),
+            )),
+            Ok(WithPeerId::new(
+                peer,
+                SnapResponse::ByteCodes(ByteCodesMessage {
+                    request_id: 0,
+                    codes: vec![bytecode.clone()],
+                }),
+            )),
+        ]);
+        let downloader = PartialStateSnapDownloader::with_filter(
+            client,
+            PartialStateSnapDownloaderConfig { response_bytes: 1024 },
+            TestHashFilter::new([account_hash]),
+        );
+        let writer = RecordingSnapWriter::default();
+        let records = writer.records.clone();
+
+        let outcome = downloader
+            .run_to_completion(
+                PartialStateSnapTarget {
+                    root_hash: root,
+                    starting_hash: account_hash,
+                    limit_hash: account_hash,
+                },
+                writer,
+                PartialStateSnapRunConfig { progress_log_interval: Duration::ZERO },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.events, 3);
+        assert_eq!(
+            outcome.progress,
+            PartialStateSnapProgress {
+                accounts: 1,
+                account_bytes: account_body.len() as u64,
+                storage_range_responses: 1,
+                storage_slots: 1,
+                storage_bytes: encoded_storage_value.len() as u64,
+                bytecode_responses: 1,
+                bytecodes: 1,
+                bytecode_bytes: bytecode.len() as u64,
+                account_range_responses: 1,
+                ..Default::default()
+            }
+        );
+
+        let records = records.lock().unwrap();
+        assert_eq!(records.accounts.len(), 1);
+        assert_eq!(
+            records.storage,
+            vec![RecordedStorage { account_hash, slot_hash, value: storage_value }]
+        );
+        assert_eq!(
+            records.bytecodes,
+            vec![RecordedBytecode { code_hash, bytecode: bytecode.to_vec() }]
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_unexpected_snap_response() {
         let peer = PeerId::repeat_byte(0x22);
         let client = MockSnapClient::new([Ok(WithPeerId::new(
@@ -1216,6 +1433,16 @@ mod tests {
         let mut expected = B256::ZERO;
         expected.as_mut_slice()[30] = 1;
         assert_eq!(next_hash(hash), Some(expected));
+    }
+
+    #[test]
+    fn formats_partial_snap_progress_fields() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(1_234_567), "1,234,567");
+        assert_eq!(format_bytes(0), "0.00B");
+        assert_eq!(format_bytes(1024), "1.00KiB");
+        assert_eq!(format_bytes(2 * 1024 * 1024), "2.00MiB");
+        assert_eq!(format_count_bytes(42, 2048), "42@2.00KiB");
     }
 
     #[derive(Debug, Clone, Default)]

@@ -1,7 +1,9 @@
-use crate::DatabaseProvider;
+use crate::{providers::NodeTypesForProvider, DatabaseProvider};
 use alloy_primitives::{Bytes, B256, U256};
-use reth_db_api::{tables, transaction::DbTxMut};
-use reth_node_types::NodeTypes;
+use reth_db_api::{
+    tables,
+    transaction::{DbTx, DbTxMut},
+};
 use reth_primitives_traits::{Account, Bytecode, StorageEntry};
 use reth_storage_api::PartialStateSnapWriter;
 use reth_storage_errors::provider::ProviderError;
@@ -9,11 +11,14 @@ use reth_trie_common::TrieAccount;
 
 /// Writes partial snap state responses into Reth's hash-keyed state tables.
 #[derive(Debug)]
-pub struct PartialStateSnapDbWriter<'a, TX, N: NodeTypes> {
+pub struct PartialStateSnapDbWriter<'a, TX, N: NodeTypesForProvider> {
     provider: &'a DatabaseProvider<TX, N>,
 }
 
-impl<'a, TX, N: NodeTypes> PartialStateSnapDbWriter<'a, TX, N> {
+impl<'a, TX, N> PartialStateSnapDbWriter<'a, TX, N>
+where
+    N: NodeTypesForProvider,
+{
     /// Creates a new partial snap state writer backed by a database provider.
     pub const fn new(provider: &'a DatabaseProvider<TX, N>) -> Self {
         Self { provider }
@@ -22,8 +27,8 @@ impl<'a, TX, N: NodeTypes> PartialStateSnapDbWriter<'a, TX, N> {
 
 impl<TX, N> DatabaseProvider<TX, N>
 where
-    TX: DbTxMut,
-    N: NodeTypes,
+    TX: DbTx + DbTxMut + 'static,
+    N: NodeTypesForProvider,
 {
     /// Returns a writer that persists partial snap state responses into hash-keyed state tables.
     pub const fn partial_state_snap_writer(&self) -> PartialStateSnapDbWriter<'_, TX, N> {
@@ -33,8 +38,8 @@ where
 
 impl<TX, N> PartialStateSnapWriter for PartialStateSnapDbWriter<'_, TX, N>
 where
-    TX: DbTxMut,
-    N: NodeTypes,
+    TX: DbTx + DbTxMut + 'static,
+    N: NodeTypesForProvider,
 {
     type Error = ProviderError;
 
