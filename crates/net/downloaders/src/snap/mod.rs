@@ -855,7 +855,7 @@ fn should_report_partial_snap_progress(interval: Duration, last_report: Instant)
 }
 
 /// Emits a partial-state snap progress log in the same shape as the full state downloader logs.
-fn report_partial_snap_progress(progress: PartialStateSnapProgress) {
+pub fn report_partial_snap_progress(progress: PartialStateSnapProgress) {
     tracing::info!(
         target: "downloaders::snap",
         state = %format_bytes(progress.state_bytes()),

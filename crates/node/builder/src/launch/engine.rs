@@ -11,6 +11,10 @@ use crate::{
 use alloy_consensus::BlockHeader;
 use futures::{stream::FusedStream, stream_select, FutureExt, StreamExt};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
+use reth_downloaders::snap::{
+    persist_snap_event, report_partial_snap_progress, PartialStateSnapDownloader,
+    PartialStateSnapDownloaderConfig, PartialStateSnapEvent, PartialStateSnapTarget,
+};
 use reth_engine_tree::{
     chain::{ChainEvent, FromOrchestrator},
     engine::{EngineApiKind, EngineApiRequest, EngineRequestHandler},
@@ -21,6 +25,7 @@ use reth_engine_util::EngineMessageStreamExt;
 use reth_exex::ExExManagerHandle;
 use reth_network::{types::BlockRangeUpdate, NetworkSyncUpdater, SyncState};
 use reth_network_api::BlockDownloaderProvider;
+use reth_network_p2p::snap::client::SnapClient;
 use reth_node_api::{
     BuiltPayload, ConsensusEngineHandle, FullNodeTypes, NodeTypes, NodeTypesWithDBAdapter,
 };
@@ -31,9 +36,10 @@ use reth_node_core::{
 };
 use reth_node_events::node;
 use reth_provider::{
-    providers::{BlockchainProvider, NodeTypesForProvider},
-    BlockNumReader, StorageSettingsCache,
+    providers::{BlockchainProvider, NodeTypesForProvider, ProviderNodeTypes},
+    BlockNumReader, ProviderFactory, StorageSettingsCache,
 };
+use reth_storage_api::ConfiguredContractFilter;
 use reth_tasks::TaskExecutor;
 use reth_tokio_util::EventSender;
 use reth_tracing::tracing::{debug, error, info};
@@ -74,6 +80,8 @@ impl EngineNodeLauncher {
                 NodeTypesWithDBAdapter<<T as FullNodeTypes>::Types, <T as FullNodeTypes>::DB>,
             >,
         >,
+        <<CB::Components as NodeComponents<T>>::Network as BlockDownloaderProvider>::Client:
+            SnapClient,
         CB: NodeComponentsBuilder<T>,
         AO: RethRpcAddOns<NodeAdapter<T, CB::Components>>
             + EngineValidatorAddOn<NodeAdapter<T, CB::Components>>,
@@ -295,9 +303,18 @@ impl EngineNodeLauncher {
         let (exit, rx) = oneshot::channel();
         let terminate_after_backfill = ctx.terminate_after_initial_backfill();
         let startup_sync_state_idle = ctx.node_config().debug.startup_sync_state_idle;
+        let partial_state_filter = ctx
+            .configs()
+            .partial_state
+            .is_enabled()
+            .then(|| ctx.configs().partial_state.contract_filter());
+        let partial_state_provider_factory = ctx.provider_factory().clone();
+        let partial_state_network_client = network_client.clone();
+        let partial_state_task_executor = ctx.task_executor().clone();
 
         info!(target: "reth::cli", "Starting consensus engine");
         let consensus_engine = move |mut on_graceful_shutdown| async move {
+            let mut partial_state_snap_started = false;
             if let Some(initial_target) = initial_target {
                 debug!(target: "reth::cli", %initial_target,  "start backfill sync");
                 // network_handle's sync state is already initialized at Syncing
@@ -337,6 +354,18 @@ impl EngineNodeLauncher {
                             }
                             ChainEvent::Handler(ev) => {
                                 if let Some(head) = ev.canonical_header() {
+                                    if let Some(filter) = partial_state_filter.clone() {
+                                        if !partial_state_snap_started && head.number() > 0 {
+                                            partial_state_snap_started = true;
+                                            spawn_partial_state_snap_sync(
+                                                &partial_state_task_executor,
+                                                partial_state_network_client.clone(),
+                                                partial_state_provider_factory.clone(),
+                                                filter,
+                                                head.state_root(),
+                                            );
+                                        }
+                                    }
                                     // Once we're progressing via live sync, we can consider the node is not syncing anymore
                                     network_handle.update_sync_state(SyncState::Idle);
                                     let head_block = Head {
@@ -428,6 +457,87 @@ impl EngineNodeLauncher {
     }
 }
 
+/// Spawns the partial-state snap downloader for the given state root.
+fn spawn_partial_state_snap_sync<N, Client>(
+    task_executor: &TaskExecutor,
+    client: Client,
+    provider_factory: ProviderFactory<N>,
+    filter: ConfiguredContractFilter,
+    state_root: alloy_primitives::B256,
+) where
+    N: ProviderNodeTypes + 'static,
+    Client: SnapClient + Clone + Unpin + 'static,
+{
+    info!(target: "reth::cli", %state_root, "Starting partial-state snap sync");
+    task_executor.spawn_critical_task("partial-state snap sync", async move {
+        match run_partial_state_snap_sync(client, provider_factory, filter, state_root).await {
+            Ok(progress) => {
+                info!(
+                    target: "reth::cli",
+                    %state_root,
+                    accounts = progress.accounts,
+                    slots = progress.storage_slots,
+                    slots_skipped = progress.storage_skipped,
+                    codes = progress.bytecodes,
+                    codes_skipped = progress.bytecodes_skipped,
+                    "Partial-state snap sync complete"
+                );
+            }
+            Err(err) => {
+                error!(target: "reth::cli", %state_root, %err, "Partial-state snap sync failed");
+            }
+        }
+    });
+}
+
+/// Runs a partial-state snap download and persists each successful snap event.
+async fn run_partial_state_snap_sync<N, Client>(
+    client: Client,
+    provider_factory: ProviderFactory<N>,
+    filter: ConfiguredContractFilter,
+    state_root: alloy_primitives::B256,
+) -> eyre::Result<reth_downloaders::snap::PartialStateSnapProgress>
+where
+    N: ProviderNodeTypes + 'static,
+    Client: SnapClient + Clone + Unpin + 'static,
+{
+    let mut downloader = PartialStateSnapDownloader::with_filter(
+        client,
+        PartialStateSnapDownloaderConfig::default(),
+        filter,
+    );
+    downloader.start(PartialStateSnapTarget::full_range(state_root));
+
+    while let Some(event) = downloader.next().await {
+        let event = event?;
+        persist_partial_state_snap_event(&provider_factory, &event)?;
+        report_partial_snap_progress(event.progress());
+    }
+
+    let progress = downloader.progress();
+    report_partial_snap_progress(progress);
+
+    Ok(progress)
+}
+
+/// Persists one partial-state snap event in a short database write transaction.
+fn persist_partial_state_snap_event<N>(
+    provider_factory: &ProviderFactory<N>,
+    event: &PartialStateSnapEvent,
+) -> eyre::Result<()>
+where
+    N: ProviderNodeTypes + 'static,
+{
+    let provider = provider_factory.provider_rw()?;
+    {
+        let mut writer = provider.partial_state_snap_writer();
+        persist_snap_event(&mut writer, event)?;
+    }
+    provider.commit()?;
+
+    Ok(())
+}
+
 impl<T, CB, AO> LaunchNode<NodeBuilderWithComponents<T, CB, AO>> for EngineNodeLauncher
 where
     T: FullNodeTypes<
@@ -436,6 +546,7 @@ where
             NodeTypesWithDBAdapter<<T as FullNodeTypes>::Types, <T as FullNodeTypes>::DB>,
         >,
     >,
+    <<CB::Components as NodeComponents<T>>::Network as BlockDownloaderProvider>::Client: SnapClient,
     CB: NodeComponentsBuilder<T> + 'static,
     AO: RethRpcAddOns<NodeAdapter<T, CB::Components>>
         + EngineValidatorAddOn<NodeAdapter<T, CB::Components>>
