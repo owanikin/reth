@@ -5,7 +5,10 @@
 
 use super::message::MAX_MESSAGE_SIZE;
 use crate::{
-    message::{EthBroadcastMessage, ProtocolBroadcastMessage, TX_MEMORY_BUDGET_MULTIPLIER},
+    errors::{EthHandshakeError, EthStreamError, P2PStreamError},
+    message::{
+        EthBroadcastMessage, MessageError, ProtocolBroadcastMessage, TX_MEMORY_BUDGET_MULTIPLIER,
+    },
     EthMessage, EthMessageID, EthNetworkPrimitives, EthVersion, NetworkPrimitives, ProtocolMessage,
     RawCapabilityMessage, SnapProtocolMessage, SnapVersion,
 };
@@ -23,6 +26,10 @@ use tokio_stream::Stream;
 /// Error type for the eth and snap stream
 #[derive(thiserror::Error, Debug)]
 pub enum EthSnapStreamError {
+    /// Error of the underlying P2P connection.
+    #[error(transparent)]
+    P2P(#[from] P2PStreamError),
+
     /// Invalid message for protocol version
     #[error("invalid message for version {0:?}: {1}")]
     InvalidMessage(EthVersion, String),
@@ -42,6 +49,25 @@ pub enum EthSnapStreamError {
     /// Status message received outside handshake
     #[error("status message received outside handshake")]
     StatusNotInHandshake,
+}
+
+impl From<EthSnapStreamError> for EthStreamError {
+    fn from(value: EthSnapStreamError) -> Self {
+        match value {
+            EthSnapStreamError::P2P(err) => Self::P2PStreamError(err),
+            EthSnapStreamError::InvalidMessage(_, err) => {
+                Self::InvalidMessage(MessageError::Other(err))
+            }
+            EthSnapStreamError::UnknownMessageId(message_id) => {
+                Self::UnsupportedMessage { message_id }
+            }
+            EthSnapStreamError::MessageTooLarge(size, _) => Self::MessageTooBig(size),
+            EthSnapStreamError::Rlp(err) => Self::InvalidMessage(err.into()),
+            EthSnapStreamError::StatusNotInHandshake => {
+                Self::EthHandshakeError(EthHandshakeError::StatusNotInHandshake)
+            }
+        }
+    }
 }
 
 /// Combined message type that include either eth or snap protocol messages
@@ -125,6 +151,12 @@ where
     #[inline]
     pub const fn snap_version(&self) -> SnapVersion {
         self.eth_snap.snap_version()
+    }
+
+    /// Sets whether to reject block announcement messages (`NewBlock`, `NewBlockHashes`) before
+    /// RLP decoding.
+    pub const fn set_reject_block_announcements(&mut self, reject: bool) {
+        self.eth_snap.set_reject_block_announcements(reject);
     }
 
     /// Returns the underlying stream
@@ -237,6 +269,8 @@ struct EthSnapStreamInner<N> {
     snap_version: SnapVersion,
     /// Maximum allowed ETH/Snap message size.
     max_message_size: usize,
+    /// When true, `NewBlock` and `NewBlockHashes` messages are rejected before RLP decoding.
+    reject_block_announcements: bool,
     /// Type marker
     _pd: PhantomData<N>,
 }
@@ -266,7 +300,13 @@ where
         snap_version: SnapVersion,
         max_message_size: usize,
     ) -> Self {
-        Self { eth_version, snap_version, max_message_size, _pd: PhantomData }
+        Self {
+            eth_version,
+            snap_version,
+            max_message_size,
+            reject_block_announcements: false,
+            _pd: PhantomData,
+        }
     }
 
     #[inline]
@@ -277,6 +317,10 @@ where
     #[inline]
     const fn snap_version(&self) -> SnapVersion {
         self.snap_version
+    }
+
+    const fn set_reject_block_announcements(&mut self, reject: bool) {
+        self.reject_block_announcements = reject;
     }
 
     /// Decode a message from the stream
@@ -290,6 +334,13 @@ where
         }
 
         let message_id = bytes[0];
+
+        if self.reject_block_announcements &&
+            (message_id == EthMessageID::NewBlock.to_u8() ||
+                message_id == EthMessageID::NewBlockHashes.to_u8())
+        {
+            return Err(EthSnapStreamError::UnknownMessageId(message_id));
+        }
 
         // This check works because capabilities are sorted lexicographically
         // if "eth" before "snap", giving eth messages lower IDs than snap messages,

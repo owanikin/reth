@@ -208,6 +208,13 @@ impl<N: NetworkPrimitives> StateFetcher<N> {
         })
     }
 
+    /// Returns whether any connected peer can serve snap state requests.
+    fn has_snap_peer(&self) -> bool {
+        self.peers.values().any(|peer| {
+            !matches!(peer.state, PeerState::Closing) && peer.capabilities.supports_snap()
+        })
+    }
+
     /// Returns the next action to return
     fn poll_action(&mut self) -> PollAction {
         // we only check and not pop here since we don't know yet whether a peer is available.
@@ -224,6 +231,8 @@ impl<N: NetworkPrimitives> StateFetcher<N> {
             // Optional BAL requests can lose their eth/71 peer while queued; complete them
             // instead of waiting for future peer churn.
             if request.is_optional_bal() && !self.has_eth71_peer() {
+                request.send_err_response(RequestError::UnsupportedCapability);
+            } else if request.is_snap() && !self.has_snap_peer() {
                 request.send_err_response(RequestError::UnsupportedCapability);
             } else {
                 // no peer matches this request's requirements; requeue at the back so other
@@ -255,6 +264,10 @@ impl<N: NetworkPrimitives> StateFetcher<N> {
                         // Optional BAL requests should not wait for future peer churn if no
                         // connected peer can serve them right now.
                         if request.is_optional_bal() && !self.has_eth71_peer() {
+                            request.send_err_response(RequestError::UnsupportedCapability);
+                            continue
+                        }
+                        if request.is_snap() && !self.peers.is_empty() && !self.has_snap_peer() {
                             request.send_err_response(RequestError::UnsupportedCapability);
                             continue
                         }
@@ -779,6 +792,17 @@ impl<N: NetworkPrimitives> DownloadRequest<N> {
     /// Returns `true` if this is an optional BAL request.
     const fn is_optional_bal(&self) -> bool {
         matches!(self, Self::GetBlockAccessLists { requirement: BalRequirement::Optional, .. })
+    }
+
+    /// Returns `true` if this is a snap state request.
+    const fn is_snap(&self) -> bool {
+        matches!(
+            self,
+            Self::GetAccountRange { .. } |
+                Self::GetStorageRanges { .. } |
+                Self::GetByteCodes { .. } |
+                Self::GetTrieNodes { .. }
+        )
     }
 
     /// Sends an error response to the waiting caller.

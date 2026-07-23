@@ -18,9 +18,10 @@ use counter::SessionCounter;
 use futures::{future::Either, io, FutureExt, StreamExt};
 use reth_ecies::{stream::ECIESStream, ECIESError};
 use reth_eth_wire::{
-    errors::EthStreamError, handshake::EthRlpxHandshake, multiplex::RlpxProtocolMultiplexer,
-    BlockRangeUpdate, Capabilities, DisconnectReason, EthStream, EthVersion,
-    HelloMessageWithProtocols, NetworkPrimitives, UnauthedP2PStream, UnifiedStatus,
+    capability::SharedCapabilities, errors::EthStreamError, eth_snap_stream::EthSnapStream,
+    handshake::EthRlpxHandshake, multiplex::RlpxProtocolMultiplexer, protocol::Protocol,
+    BlockRangeUpdate, Capabilities, Capability, DisconnectReason, EthStream, EthVersion,
+    HelloMessageWithProtocols, NetworkPrimitives, SnapVersion, UnauthedP2PStream, UnifiedStatus,
     HANDSHAKE_TIMEOUT,
 };
 use reth_ethereum_forks::{ForkFilter, ForkId, ForkTransition, Head};
@@ -1093,6 +1094,11 @@ async fn authenticate_stream<N: NetworkPrimitives>(
     fork_filter: ForkFilter,
     mut extra_handlers: RlpxSubProtocolHandlers,
 ) -> PendingSessionEvent<N> {
+    let advertise_snap = extra_handlers.is_empty();
+    if advertise_snap {
+        let _ = hello.try_add_protocol(Protocol::snap_1());
+    }
+
     // Add extra protocols to the hello message
     extra_handlers.retain(|handler| hello.try_add_protocol(handler.protocol()).is_ok());
 
@@ -1151,7 +1157,14 @@ async fn authenticate_stream<N: NetworkPrimitives>(
     // Before trying status handshake, set up the version to negotiated shared version
     status.set_eth_version(eth_version);
 
-    let (conn, their_status) = if p2p_stream.shared_capabilities().len() == 1 {
+    let snap_version = negotiated_snap_version(p2p_stream.shared_capabilities());
+    let eth_snap_only = snap_version.is_some() &&
+        p2p_stream
+            .shared_capabilities()
+            .iter_caps()
+            .all(|cap| cap.is_eth() || cap.name() == "snap");
+
+    let (conn, their_status) = if p2p_stream.shared_capabilities().len() == 1 || eth_snap_only {
         // if the shared caps are 1, we know both support the eth version
         // if the hello handshake was successful we can try status handshake
 
@@ -1161,9 +1174,19 @@ async fn authenticate_stream<N: NetworkPrimitives>(
             .await
         {
             Ok(their_status) => {
-                let eth_stream =
-                    EthStream::with_max_message_size(eth_version, p2p_stream, eth_max_message_size);
-                (eth_stream.into(), their_status)
+                let conn = if let Some(snap_version) = snap_version {
+                    EthSnapStream::with_max_message_size_and_snap_version(
+                        p2p_stream,
+                        eth_version,
+                        snap_version,
+                        eth_max_message_size,
+                    )
+                    .into()
+                } else {
+                    EthStream::with_max_message_size(eth_version, p2p_stream, eth_max_message_size)
+                        .into()
+                };
+                (conn, their_status)
             }
             Err(err) => {
                 return PendingSessionEvent::Disconnected {
@@ -1222,5 +1245,15 @@ async fn authenticate_stream<N: NetworkPrimitives>(
         direction,
         client_id: their_hello.client_version,
         peer_listen_port,
+    }
+}
+
+fn negotiated_snap_version(shared_capabilities: &SharedCapabilities) -> Option<SnapVersion> {
+    if shared_capabilities.contains(&Capability::snap(SnapVersion::V2)) {
+        Some(SnapVersion::V2)
+    } else if shared_capabilities.contains(&Capability::snap(SnapVersion::V1)) {
+        Some(SnapVersion::V1)
+    } else {
+        None
     }
 }

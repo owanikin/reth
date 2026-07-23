@@ -28,6 +28,7 @@ use futures::{stream::Fuse, SinkExt, StreamExt};
 use metrics::{Counter, Gauge};
 use reth_eth_wire::{
     errors::{EthHandshakeError, EthStreamError},
+    eth_snap_stream::EthSnapMessage,
     message::{EthBroadcastMessage, MessageError},
     Capabilities, Capability, DisconnectP2P, DisconnectReason, EthMessage, NetworkPrimitives,
     NewBlockPayload, SnapProtocolMessage, SnapVersion,
@@ -272,9 +273,8 @@ impl<N: NetworkPrimitives> ActiveSession<N> {
         }
 
         match msg {
-            message @ EthMessage::Status(_) => OnIncomingMessageOutcome::BadMessage {
+            EthMessage::Status(_) => OnIncomingMessageOutcome::BadMessage {
                 error: EthStreamError::EthHandshakeError(EthHandshakeError::StatusNotInHandshake),
-                message,
             },
             EthMessage::NewBlockHashes(msg) => {
                 self.try_emit_broadcast(PeerMessage::NewBlockHashes(msg)).into()
@@ -355,7 +355,6 @@ impl<N: NetworkPrimitives> ActiveSession<N> {
                             "invalid block range: earliest ({}) > latest ({})",
                             msg.earliest, msg.latest
                         ))),
-                        message: EthMessage::BlockRangeUpdate(msg),
                     };
                 }
 
@@ -365,7 +364,6 @@ impl<N: NetworkPrimitives> ActiveSession<N> {
                         error: EthStreamError::InvalidMessage(MessageError::Other(
                             "invalid block range: latest_hash cannot be zero".to_string(),
                         )),
-                        message: EthMessage::BlockRangeUpdate(msg),
                     };
                 }
 
@@ -379,6 +377,55 @@ impl<N: NetworkPrimitives> ActiveSession<N> {
                 on_request!(resp, Cells, GetCells)
             }
             EthMessage::Other(bytes) => self.try_emit_broadcast(PeerMessage::Other(bytes)).into(),
+        }
+    }
+
+    /// Handle a snap message read from the connection.
+    fn on_incoming_snap_message(
+        &mut self,
+        msg: SnapProtocolMessage,
+    ) -> OnIncomingMessageOutcome<N> {
+        macro_rules! on_response {
+            ($resp:ident, $item:ident) => {{
+                let request_id = $resp.request_id;
+                let message = $resp;
+                if let Some(req) = self.inflight_requests.remove(&request_id) {
+                    match req.request {
+                        RequestState::Waiting(PeerRequest::$item { response, .. }) => {
+                            trace!(peer_id=?self.remote_peer_id, ?request_id, "received snap response from peer");
+                            let _ = response.send(Ok(message));
+                            self.update_request_timeout(req.timestamp, Instant::now());
+                        }
+                        RequestState::Waiting(request) => {
+                            request.send_bad_response();
+                        }
+                        RequestState::TimedOut => {
+                            self.update_request_timeout(req.timestamp, Instant::now());
+                        }
+                    }
+                } else {
+                    trace!(peer_id=?self.remote_peer_id, ?request_id, "received snap response to unknown request");
+                    self.on_bad_message();
+                }
+
+                OnIncomingMessageOutcome::Ok
+            }};
+        }
+
+        match msg {
+            SnapProtocolMessage::AccountRange(resp) => on_response!(resp, GetAccountRange),
+            SnapProtocolMessage::StorageRanges(resp) => on_response!(resp, GetStorageRanges),
+            SnapProtocolMessage::ByteCodes(resp) => on_response!(resp, GetByteCodes),
+            SnapProtocolMessage::TrieNodes(resp) => on_response!(resp, GetTrieNodes),
+            request => {
+                debug!(
+                    target: "net::session",
+                    peer_id=?self.remote_peer_id,
+                    ?request,
+                    "received unsupported snap request"
+                );
+                OnIncomingMessageOutcome::Ok
+            }
         }
     }
 
@@ -834,15 +881,24 @@ impl<N: NetworkPrimitives> Future for ActiveSession<N> {
                     Poll::Ready(Some(res)) => {
                         match res {
                             Ok(msg) => {
-                                trace!(target: "net::session", msg_id=?msg.message_id(), remote_peer_id=?this.remote_peer_id, "received eth message");
-                                // decode and handle message
-                                match this.on_incoming_message(msg) {
+                                let outcome = match msg {
+                                    EthSnapMessage::Eth(msg) => {
+                                        trace!(target: "net::session", msg_id=?msg.message_id(), remote_peer_id=?this.remote_peer_id, "received eth message");
+                                        this.on_incoming_message(msg)
+                                    }
+                                    EthSnapMessage::Snap(msg) => {
+                                        trace!(target: "net::session", msg_id=?msg.message_id(), remote_peer_id=?this.remote_peer_id, "received snap message");
+                                        this.on_incoming_snap_message(msg)
+                                    }
+                                };
+
+                                match outcome {
                                     OnIncomingMessageOutcome::Ok => {
                                         // handled successfully
                                         progress = true;
                                     }
-                                    OnIncomingMessageOutcome::BadMessage { error, message } => {
-                                        debug!(target: "net::session", %error, msg=?message, remote_peer_id=?this.remote_peer_id, "received invalid protocol message");
+                                    OnIncomingMessageOutcome::BadMessage { error } => {
+                                        debug!(target: "net::session", %error, remote_peer_id=?this.remote_peer_id, "received invalid protocol message");
                                         this.on_bad_message();
                                         return this
                                             .try_disconnect(DisconnectReason::ProtocolBreach, cx)
@@ -959,7 +1015,7 @@ enum OnIncomingMessageOutcome<N: NetworkPrimitives> {
     /// Message successfully handled.
     Ok,
     /// Message is considered to be in violation of the protocol
-    BadMessage { error: EthStreamError, message: EthMessage<N> },
+    BadMessage { error: EthStreamError },
     /// Currently no capacity to handle the message
     NoCapacity(ActiveSessionMessage<N>),
 }
