@@ -6,6 +6,8 @@ use crate::{
     AccountReader, BalProvider, BalStoreHandle, BlockBodyIndicesProvider, BlockHashReader,
     BlockIdReader, BlockNumReader, BlockReader, BlockReaderIdExt, BlockSource, BytecodeReader,
     ChangeSetReader, HashedPostStateProvider, HeaderProvider, NodePrimitivesProvider,
+    PartialStateSnapAccountRange, PartialStateSnapByteCodes, PartialStateSnapProvider,
+    PartialStateSnapStorageRanges, PartialStateSnapTrieNodes, PartialStateSnapTriePath,
     PruneCheckpointReader, ReceiptProvider, ReceiptProviderIdExt, StageCheckpointReader,
     StateProofProvider, StateProvider, StateProviderBox, StateProviderFactory, StateReader,
     StateRootProvider, StorageRootProvider, TransactionVariant, TransactionsProvider,
@@ -114,6 +116,48 @@ impl<ChainSpec, N> Clone for NoopProvider<ChainSpec, N> {
 impl<ChainSpec, N> BalProvider for NoopProvider<ChainSpec, N> {
     fn bal_store(&self) -> &BalStoreHandle {
         &self.bal_store
+    }
+}
+
+impl<ChainSpec: Send + Sync, N: Send + Sync> PartialStateSnapProvider
+    for NoopProvider<ChainSpec, N>
+{
+    fn snap_account_range(
+        &self,
+        _root_hash: B256,
+        _starting_hash: B256,
+        _limit_hash: B256,
+        _response_bytes: u64,
+    ) -> ProviderResult<PartialStateSnapAccountRange> {
+        Ok(PartialStateSnapAccountRange::default())
+    }
+
+    fn snap_storage_ranges(
+        &self,
+        _root_hash: B256,
+        _account_hashes: &[B256],
+        _starting_hash: B256,
+        _limit_hash: B256,
+        _response_bytes: u64,
+    ) -> ProviderResult<PartialStateSnapStorageRanges> {
+        Ok(PartialStateSnapStorageRanges::default())
+    }
+
+    fn snap_bytecodes(
+        &self,
+        _hashes: &[B256],
+        _response_bytes: u64,
+    ) -> ProviderResult<PartialStateSnapByteCodes> {
+        Ok(PartialStateSnapByteCodes::default())
+    }
+
+    fn snap_trie_nodes(
+        &self,
+        _root_hash: B256,
+        _paths: &[PartialStateSnapTriePath],
+        _response_bytes: u64,
+    ) -> ProviderResult<PartialStateSnapTrieNodes> {
+        Ok(PartialStateSnapTrieNodes::default())
     }
 }
 

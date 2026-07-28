@@ -50,7 +50,6 @@ use reth_network_api::{
     test_utils::PeersHandle,
     EthProtocolInfo, NetworkEvent, NetworkStatus, PeerInfo, PeerRequest,
 };
-use reth_network_p2p::error::RequestError;
 use reth_network_peers::{NodeRecord, PeerId};
 use reth_network_types::ReputationChangeKind;
 use reth_storage_api::BlockNumReader;
@@ -576,15 +575,40 @@ impl<N: NetworkPrimitives> NetworkManager<N> {
             }
             PeerRequest::GetCells { request, response } => self
                 .delegate_eth_request(IncomingEthRequest::GetCells { peer_id, request, response }),
+            PeerRequest::GetAccountRange { request, response } => {
+                self.delegate_eth_request(IncomingEthRequest::GetAccountRange {
+                    peer_id,
+                    request,
+                    response,
+                })
+            }
+            PeerRequest::GetStorageRanges { request, response } => {
+                self.delegate_eth_request(IncomingEthRequest::GetStorageRanges {
+                    peer_id,
+                    request,
+                    response,
+                })
+            }
+            PeerRequest::GetByteCodes { request, response } => {
+                self.delegate_eth_request(IncomingEthRequest::GetByteCodes {
+                    peer_id,
+                    request,
+                    response,
+                })
+            }
+            PeerRequest::GetTrieNodes { request, response } => {
+                self.delegate_eth_request(IncomingEthRequest::GetTrieNodes {
+                    peer_id,
+                    request,
+                    response,
+                })
+            }
             PeerRequest::GetPooledTransactions { request, response } => {
                 self.notify_tx_manager(NetworkTransactionEvent::GetPooledTransactions {
                     peer_id,
                     request,
                     response,
                 });
-            }
-            request => {
-                request.send_err_response(RequestError::UnsupportedCapability);
             }
         }
     }

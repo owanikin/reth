@@ -34,13 +34,16 @@ use reth_prune_types::{PruneCheckpoint, PruneModes, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_storage_api::{
     BlockBodyIndicesProvider, BytecodeReader, DBProvider, DatabaseProviderFactory,
-    HashedPostStateProvider, NodePrimitivesProvider, StageCheckpointReader, StateProofProvider,
-    StorageChangeSetReader, StorageRootProvider, StorageSettingsCache,
+    HashedPostStateProvider, NodePrimitivesProvider, PartialStateSnapAccount,
+    PartialStateSnapAccountRange, PartialStateSnapByteCodes, PartialStateSnapProvider,
+    PartialStateSnapStorage, PartialStateSnapStorageRanges, PartialStateSnapTrieNodes,
+    PartialStateSnapTriePath, StageCheckpointReader, StateProofProvider, StorageChangeSetReader,
+    StorageRootProvider, StorageSettingsCache,
 };
 use reth_storage_errors::provider::{ConsistentViewError, ProviderError, ProviderResult};
 use reth_trie::{
-    updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage, MultiProof,
-    MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
+    root::storage_root_unhashed, updates::TrieUpdates, AccountProof, HashedPostState,
+    HashedStorage, MultiProof, MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
 };
 use std::{
     collections::BTreeMap,
@@ -221,6 +224,163 @@ impl<T: NodePrimitives, ChainSpec> BalProvider for MockEthProvider<T, ChainSpec>
     fn bal_store(&self) -> &BalStoreHandle {
         &self.bal_store
     }
+}
+
+impl<T: NodePrimitives, ChainSpec: Send + Sync> PartialStateSnapProvider
+    for MockEthProvider<T, ChainSpec>
+{
+    fn snap_account_range(
+        &self,
+        _root_hash: B256,
+        starting_hash: B256,
+        limit_hash: B256,
+        response_bytes: u64,
+    ) -> ProviderResult<PartialStateSnapAccountRange> {
+        let mut accounts = self
+            .accounts
+            .lock()
+            .iter()
+            .map(|(address, account)| (keccak256(address), account.clone()))
+            .collect::<Vec<_>>();
+        accounts.sort_by_key(|(hash, _)| *hash);
+
+        let mut served = Vec::new();
+        let mut total_bytes = 0u64;
+        for (hash, account) in accounts {
+            if hash < starting_hash || hash > limit_hash {
+                continue
+            }
+
+            let storage_root =
+                storage_root_unhashed(account.storage.iter().map(|(slot, value)| (*slot, *value)));
+            let trie_account = account.account.into_trie_account(storage_root);
+            if !served.is_empty() &&
+                response_exceeds_soft_limit(
+                    total_bytes,
+                    ACCOUNT_RANGE_ITEM_BYTES,
+                    response_bytes,
+                )
+            {
+                break
+            }
+
+            served.push(PartialStateSnapAccount { hash, account: trie_account });
+            total_bytes = total_bytes.saturating_add(ACCOUNT_RANGE_ITEM_BYTES);
+            if response_bytes != 0 && total_bytes >= response_bytes {
+                break
+            }
+        }
+
+        Ok(PartialStateSnapAccountRange { accounts: served, proof: Vec::new() })
+    }
+
+    fn snap_storage_ranges(
+        &self,
+        _root_hash: B256,
+        account_hashes: &[B256],
+        starting_hash: B256,
+        limit_hash: B256,
+        response_bytes: u64,
+    ) -> ProviderResult<PartialStateSnapStorageRanges> {
+        let accounts = self.accounts.lock();
+        let mut slots = Vec::with_capacity(account_hashes.len());
+        let mut total_bytes = 0u64;
+
+        for account_hash in account_hashes {
+            if response_bytes != 0 && total_bytes >= response_bytes {
+                break
+            }
+
+            let Some((_, account)) =
+                accounts.iter().find(|(address, _)| keccak256(address) == *account_hash)
+            else {
+                slots.push(Vec::new());
+                continue
+            };
+
+            let mut account_slots = account
+                .storage
+                .iter()
+                .map(|(slot, value)| (keccak256(slot), *value))
+                .filter(|(slot_hash, _)| *slot_hash >= starting_hash && *slot_hash <= limit_hash)
+                .collect::<Vec<_>>();
+            account_slots.sort_by_key(|(slot_hash, _)| *slot_hash);
+
+            let mut served_slots = Vec::new();
+            for (hash, value) in account_slots {
+                if !served_slots.is_empty() &&
+                    response_exceeds_soft_limit(
+                        total_bytes,
+                        STORAGE_RANGE_ITEM_BYTES,
+                        response_bytes,
+                    )
+                {
+                    break
+                }
+
+                served_slots.push(PartialStateSnapStorage { hash, value });
+                total_bytes = total_bytes.saturating_add(STORAGE_RANGE_ITEM_BYTES);
+                if response_bytes != 0 && total_bytes >= response_bytes {
+                    break
+                }
+            }
+            slots.push(served_slots);
+        }
+
+        Ok(PartialStateSnapStorageRanges { slots, proof: Vec::new() })
+    }
+
+    fn snap_bytecodes(
+        &self,
+        hashes: &[B256],
+        response_bytes: u64,
+    ) -> ProviderResult<PartialStateSnapByteCodes> {
+        let accounts = self.accounts.lock();
+        let mut codes = Vec::new();
+        let mut total_bytes = 0u64;
+
+        for hash in hashes {
+            let Some(code) = accounts.values().find_map(|account| {
+                match (account.account.bytecode_hash, account.bytecode.as_ref()) {
+                    (Some(bytecode_hash), Some(bytecode)) if bytecode_hash == *hash => {
+                        Some(bytecode.original_bytes())
+                    }
+                    _ => None,
+                }
+            }) else {
+                continue
+            };
+
+            if !codes.is_empty() &&
+                response_exceeds_soft_limit(total_bytes, code.len() as u64, response_bytes)
+            {
+                break
+            }
+            total_bytes = total_bytes.saturating_add(code.len() as u64);
+            codes.push(code);
+            if response_bytes != 0 && total_bytes >= response_bytes {
+                break
+            }
+        }
+
+        Ok(PartialStateSnapByteCodes { codes })
+    }
+
+    fn snap_trie_nodes(
+        &self,
+        _root_hash: B256,
+        _paths: &[PartialStateSnapTriePath],
+        _response_bytes: u64,
+    ) -> ProviderResult<PartialStateSnapTrieNodes> {
+        Ok(PartialStateSnapTrieNodes::default())
+    }
+}
+
+const ACCOUNT_RANGE_ITEM_BYTES: u64 = 32 + 8 + 32 + 32 + 32;
+const STORAGE_RANGE_ITEM_BYTES: u64 = 32 + 32;
+
+const fn response_exceeds_soft_limit(current: u64, next: u64, limit: u64) -> bool {
+    limit != 0 && current.saturating_add(next) > limit
 }
 
 /// An extended account for local store

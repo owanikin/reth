@@ -29,7 +29,7 @@ use reth_network_api::{
 use reth_network_peers::PeerId;
 use reth_storage_api::{
     noop::NoopProvider, BalProvider, BlockReader, BlockReaderIdExt, HeaderProvider,
-    StateProviderFactory,
+    PartialStateSnapProvider, StateProviderFactory,
 };
 use reth_tasks::Runtime;
 use reth_tokio_util::EventStream;
@@ -249,6 +249,7 @@ where
             Header = alloy_consensus::Header,
         > + HeaderProvider
         + BalProvider
+        + PartialStateSnapProvider
         + Clone
         + Unpin
         + 'static,
@@ -322,6 +323,7 @@ where
             Header = alloy_consensus::Header,
         > + HeaderProvider
         + BalProvider
+        + PartialStateSnapProvider
         + Unpin
         + 'static,
     Pool: TransactionPool<
@@ -467,7 +469,7 @@ where
     /// Set a new request handler that's connected to the peer's network
     pub fn install_request_handler(&mut self)
     where
-        C: BalProvider,
+        C: BalProvider + reth_storage_api::PartialStateSnapProvider,
     {
         let (tx, rx) = channel(ETH_REQUEST_CHANNEL_CAPACITY);
         self.network.set_eth_request_handler(tx);
@@ -589,6 +591,7 @@ where
             Header = alloy_consensus::Header,
         > + HeaderProvider
         + BalProvider
+        + PartialStateSnapProvider
         + Unpin
         + 'static,
     Pool: TransactionPool<

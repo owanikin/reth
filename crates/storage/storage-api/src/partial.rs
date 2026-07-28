@@ -1,9 +1,10 @@
-use alloc::collections::BTreeSet;
+use alloc::{collections::BTreeSet, vec::Vec};
 use alloy_eips::{
     eip7928::{bal::DecodedBal, compute_block_access_list_hash, BlockAccessList},
     NumHash,
 };
 use alloy_primitives::{keccak256, Address, BlockHash, BlockNumber, Bytes, Sealed, B256, U256};
+use auto_impl::auto_impl;
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
 use reth_trie_common::TrieAccount;
 
@@ -65,6 +66,103 @@ pub trait PartialStateSnapWriter {
 
     /// Persists bytecode returned by snap sync.
     fn write_bytecode(&mut self, code_hash: B256, bytecode: &[u8]) -> Result<(), Self::Error>;
+}
+
+/// Account data served to snap peers from hash-keyed state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialStateSnapAccount {
+    /// Hash of the account address, also used as the account trie path.
+    pub hash: B256,
+    /// Account encoded in trie-account form by the network layer.
+    pub account: TrieAccount,
+}
+
+/// Account range data served to snap peers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PartialStateSnapAccountRange {
+    /// Consecutive account leaves.
+    pub accounts: Vec<PartialStateSnapAccount>,
+    /// Boundary proof nodes for the range.
+    pub proof: Vec<Bytes>,
+}
+
+/// Storage slot data served to snap peers from hash-keyed state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartialStateSnapStorage {
+    /// Hash of the storage slot key, also used as the storage trie path.
+    pub hash: B256,
+    /// Storage value.
+    pub value: U256,
+}
+
+/// Storage ranges data served to snap peers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PartialStateSnapStorageRanges {
+    /// Consecutive storage leaves, one list per requested account.
+    pub slots: Vec<Vec<PartialStateSnapStorage>>,
+    /// Boundary proof nodes for the final partial storage range.
+    pub proof: Vec<Bytes>,
+}
+
+/// Bytecodes served to snap peers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PartialStateSnapByteCodes {
+    /// Bytecodes in request order, skipping hashes that are unavailable locally.
+    pub codes: Vec<Bytes>,
+}
+
+/// Trie path requested by a snap peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialStateSnapTriePath {
+    /// Path in the account trie.
+    pub account_path: Bytes,
+    /// Paths in the storage trie.
+    pub slot_paths: Vec<Bytes>,
+}
+
+/// Trie nodes served to snap peers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PartialStateSnapTrieNodes {
+    /// Requested trie nodes.
+    pub nodes: Vec<Bytes>,
+}
+
+/// Reads snap state records that can be served to peers.
+#[auto_impl(&, Arc, Box)]
+pub trait PartialStateSnapProvider: Send + Sync {
+    /// Returns a snap account range for the requested state root.
+    fn snap_account_range(
+        &self,
+        root_hash: B256,
+        starting_hash: B256,
+        limit_hash: B256,
+        response_bytes: u64,
+    ) -> ProviderResult<PartialStateSnapAccountRange>;
+
+    /// Returns snap storage ranges for the requested account hashes.
+    fn snap_storage_ranges(
+        &self,
+        root_hash: B256,
+        account_hashes: &[B256],
+        starting_hash: B256,
+        limit_hash: B256,
+        response_bytes: u64,
+    ) -> ProviderResult<PartialStateSnapStorageRanges>;
+
+    /// Returns bytecodes for the requested code hashes.
+    fn snap_bytecodes(
+        &self,
+        hashes: &[B256],
+        response_bytes: u64,
+    ) -> ProviderResult<PartialStateSnapByteCodes>;
+
+    /// Returns trie nodes for the requested paths.
+    fn snap_trie_nodes(
+        &self,
+        root_hash: B256,
+        paths: &[PartialStateSnapTriePath],
+        response_bytes: u64,
+    ) -> ProviderResult<PartialStateSnapTrieNodes>;
 }
 
 /// A contract filter backed by a static set of tracked contract addresses.

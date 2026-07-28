@@ -13,11 +13,19 @@ use reth_eth_wire::{
     GetBlockBodies, GetBlockHeaders, GetCells, GetNodeData, GetReceipts, GetReceipts70,
     HeadersDirection, NetworkPrimitives, NodeData, Receipts, Receipts69, Receipts70,
 };
+use reth_eth_wire_types::snap::{
+    AccountData, AccountRangeMessage, ByteCodesMessage, GetAccountRangeMessage,
+    GetByteCodesMessage, GetStorageRangesMessage, GetTrieNodesMessage, StorageData,
+    StorageRangesMessage, TrieNodesMessage,
+};
 use reth_network_api::test_utils::PeersHandle;
 use reth_network_p2p::error::RequestResult;
 use reth_network_peers::PeerId;
 use reth_primitives_traits::Block;
-use reth_storage_api::{BalProvider, BlockReader, GetBlockAccessListLimit, HeaderProvider};
+use reth_storage_api::{
+    BalProvider, BlockReader, GetBlockAccessListLimit, HeaderProvider, PartialStateSnapProvider,
+    PartialStateSnapTriePath,
+};
 use std::{
     future::Future,
     pin::Pin,
@@ -348,6 +356,171 @@ where
     }
 }
 
+impl<C, N> EthRequestHandler<C, N>
+where
+    N: NetworkPrimitives,
+    C: PartialStateSnapProvider,
+{
+    fn on_account_range_request(
+        &self,
+        peer_id: PeerId,
+        request: GetAccountRangeMessage,
+        response: oneshot::Sender<RequestResult<AccountRangeMessage>>,
+    ) {
+        let result = self
+            .client
+            .snap_account_range(
+                request.root_hash,
+                request.starting_hash,
+                request.limit_hash,
+                request.response_bytes,
+            )
+            .map(|range| AccountRangeMessage {
+                request_id: request.request_id,
+                accounts: range
+                    .accounts
+                    .into_iter()
+                    .map(|account| AccountData {
+                        hash: account.hash,
+                        body: alloy_rlp::encode(account.account).into(),
+                    })
+                    .collect(),
+                proof: range.proof,
+            })
+            .unwrap_or_else(|err| {
+                tracing::debug!(
+                    target: "net::eth",
+                    %err,
+                    ?peer_id,
+                    root = ?request.root_hash,
+                    start = ?request.starting_hash,
+                    limit = ?request.limit_hash,
+                    "Failed to serve snap account range"
+                );
+                AccountRangeMessage {
+                    request_id: request.request_id,
+                    accounts: Vec::new(),
+                    proof: Vec::new(),
+                }
+            });
+
+        let _ = response.send(Ok(result));
+    }
+
+    fn on_storage_ranges_request(
+        &self,
+        peer_id: PeerId,
+        request: GetStorageRangesMessage,
+        response: oneshot::Sender<RequestResult<StorageRangesMessage>>,
+    ) {
+        let result = self
+            .client
+            .snap_storage_ranges(
+                request.root_hash,
+                &request.account_hashes,
+                request.starting_hash,
+                request.limit_hash,
+                request.response_bytes,
+            )
+            .map(|ranges| StorageRangesMessage {
+                request_id: request.request_id,
+                slots: ranges
+                    .slots
+                    .into_iter()
+                    .map(|slots| {
+                        slots
+                            .into_iter()
+                            .map(|slot| StorageData {
+                                hash: slot.hash,
+                                data: alloy_rlp::encode(slot.value).into(),
+                            })
+                            .collect()
+                    })
+                    .collect(),
+                proof: ranges.proof,
+            })
+            .unwrap_or_else(|err| {
+                tracing::debug!(
+                    target: "net::eth",
+                    %err,
+                    ?peer_id,
+                    root = ?request.root_hash,
+                    accounts = request.account_hashes.len(),
+                    start = ?request.starting_hash,
+                    limit = ?request.limit_hash,
+                    "Failed to serve snap storage ranges"
+                );
+                StorageRangesMessage {
+                    request_id: request.request_id,
+                    slots: Vec::new(),
+                    proof: Vec::new(),
+                }
+            });
+
+        let _ = response.send(Ok(result));
+    }
+
+    fn on_bytecodes_request(
+        &self,
+        peer_id: PeerId,
+        request: GetByteCodesMessage,
+        response: oneshot::Sender<RequestResult<ByteCodesMessage>>,
+    ) {
+        let result = self
+            .client
+            .snap_bytecodes(&request.hashes, request.response_bytes)
+            .map(|bytecodes| ByteCodesMessage {
+                request_id: request.request_id,
+                codes: bytecodes.codes,
+            })
+            .unwrap_or_else(|err| {
+                tracing::debug!(
+                    target: "net::eth",
+                    %err,
+                    ?peer_id,
+                    hashes = request.hashes.len(),
+                    "Failed to serve snap bytecodes"
+                );
+                ByteCodesMessage { request_id: request.request_id, codes: Vec::new() }
+            });
+
+        let _ = response.send(Ok(result));
+    }
+
+    fn on_trie_nodes_request(
+        &self,
+        peer_id: PeerId,
+        request: GetTrieNodesMessage,
+        response: oneshot::Sender<RequestResult<TrieNodesMessage>>,
+    ) {
+        let paths = request
+            .paths
+            .iter()
+            .map(|path| PartialStateSnapTriePath {
+                account_path: path.account_path.clone(),
+                slot_paths: path.slot_paths.clone(),
+            })
+            .collect::<Vec<_>>();
+        let result = self
+            .client
+            .snap_trie_nodes(request.root_hash, &paths, request.response_bytes)
+            .map(|nodes| TrieNodesMessage { request_id: request.request_id, nodes: nodes.nodes })
+            .unwrap_or_else(|err| {
+                tracing::debug!(
+                    target: "net::eth",
+                    %err,
+                    ?peer_id,
+                    root = ?request.root_hash,
+                    paths = request.paths.len(),
+                    "Failed to serve snap trie nodes"
+                );
+                TrieNodesMessage { request_id: request.request_id, nodes: Vec::new() }
+            });
+
+        let _ = response.send(Ok(result));
+    }
+}
+
 /// An endless future.
 ///
 /// This should be spawned or used as part of `tokio::select!`.
@@ -357,6 +530,7 @@ where
     C: BalProvider
         + BlockReader<Block = N::Block, Receipt = N::Receipt>
         + HeaderProvider<Header = N::BlockHeader>
+        + PartialStateSnapProvider
         + Unpin,
 {
     type Output = ();
@@ -396,6 +570,18 @@ where
                     }
                     IncomingEthRequest::GetCells { peer_id, request, response } => {
                         this.on_cells_request(peer_id, request, response)
+                    }
+                    IncomingEthRequest::GetAccountRange { peer_id, request, response } => {
+                        this.on_account_range_request(peer_id, request, response)
+                    }
+                    IncomingEthRequest::GetStorageRanges { peer_id, request, response } => {
+                        this.on_storage_ranges_request(peer_id, request, response)
+                    }
+                    IncomingEthRequest::GetByteCodes { peer_id, request, response } => {
+                        this.on_bytecodes_request(peer_id, request, response)
+                    }
+                    IncomingEthRequest::GetTrieNodes { peer_id, request, response } => {
+                        this.on_trie_nodes_request(peer_id, request, response)
                     }
                 }
             },
@@ -503,5 +689,41 @@ pub enum IncomingEthRequest<N: NetworkPrimitives = EthNetworkPrimitives> {
         request: GetCells,
         /// The channel sender for the response containing cells.
         response: oneshot::Sender<RequestResult<Cells>>,
+    },
+    /// Request account range data through snap.
+    GetAccountRange {
+        /// The ID of the peer that requested account range data.
+        peer_id: PeerId,
+        /// The requested account range.
+        request: GetAccountRangeMessage,
+        /// The channel sender for the response containing account range data.
+        response: oneshot::Sender<RequestResult<AccountRangeMessage>>,
+    },
+    /// Request storage range data through snap.
+    GetStorageRanges {
+        /// The ID of the peer that requested storage ranges.
+        peer_id: PeerId,
+        /// The requested storage ranges.
+        request: GetStorageRangesMessage,
+        /// The channel sender for the response containing storage range data.
+        response: oneshot::Sender<RequestResult<StorageRangesMessage>>,
+    },
+    /// Request bytecodes through snap.
+    GetByteCodes {
+        /// The ID of the peer that requested bytecodes.
+        peer_id: PeerId,
+        /// The requested bytecodes.
+        request: GetByteCodesMessage,
+        /// The channel sender for the response containing bytecodes.
+        response: oneshot::Sender<RequestResult<ByteCodesMessage>>,
+    },
+    /// Request trie nodes through snap.
+    GetTrieNodes {
+        /// The ID of the peer that requested trie nodes.
+        peer_id: PeerId,
+        /// The requested trie nodes.
+        request: GetTrieNodesMessage,
+        /// The channel sender for the response containing trie nodes.
+        response: oneshot::Sender<RequestResult<TrieNodesMessage>>,
     },
 }

@@ -27,7 +27,11 @@ use reth_primitives_traits::{Account, RecoveredBlock, SealedHeader, StorageEntry
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
-use reth_storage_api::{BlockBodyIndicesProvider, NodePrimitivesProvider, StorageChangeSetReader};
+use reth_storage_api::{
+    BlockBodyIndicesProvider, NodePrimitivesProvider, PartialStateSnapAccountRange,
+    PartialStateSnapByteCodes, PartialStateSnapProvider, PartialStateSnapStorageRanges,
+    PartialStateSnapTrieNodes, PartialStateSnapTriePath, StorageChangeSetReader,
+};
 use reth_storage_errors::provider::ProviderResult;
 use reth_trie::{HashedPostState, KeccakKeyHasher};
 use revm_database::BundleState;
@@ -148,6 +152,52 @@ impl<N: NodeTypesWithDB> NodePrimitivesProvider for BlockchainProvider<N> {
 impl<N: NodeTypesWithDB> BalProvider for BlockchainProvider<N> {
     fn bal_store(&self) -> &BalStoreHandle {
         &self.bal_store
+    }
+}
+
+impl<N: ProviderNodeTypes> PartialStateSnapProvider for BlockchainProvider<N> {
+    fn snap_account_range(
+        &self,
+        root_hash: B256,
+        starting_hash: B256,
+        limit_hash: B256,
+        response_bytes: u64,
+    ) -> ProviderResult<PartialStateSnapAccountRange> {
+        self.database.snap_account_range(root_hash, starting_hash, limit_hash, response_bytes)
+    }
+
+    fn snap_storage_ranges(
+        &self,
+        root_hash: B256,
+        account_hashes: &[B256],
+        starting_hash: B256,
+        limit_hash: B256,
+        response_bytes: u64,
+    ) -> ProviderResult<PartialStateSnapStorageRanges> {
+        self.database.snap_storage_ranges(
+            root_hash,
+            account_hashes,
+            starting_hash,
+            limit_hash,
+            response_bytes,
+        )
+    }
+
+    fn snap_bytecodes(
+        &self,
+        hashes: &[B256],
+        response_bytes: u64,
+    ) -> ProviderResult<PartialStateSnapByteCodes> {
+        self.database.snap_bytecodes(hashes, response_bytes)
+    }
+
+    fn snap_trie_nodes(
+        &self,
+        root_hash: B256,
+        paths: &[PartialStateSnapTriePath],
+        response_bytes: u64,
+    ) -> ProviderResult<PartialStateSnapTrieNodes> {
+        self.database.snap_trie_nodes(root_hash, paths, response_bytes)
     }
 }
 

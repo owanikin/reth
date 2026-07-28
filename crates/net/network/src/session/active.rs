@@ -36,7 +36,7 @@ use reth_eth_wire::{
 use reth_eth_wire_types::{message::RequestPair, NewPooledTransactionHashes, RawCapabilityMessage};
 use reth_metrics::common::mpsc::MeteredPollSender;
 use reth_network_api::PeerRequest;
-use reth_network_p2p::error::RequestError;
+use reth_network_p2p::{error::RequestError, snap::client::SnapResponse};
 use reth_network_peers::PeerId;
 use reth_network_types::session::config::INITIAL_REQUEST_TIMEOUT;
 use reth_primitives_traits::Block;
@@ -385,6 +385,25 @@ impl<N: NetworkPrimitives> ActiveSession<N> {
         &mut self,
         msg: SnapProtocolMessage,
     ) -> OnIncomingMessageOutcome<N> {
+        macro_rules! on_request {
+            ($req:ident, $resp_item:ident, $req_item:ident) => {{
+                let request_id = $req.request_id;
+                let request = $req;
+                let (tx, response) = oneshot::channel();
+                let received = ReceivedRequest {
+                    request_id,
+                    rx: PeerResponse::$resp_item { response },
+                    received: Instant::now(),
+                };
+                self.received_requests_from_remote.push(received);
+                self.try_emit_request(PeerMessage::EthRequest(PeerRequest::$req_item {
+                    request,
+                    response: tx,
+                }))
+                .into()
+            }};
+        }
+
         macro_rules! on_response {
             ($resp:ident, $item:ident) => {{
                 let request_id = $resp.request_id;
@@ -413,9 +432,17 @@ impl<N: NetworkPrimitives> ActiveSession<N> {
         }
 
         match msg {
+            SnapProtocolMessage::GetAccountRange(req) => {
+                on_request!(req, AccountRange, GetAccountRange)
+            }
             SnapProtocolMessage::AccountRange(resp) => on_response!(resp, GetAccountRange),
+            SnapProtocolMessage::GetStorageRanges(req) => {
+                on_request!(req, StorageRanges, GetStorageRanges)
+            }
             SnapProtocolMessage::StorageRanges(resp) => on_response!(resp, GetStorageRanges),
+            SnapProtocolMessage::GetByteCodes(req) => on_request!(req, ByteCodes, GetByteCodes),
             SnapProtocolMessage::ByteCodes(resp) => on_response!(resp, GetByteCodes),
+            SnapProtocolMessage::GetTrieNodes(req) => on_request!(req, TrieNodes, GetTrieNodes),
             SnapProtocolMessage::TrieNodes(resp) => on_response!(resp, GetTrieNodes),
             request => {
                 debug!(
@@ -529,14 +556,49 @@ impl<N: NetworkPrimitives> ActiveSession<N> {
     ///
     /// This will queue the response to be sent to the peer
     fn handle_outgoing_response(&mut self, id: u64, resp: PeerResponseResult<N>) {
-        match resp.try_into_message(id) {
-            Ok(msg) => {
-                self.queued_outgoing.push_back(msg.into());
+        match resp {
+            PeerResponseResult::Snap(resp) => self.handle_outgoing_snap_response(id, resp),
+            resp => match resp.try_into_message(id) {
+                Ok(msg) => {
+                    self.queued_outgoing.push_back(msg.into());
+                }
+                Err(err) => {
+                    debug!(target: "net", %err, "Failed to respond to received request");
+                }
+            },
+        }
+    }
+
+    /// Handle a snap response to the peer.
+    fn handle_outgoing_snap_response(&mut self, id: u64, resp: Result<SnapResponse, RequestError>) {
+        let snap = match resp {
+            Ok(SnapResponse::AccountRange(mut msg)) => {
+                msg.request_id = id;
+                SnapProtocolMessage::AccountRange(msg)
+            }
+            Ok(SnapResponse::StorageRanges(mut msg)) => {
+                msg.request_id = id;
+                SnapProtocolMessage::StorageRanges(msg)
+            }
+            Ok(SnapResponse::ByteCodes(mut msg)) => {
+                msg.request_id = id;
+                SnapProtocolMessage::ByteCodes(msg)
+            }
+            Ok(SnapResponse::TrieNodes(mut msg)) => {
+                msg.request_id = id;
+                SnapProtocolMessage::TrieNodes(msg)
             }
             Err(err) => {
-                debug!(target: "net", %err, "Failed to respond to received request");
+                debug!(target: "net", %err, "Failed to respond to received snap request");
+                return
             }
-        }
+        };
+
+        let Some(msg) = self.snap_raw_message(snap) else {
+            debug!(target: "net", "Failed to encode snap response for unsupported capability");
+            return
+        };
+        self.queued_outgoing.push_back(OutgoingMessage::Raw(msg));
     }
 
     /// Send a message back to the [`SessionManager`](super::SessionManager).

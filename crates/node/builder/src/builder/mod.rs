@@ -36,6 +36,7 @@ use reth_provider::{
     providers::{BlockchainProvider, NodeTypesForProvider, RocksDBProvider},
     ChainSpecProvider, FullProvider,
 };
+use reth_storage_api::PartialStateSnapProvider;
 use reth_tasks::TaskExecutor;
 use reth_transaction_pool::{PoolConfig, PoolTransaction, TransactionPool};
 use secp256k1::SecretKey;
@@ -839,7 +840,7 @@ impl<Node: FullNodeTypes> BuilderContext<Node> {
                 >,
             > + Unpin
             + 'static,
-        Node::Provider: BlockReaderFor<N>,
+        Node::Provider: BlockReaderFor<N> + PartialStateSnapProvider,
     {
         self.start_network_with(
             builder,
@@ -872,7 +873,7 @@ impl<Node: FullNodeTypes> BuilderContext<Node> {
                 >,
             > + Unpin
             + 'static,
-        Node::Provider: BlockReaderFor<N>,
+        Node::Provider: BlockReaderFor<N> + PartialStateSnapProvider,
         Policy: TransactionPropagationPolicy<N>,
     {
         self.start_network_with_policies(
@@ -909,7 +910,7 @@ impl<Node: FullNodeTypes> BuilderContext<Node> {
                 >,
             > + Unpin
             + 'static,
-        Node::Provider: BlockReaderFor<N>,
+        Node::Provider: BlockReaderFor<N> + PartialStateSnapProvider,
         PropPolicy: TransactionPropagationPolicy<N>,
         AnnPolicy: AnnouncementFilteringPolicy<N>,
     {
