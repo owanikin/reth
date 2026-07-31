@@ -367,27 +367,39 @@ where
         request: GetAccountRangeMessage,
         response: oneshot::Sender<RequestResult<AccountRangeMessage>>,
     ) {
-        let result = self
-            .client
-            .snap_account_range(
-                request.root_hash,
-                request.starting_hash,
-                request.limit_hash,
-                request.response_bytes,
-            )
-            .map(|range| AccountRangeMessage {
-                request_id: request.request_id,
-                accounts: range
-                    .accounts
-                    .into_iter()
-                    .map(|account| AccountData {
-                        hash: account.hash,
-                        body: alloy_rlp::encode(account.account).into(),
-                    })
-                    .collect(),
-                proof: range.proof,
-            })
-            .unwrap_or_else(|err| {
+        let result = self.client.snap_account_range(
+            request.root_hash,
+            request.starting_hash,
+            request.limit_hash,
+            request.response_bytes,
+        );
+
+        let result = match result {
+            Ok(range) => {
+                tracing::debug!(
+                    target: "net::eth",
+                    ?peer_id,
+                    root = ?request.root_hash,
+                    start = ?request.starting_hash,
+                    limit = ?request.limit_hash,
+                    accounts = range.accounts.len(),
+                    proof = range.proof.len(),
+                    "Served snap account range"
+                );
+                AccountRangeMessage {
+                    request_id: request.request_id,
+                    accounts: range
+                        .accounts
+                        .into_iter()
+                        .map(|account| AccountData {
+                            hash: account.hash,
+                            body: alloy_rlp::encode(account.account).into(),
+                        })
+                        .collect(),
+                    proof: range.proof,
+                }
+            }
+            Err(err) => {
                 tracing::debug!(
                     target: "net::eth",
                     %err,
@@ -402,7 +414,8 @@ where
                     accounts: Vec::new(),
                     proof: Vec::new(),
                 }
-            });
+            }
+        };
 
         let _ = response.send(Ok(result));
     }
@@ -413,33 +426,45 @@ where
         request: GetStorageRangesMessage,
         response: oneshot::Sender<RequestResult<StorageRangesMessage>>,
     ) {
-        let result = self
-            .client
-            .snap_storage_ranges(
-                request.root_hash,
-                &request.account_hashes,
-                request.starting_hash,
-                request.limit_hash,
-                request.response_bytes,
-            )
-            .map(|ranges| StorageRangesMessage {
-                request_id: request.request_id,
-                slots: ranges
-                    .slots
-                    .into_iter()
-                    .map(|slots| {
-                        slots
-                            .into_iter()
-                            .map(|slot| StorageData {
-                                hash: slot.hash,
-                                data: alloy_rlp::encode(slot.value).into(),
-                            })
-                            .collect()
-                    })
-                    .collect(),
-                proof: ranges.proof,
-            })
-            .unwrap_or_else(|err| {
+        let result = self.client.snap_storage_ranges(
+            request.root_hash,
+            &request.account_hashes,
+            request.starting_hash,
+            request.limit_hash,
+            request.response_bytes,
+        );
+
+        let result = match result {
+            Ok(ranges) => {
+                let slot_count = ranges.slots.iter().map(Vec::len).sum::<usize>();
+                tracing::debug!(
+                    target: "net::eth",
+                    ?peer_id,
+                    root = ?request.root_hash,
+                    accounts = request.account_hashes.len(),
+                    slots = slot_count,
+                    proof = ranges.proof.len(),
+                    "Served snap storage ranges"
+                );
+                StorageRangesMessage {
+                    request_id: request.request_id,
+                    slots: ranges
+                        .slots
+                        .into_iter()
+                        .map(|slots| {
+                            slots
+                                .into_iter()
+                                .map(|slot| StorageData {
+                                    hash: slot.hash,
+                                    data: alloy_rlp::encode(slot.value).into(),
+                                })
+                                .collect()
+                        })
+                        .collect(),
+                    proof: ranges.proof,
+                }
+            }
+            Err(err) => {
                 tracing::debug!(
                     target: "net::eth",
                     %err,
@@ -455,7 +480,8 @@ where
                     slots: Vec::new(),
                     proof: Vec::new(),
                 }
-            });
+            }
+        };
 
         let _ = response.send(Ok(result));
     }
@@ -466,14 +492,18 @@ where
         request: GetByteCodesMessage,
         response: oneshot::Sender<RequestResult<ByteCodesMessage>>,
     ) {
-        let result = self
-            .client
-            .snap_bytecodes(&request.hashes, request.response_bytes)
-            .map(|bytecodes| ByteCodesMessage {
-                request_id: request.request_id,
-                codes: bytecodes.codes,
-            })
-            .unwrap_or_else(|err| {
+        let result = match self.client.snap_bytecodes(&request.hashes, request.response_bytes) {
+            Ok(bytecodes) => {
+                tracing::debug!(
+                    target: "net::eth",
+                    ?peer_id,
+                    requested = request.hashes.len(),
+                    codes = bytecodes.codes.len(),
+                    "Served snap bytecodes"
+                );
+                ByteCodesMessage { request_id: request.request_id, codes: bytecodes.codes }
+            }
+            Err(err) => {
                 tracing::debug!(
                     target: "net::eth",
                     %err,
@@ -482,7 +512,8 @@ where
                     "Failed to serve snap bytecodes"
                 );
                 ByteCodesMessage { request_id: request.request_id, codes: Vec::new() }
-            });
+            }
+        };
 
         let _ = response.send(Ok(result));
     }
@@ -501,21 +532,31 @@ where
                 slot_paths: path.slot_paths.clone(),
             })
             .collect::<Vec<_>>();
-        let result = self
-            .client
-            .snap_trie_nodes(request.root_hash, &paths, request.response_bytes)
-            .map(|nodes| TrieNodesMessage { request_id: request.request_id, nodes: nodes.nodes })
-            .unwrap_or_else(|err| {
-                tracing::debug!(
-                    target: "net::eth",
-                    %err,
-                    ?peer_id,
-                    root = ?request.root_hash,
-                    paths = request.paths.len(),
-                    "Failed to serve snap trie nodes"
-                );
-                TrieNodesMessage { request_id: request.request_id, nodes: Vec::new() }
-            });
+        let result =
+            match self.client.snap_trie_nodes(request.root_hash, &paths, request.response_bytes) {
+                Ok(nodes) => {
+                    tracing::debug!(
+                        target: "net::eth",
+                        ?peer_id,
+                        root = ?request.root_hash,
+                        paths = request.paths.len(),
+                        nodes = nodes.nodes.len(),
+                        "Served snap trie nodes"
+                    );
+                    TrieNodesMessage { request_id: request.request_id, nodes: nodes.nodes }
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        target: "net::eth",
+                        %err,
+                        ?peer_id,
+                        root = ?request.root_hash,
+                        paths = request.paths.len(),
+                        "Failed to serve snap trie nodes"
+                    );
+                    TrieNodesMessage { request_id: request.request_id, nodes: Vec::new() }
+                }
+            };
 
         let _ = response.send(Ok(result));
     }
@@ -726,4 +767,197 @@ pub enum IncomingEthRequest<N: NetworkPrimitives = EthNetworkPrimitives> {
         /// The channel sender for the response containing trie nodes.
         response: oneshot::Sender<RequestResult<TrieNodesMessage>>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
+    use alloy_rlp::Decodable;
+    use reth_eth_wire_types::snap::TriePath;
+    use reth_storage_api::{
+        errors::provider::ProviderResult, PartialStateSnapAccount, PartialStateSnapAccountRange,
+        PartialStateSnapByteCodes, PartialStateSnapStorage, PartialStateSnapStorageRanges,
+        PartialStateSnapTrieNodes,
+    };
+    use tokio::sync::mpsc;
+
+    #[derive(Debug, Clone, Default)]
+    struct TestSnapProvider {
+        account_range: PartialStateSnapAccountRange,
+        storage_ranges: PartialStateSnapStorageRanges,
+        bytecodes: PartialStateSnapByteCodes,
+        trie_nodes: PartialStateSnapTrieNodes,
+    }
+
+    impl PartialStateSnapProvider for TestSnapProvider {
+        fn snap_account_range(
+            &self,
+            _root_hash: B256,
+            _starting_hash: B256,
+            _limit_hash: B256,
+            _response_bytes: u64,
+        ) -> ProviderResult<PartialStateSnapAccountRange> {
+            Ok(self.account_range.clone())
+        }
+
+        fn snap_storage_ranges(
+            &self,
+            _root_hash: B256,
+            _account_hashes: &[B256],
+            _starting_hash: B256,
+            _limit_hash: B256,
+            _response_bytes: u64,
+        ) -> ProviderResult<PartialStateSnapStorageRanges> {
+            Ok(self.storage_ranges.clone())
+        }
+
+        fn snap_bytecodes(
+            &self,
+            _hashes: &[B256],
+            _response_bytes: u64,
+        ) -> ProviderResult<PartialStateSnapByteCodes> {
+            Ok(self.bytecodes.clone())
+        }
+
+        fn snap_trie_nodes(
+            &self,
+            _root_hash: B256,
+            _paths: &[reth_storage_api::PartialStateSnapTriePath],
+            _response_bytes: u64,
+        ) -> ProviderResult<PartialStateSnapTrieNodes> {
+            Ok(self.trie_nodes.clone())
+        }
+    }
+
+    fn test_handler(provider: TestSnapProvider) -> EthRequestHandler<TestSnapProvider> {
+        let (peers_tx, _peers_rx) = mpsc::unbounded_channel();
+        let (_incoming_tx, incoming_rx) = mpsc::channel(1);
+        EthRequestHandler::new(provider, PeersHandle::new(peers_tx), incoming_rx)
+    }
+
+    fn decode_storage_value(data: &Bytes) -> U256 {
+        let mut data = data.as_ref();
+        U256::decode(&mut data).unwrap()
+    }
+
+    #[tokio::test]
+    async fn serves_snap_account_range_from_provider() {
+        let address = Address::repeat_byte(0x11);
+        let provider = TestSnapProvider {
+            account_range: PartialStateSnapAccountRange {
+                accounts: vec![PartialStateSnapAccount {
+                    hash: keccak256(address),
+                    account: Default::default(),
+                }],
+                proof: Vec::new(),
+            },
+            ..Default::default()
+        };
+
+        let handler = test_handler(provider);
+        let (tx, rx) = oneshot::channel();
+        handler.on_account_range_request(
+            PeerId::random(),
+            GetAccountRangeMessage {
+                request_id: 1,
+                root_hash: B256::ZERO,
+                starting_hash: B256::ZERO,
+                limit_hash: B256::repeat_byte(0xff),
+                response_bytes: SOFT_RESPONSE_LIMIT as u64,
+            },
+            tx,
+        );
+
+        let response = rx.await.unwrap().unwrap();
+        assert_eq!(response.request_id, 1);
+        assert_eq!(response.accounts.len(), 1);
+        assert_eq!(response.accounts[0].hash, keccak256(address));
+        assert!(!response.accounts[0].body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn serves_snap_storage_ranges_from_provider() {
+        let address = Address::repeat_byte(0x22);
+        let slot = B256::with_last_byte(1);
+        let value = U256::from(42);
+        let provider = TestSnapProvider {
+            storage_ranges: PartialStateSnapStorageRanges {
+                slots: vec![vec![PartialStateSnapStorage { hash: keccak256(slot), value }]],
+                proof: Vec::new(),
+            },
+            ..Default::default()
+        };
+
+        let handler = test_handler(provider);
+        let (tx, rx) = oneshot::channel();
+        handler.on_storage_ranges_request(
+            PeerId::random(),
+            GetStorageRangesMessage {
+                request_id: 2,
+                root_hash: B256::ZERO,
+                account_hashes: vec![keccak256(address)],
+                starting_hash: B256::ZERO,
+                limit_hash: B256::repeat_byte(0xff),
+                response_bytes: SOFT_RESPONSE_LIMIT as u64,
+            },
+            tx,
+        );
+
+        let response = rx.await.unwrap().unwrap();
+        assert_eq!(response.request_id, 2);
+        assert_eq!(response.slots.len(), 1);
+        assert_eq!(response.slots[0].len(), 1);
+        assert_eq!(response.slots[0][0].hash, keccak256(slot));
+        assert_eq!(decode_storage_value(&response.slots[0][0].data), value);
+    }
+
+    #[tokio::test]
+    async fn serves_snap_bytecodes_from_provider() {
+        let bytecode = Bytes::from(vec![0x60, 0x00, 0x60, 0x01]);
+        let code_hash = keccak256(bytecode.as_ref());
+        let provider = TestSnapProvider {
+            bytecodes: PartialStateSnapByteCodes { codes: vec![bytecode.clone()] },
+            ..Default::default()
+        };
+
+        let handler = test_handler(provider);
+        let (tx, rx) = oneshot::channel();
+        handler.on_bytecodes_request(
+            PeerId::random(),
+            GetByteCodesMessage {
+                request_id: 3,
+                hashes: vec![code_hash],
+                response_bytes: SOFT_RESPONSE_LIMIT as u64,
+            },
+            tx,
+        );
+
+        let response = rx.await.unwrap().unwrap();
+        assert_eq!(response.request_id, 3);
+        assert_eq!(response.codes, vec![bytecode]);
+    }
+
+    #[tokio::test]
+    async fn serves_empty_snap_trie_nodes_from_provider() {
+        let handler = test_handler(TestSnapProvider::default());
+        let (tx, rx) = oneshot::channel();
+        handler.on_trie_nodes_request(
+            PeerId::random(),
+            GetTrieNodesMessage {
+                request_id: 4,
+                root_hash: B256::ZERO,
+                paths: vec![TriePath {
+                    account_path: Bytes::from(vec![0xab]),
+                    slot_paths: vec![Bytes::from(vec![0xcd])],
+                }],
+                response_bytes: SOFT_RESPONSE_LIMIT as u64,
+            },
+            tx,
+        );
+
+        let response = rx.await.unwrap().unwrap();
+        assert_eq!(response.request_id, 4);
+        assert!(response.nodes.is_empty());
+    }
 }

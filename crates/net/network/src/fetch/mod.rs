@@ -1921,9 +1921,9 @@ mod tests {
         assert!(fetcher.peers[&peer_id].state.is_idle());
         assert!(!fetcher.inflight_snap_requests.contains_key(&peer_id));
 
-        let result = rx.await.unwrap().unwrap();
-        assert_eq!(result.0, peer_id);
-        assert_eq!(result.1, response);
+        let (result_peer_id, result_response) = rx.await.unwrap().unwrap().split();
+        assert_eq!(result_peer_id, peer_id);
+        assert_eq!(result_response, response);
     }
 
     #[tokio::test]
