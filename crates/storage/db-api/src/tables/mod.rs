@@ -470,6 +470,15 @@ tables! {
         type Value = Account;
     }
 
+    /// Stores non-empty storage-root commitments downloaded for partial-state accounts.
+    ///
+    /// Partial-state nodes intentionally omit storage for untracked accounts, so their storage
+    /// roots cannot be reconstructed from [`HashedStorages`].
+    table PartialStateStorageRoots {
+        type Key = B256;
+        type Value = B256;
+    }
+
     /// Stores the current storage values indexed with `keccak256Address` and
     /// hash of storage key `keccak256key`.
     /// This table is in preparation for merklization and calculation of state root.

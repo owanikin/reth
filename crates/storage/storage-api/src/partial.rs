@@ -49,7 +49,7 @@ pub trait PartialStateSnapWriter {
     /// Writer error type.
     type Error;
 
-    /// Persists an account leaf returned by snap sync.
+    /// Persists an account leaf returned by snap sync, including its storage-root commitment.
     fn write_account(
         &mut self,
         account_hash: B256,

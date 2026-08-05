@@ -2,6 +2,7 @@ use crate::{
     providers::{NodeTypesForProvider, ProviderNodeTypes},
     DatabaseProvider, ProviderFactory,
 };
+use alloy_consensus::constants::EMPTY_ROOT_HASH;
 use alloy_primitives::{Bytes, B256, U256};
 use reth_db_api::{
     cursor::{DbCursorRO, DbDupCursorRO},
@@ -62,10 +63,21 @@ where
         account_hash: B256,
         account: TrieAccount,
     ) -> Result<(), Self::Error> {
+        let storage_root = account.storage_root;
         self.provider
             .tx_ref()
-            .put::<tables::HashedAccounts>(account_hash, Account::from(account))
-            .map_err(Into::into)
+            .put::<tables::HashedAccounts>(account_hash, Account::from(account))?;
+
+        if storage_root == EMPTY_ROOT_HASH {
+            self.provider
+                .tx_ref()
+                .delete::<tables::PartialStateStorageRoots>(account_hash, None)?;
+        } else {
+            self.provider
+                .tx_ref()
+                .put::<tables::PartialStateStorageRoots>(account_hash, storage_root)?;
+        }
+        Ok(())
     }
 
     fn write_storage(
@@ -163,7 +175,7 @@ where
                 break
             }
 
-            let storage_root = self.storage_root_by_hash(account_hash)?;
+            let storage_root = self.account_storage_root(account_hash)?;
             let trie_account = account.into_trie_account(storage_root);
             if !accounts.is_empty() &&
                 exceeds_soft_limit(total_bytes, ACCOUNT_RANGE_ITEM_BYTES, response_bytes)
@@ -268,6 +280,15 @@ where
     TX: DbTx + Send + Sync + 'static,
     N: NodeTypesForProvider,
 {
+    fn account_storage_root(&self, account_hash: B256) -> Result<B256, ProviderError> {
+        if let Some(storage_root) =
+            self.tx_ref().get::<tables::PartialStateStorageRoots>(account_hash)?
+        {
+            return Ok(storage_root)
+        }
+        self.storage_root_by_hash(account_hash)
+    }
+
     fn storage_root_by_hash(&self, account_hash: B256) -> Result<B256, ProviderError> {
         reth_trie_db::with_adapter!(self, |A| {
             DbStorageRoot::<_, A>::from_tx_hashed(self.tx_ref(), account_hash).root()
@@ -322,6 +343,10 @@ mod tests {
             stored_account,
             Account { nonce: 7, balance: U256::from(100), bytecode_hash: Some(code_hash) }
         );
+        assert_eq!(
+            provider.tx_ref().get::<tables::PartialStateStorageRoots>(account_hash).unwrap(),
+            Some(storage_root)
+        );
 
         let mut storage_cursor =
             provider.tx_ref().cursor_dup_read::<tables::HashedStorages>().unwrap();
@@ -355,7 +380,7 @@ mod tests {
                 TrieAccount {
                     nonce: 0,
                     balance: U256::ZERO,
-                    storage_root: B256::ZERO,
+                    storage_root: EMPTY_ROOT_HASH,
                     code_hash: KECCAK_EMPTY,
                 },
             )
@@ -367,5 +392,69 @@ mod tests {
             .unwrap()
             .expect("account should be stored");
         assert_eq!(stored_account.bytecode_hash, None);
+        assert_eq!(
+            provider.tx_ref().get::<tables::PartialStateStorageRoots>(account_hash).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn partial_snap_provider_preserves_storage_root_without_local_slots() {
+        let factory = create_test_provider_factory();
+        let provider = factory.database_provider_rw().unwrap();
+        let account_hash = B256::repeat_byte(0x66);
+        let storage_root = B256::repeat_byte(0x77);
+        let account = TrieAccount {
+            nonce: 1,
+            balance: U256::from(10),
+            storage_root,
+            code_hash: KECCAK_EMPTY,
+        };
+
+        provider.partial_state_snap_writer().write_account(account_hash, account).unwrap();
+
+        assert_eq!(provider.storage_root_by_hash(account_hash).unwrap(), EMPTY_ROOT_HASH);
+
+        let range = provider
+            .snap_account_range(B256::repeat_byte(0x88), account_hash, account_hash, u64::MAX)
+            .unwrap();
+        assert_eq!(range.accounts.len(), 1);
+        assert_eq!(range.accounts[0].hash, account_hash);
+        assert_eq!(range.accounts[0].account, account);
+    }
+
+    #[test]
+    fn partial_snap_writer_removes_stale_empty_storage_commitment() {
+        let factory = create_test_provider_factory();
+        let provider = factory.database_provider_rw().unwrap();
+        let account_hash = B256::repeat_byte(0x99);
+
+        provider
+            .partial_state_snap_writer()
+            .write_account(
+                account_hash,
+                TrieAccount {
+                    storage_root: B256::repeat_byte(0xaa),
+                    code_hash: KECCAK_EMPTY,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        provider
+            .partial_state_snap_writer()
+            .write_account(
+                account_hash,
+                TrieAccount {
+                    storage_root: EMPTY_ROOT_HASH,
+                    code_hash: KECCAK_EMPTY,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            provider.tx_ref().get::<tables::PartialStateStorageRoots>(account_hash).unwrap(),
+            None
+        );
     }
 }
