@@ -11,18 +11,14 @@ use reth_db_api::{
 };
 use reth_primitives_traits::{Account, Bytecode, StorageEntry};
 use reth_storage_api::{
-    DatabaseProviderFactory, PartialStateSnapAccount, PartialStateSnapAccountRange,
-    PartialStateSnapByteCodes, PartialStateSnapProvider, PartialStateSnapStorage,
-    PartialStateSnapStorageRanges, PartialStateSnapTrieNodes, PartialStateSnapTriePath,
-    PartialStateSnapWriter, StorageSettingsCache,
+    ContractFilter, DatabaseProviderFactory, PartialStateRootProvider, PartialStateSnapAccount,
+    PartialStateSnapAccountRange, PartialStateSnapByteCodes, PartialStateSnapProvider,
+    PartialStateSnapStorage, PartialStateSnapStorageRanges, PartialStateSnapTrieNodes,
+    PartialStateSnapTriePath, PartialStateSnapWriter,
 };
 use reth_storage_errors::provider::ProviderError;
-use reth_trie::StorageRoot;
+use reth_trie::root::{StateRootBuilder, StorageRootBuilder};
 use reth_trie_common::TrieAccount;
-use reth_trie_db::{DatabaseHashedCursorFactory, DatabaseStorageRoot, DatabaseTrieCursorFactory};
-
-type DbStorageRoot<'a, TX, A> =
-    StorageRoot<DatabaseTrieCursorFactory<&'a TX, A>, DatabaseHashedCursorFactory<&'a TX>>;
 
 /// Writes partial snap state responses into Reth's hash-keyed state tables.
 #[derive(Debug)]
@@ -153,6 +149,15 @@ where
     }
 }
 
+impl<N> PartialStateRootProvider for ProviderFactory<N>
+where
+    N: ProviderNodeTypes,
+{
+    fn partial_state_root(&self, filter: &dyn ContractFilter) -> Result<B256, ProviderError> {
+        self.database_provider_ro()?.partial_state_root(filter)
+    }
+}
+
 impl<TX, N> PartialStateSnapProvider for DatabaseProvider<TX, N>
 where
     TX: DbTx + Send + Sync + 'static,
@@ -275,6 +280,50 @@ where
     }
 }
 
+impl<TX, N> PartialStateRootProvider for DatabaseProvider<TX, N>
+where
+    TX: DbTx + Send + Sync + 'static,
+    N: NodeTypesForProvider,
+{
+    fn partial_state_root(&self, filter: &dyn ContractFilter) -> Result<B256, ProviderError> {
+        let mut account_cursor = self.tx_ref().cursor_read::<tables::HashedAccounts>()?;
+        let mut commitment_cursor =
+            self.tx_ref().cursor_read::<tables::PartialStateStorageRoots>()?;
+        let mut storage_cursor = self.tx_ref().cursor_dup_read::<tables::HashedStorages>()?;
+        let mut next_account = account_cursor.seek(B256::ZERO)?;
+        let mut next_commitment = commitment_cursor.seek(B256::ZERO)?;
+        let mut root_builder = StateRootBuilder::default();
+
+        while let Some((account_hash, account)) = next_account {
+            while next_commitment.is_some_and(|(hash, _)| hash < account_hash) {
+                next_commitment = commitment_cursor.next()?;
+            }
+            let preserved_storage_root =
+                next_commitment.filter(|(hash, _)| *hash == account_hash).map(|(_, root)| root);
+            if preserved_storage_root.is_some() {
+                next_commitment = commitment_cursor.next()?;
+            }
+
+            let storage_root = if filter.should_sync_storage_by_hash(&account_hash) {
+                let mut storage_root_builder = StorageRootBuilder::default();
+                let mut next_slot = storage_cursor.seek_by_key_subkey(account_hash, B256::ZERO)?;
+                while let Some(entry) = next_slot {
+                    storage_root_builder.add_storage(entry.key, entry.value);
+                    next_slot = storage_cursor.next_dup_val()?;
+                }
+                storage_root_builder.root()
+            } else {
+                preserved_storage_root.unwrap_or(EMPTY_ROOT_HASH)
+            };
+
+            root_builder.add_account(account_hash, account.into_trie_account(storage_root));
+            next_account = account_cursor.next()?;
+        }
+
+        Ok(root_builder.root())
+    }
+}
+
 impl<TX, N> DatabaseProvider<TX, N>
 where
     TX: DbTx + Send + Sync + 'static,
@@ -290,10 +339,16 @@ where
     }
 
     fn storage_root_by_hash(&self, account_hash: B256) -> Result<B256, ProviderError> {
-        reth_trie_db::with_adapter!(self, |A| {
-            DbStorageRoot::<_, A>::from_tx_hashed(self.tx_ref(), account_hash).root()
-        })
-        .map_err(ProviderError::other)
+        let mut cursor = self.tx_ref().cursor_dup_read::<tables::HashedStorages>()?;
+        let mut next = cursor.seek_by_key_subkey(account_hash, B256::ZERO)?;
+        let mut root_builder = StorageRootBuilder::default();
+
+        while let Some(entry) = next {
+            root_builder.add_storage(entry.key, entry.value);
+            next = cursor.next_dup_val()?;
+        }
+
+        Ok(root_builder.root())
     }
 }
 
@@ -309,7 +364,10 @@ mod tests {
     use super::*;
     use crate::test_utils::create_test_provider_factory;
     use alloy_consensus::constants::KECCAK_EMPTY;
+    use alloy_primitives::{address, keccak256};
     use reth_db_api::{cursor::DbDupCursorRO, transaction::DbTx};
+    use reth_storage_api::ConfiguredContractFilter;
+    use reth_trie::root::{state_root_unsorted, storage_root};
 
     #[test]
     fn partial_snap_writer_persists_hash_keyed_state() {
@@ -456,5 +514,68 @@ mod tests {
             provider.tx_ref().get::<tables::PartialStateStorageRoots>(account_hash).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn partial_state_root_matches_complete_reference_state() {
+        let factory = create_test_provider_factory();
+        let provider = factory.database_provider_rw().unwrap();
+        let tracked_address = address!("0000000000000000000000000000000000000001");
+        let untracked_address = address!("0000000000000000000000000000000000000002");
+        let empty_storage_address = address!("0000000000000000000000000000000000000003");
+        let tracked_hash = keccak256(tracked_address);
+        let untracked_hash = keccak256(untracked_address);
+        let empty_storage_hash = keccak256(empty_storage_address);
+        let tracked_slot = B256::repeat_byte(0x11);
+        let untracked_slot = B256::repeat_byte(0x22);
+        let tracked_value = U256::from(100);
+        let untracked_value = U256::from(200);
+        let tracked_storage_root = storage_root([(tracked_slot, tracked_value)]);
+        let untracked_storage_root = storage_root([(untracked_slot, untracked_value)]);
+        let tracked_account = TrieAccount {
+            nonce: 1,
+            balance: U256::from(10),
+            storage_root: tracked_storage_root,
+            code_hash: KECCAK_EMPTY,
+        };
+        let untracked_account = TrieAccount {
+            nonce: 2,
+            balance: U256::from(20),
+            storage_root: untracked_storage_root,
+            code_hash: KECCAK_EMPTY,
+        };
+        let empty_storage_account = TrieAccount {
+            nonce: 3,
+            balance: U256::from(30),
+            storage_root: EMPTY_ROOT_HASH,
+            code_hash: KECCAK_EMPTY,
+        };
+        let expected = state_root_unsorted([
+            (tracked_hash, tracked_account),
+            (untracked_hash, untracked_account),
+            (empty_storage_hash, empty_storage_account),
+        ]);
+
+        {
+            let mut writer = provider.partial_state_snap_writer();
+            writer.write_account(tracked_hash, tracked_account).unwrap();
+            writer.write_storage(tracked_hash, tracked_slot, tracked_value).unwrap();
+            writer.write_account(untracked_hash, untracked_account).unwrap();
+            writer.write_account(empty_storage_hash, empty_storage_account).unwrap();
+        }
+
+        // Tracked storage must be derived locally, even if its downloaded commitment is stale.
+        provider
+            .tx_ref()
+            .put::<tables::PartialStateStorageRoots>(tracked_hash, B256::repeat_byte(0xff))
+            .unwrap();
+
+        let filter = ConfiguredContractFilter::new([tracked_address]);
+        assert_eq!(provider.partial_state_root(&filter).unwrap(), expected);
+
+        // Removing the only representation of untracked storage changes the resulting root,
+        // allowing the caller to reject the partial state against the expected header root.
+        provider.tx_ref().delete::<tables::PartialStateStorageRoots>(untracked_hash, None).unwrap();
+        assert_ne!(provider.partial_state_root(&filter).unwrap(), expected);
     }
 }

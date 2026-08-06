@@ -28,9 +28,10 @@ use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{
-    BlockBodyIndicesProvider, NodePrimitivesProvider, PartialStateSnapAccountRange,
-    PartialStateSnapByteCodes, PartialStateSnapProvider, PartialStateSnapStorageRanges,
-    PartialStateSnapTrieNodes, PartialStateSnapTriePath, StorageChangeSetReader,
+    BlockBodyIndicesProvider, ContractFilter, NodePrimitivesProvider, PartialStateRootProvider,
+    PartialStateSnapAccountRange, PartialStateSnapByteCodes, PartialStateSnapProvider,
+    PartialStateSnapStorageRanges, PartialStateSnapTrieNodes, PartialStateSnapTriePath,
+    StorageChangeSetReader,
 };
 use reth_storage_errors::provider::ProviderResult;
 use reth_trie::{HashedPostState, KeccakKeyHasher};
@@ -198,6 +199,12 @@ impl<N: ProviderNodeTypes> PartialStateSnapProvider for BlockchainProvider<N> {
         response_bytes: u64,
     ) -> ProviderResult<PartialStateSnapTrieNodes> {
         self.database.snap_trie_nodes(root_hash, paths, response_bytes)
+    }
+}
+
+impl<N: ProviderNodeTypes> PartialStateRootProvider for BlockchainProvider<N> {
+    fn partial_state_root(&self, filter: &dyn ContractFilter) -> ProviderResult<B256> {
+        self.database.partial_state_root(filter)
     }
 }
 

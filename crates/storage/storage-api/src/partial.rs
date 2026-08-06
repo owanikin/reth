@@ -165,6 +165,16 @@ pub trait PartialStateSnapProvider: Send + Sync {
     ) -> ProviderResult<PartialStateSnapTrieNodes>;
 }
 
+/// Computes a state root while accounting for intentionally omitted contract storage.
+#[auto_impl(&, Arc, Box)]
+pub trait PartialStateRootProvider: Send + Sync {
+    /// Computes the account trie root for the current partial state.
+    ///
+    /// Storage roots for tracked accounts are computed from locally retained slots. Untracked
+    /// accounts use their preserved storage-root commitments when available.
+    fn partial_state_root(&self, filter: &dyn ContractFilter) -> ProviderResult<B256>;
+}
+
 /// A contract filter backed by a static set of tracked contract addresses.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct ConfiguredContractFilter {
