@@ -573,6 +573,20 @@ mod tests {
         let filter = ConfiguredContractFilter::new([tracked_address]);
         assert_eq!(provider.partial_state_root(&filter).unwrap(), expected);
 
+        // Tracked storage is never substituted with its preserved commitment.
+        provider
+            .tx_ref()
+            .delete::<tables::HashedStorages>(
+                tracked_hash,
+                Some(StorageEntry { key: tracked_slot, value: tracked_value }),
+            )
+            .unwrap();
+        assert_ne!(provider.partial_state_root(&filter).unwrap(), expected);
+        provider
+            .partial_state_snap_writer()
+            .write_storage(tracked_hash, tracked_slot, tracked_value)
+            .unwrap();
+
         // Removing the only representation of untracked storage changes the resulting root,
         // allowing the caller to reject the partial state against the expected header root.
         provider.tx_ref().delete::<tables::PartialStateStorageRoots>(untracked_hash, None).unwrap();

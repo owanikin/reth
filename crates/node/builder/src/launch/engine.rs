@@ -12,8 +12,9 @@ use alloy_consensus::BlockHeader;
 use futures::{stream::FusedStream, stream_select, FutureExt, StreamExt};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_downloaders::snap::{
-    persist_snap_event, report_partial_snap_progress, PartialStateSnapDownloader,
-    PartialStateSnapDownloaderConfig, PartialStateSnapEvent, PartialStateSnapTarget,
+    persist_snap_event, report_partial_snap_progress, verify_partial_snap_state_root,
+    PartialStateSnapDownloader, PartialStateSnapDownloaderConfig, PartialStateSnapEvent,
+    PartialStateSnapTarget,
 };
 use reth_engine_tree::{
     chain::{ChainEvent, FromOrchestrator},
@@ -504,7 +505,7 @@ where
     let mut downloader = PartialStateSnapDownloader::with_filter(
         client,
         PartialStateSnapDownloaderConfig::default(),
-        filter,
+        filter.clone(),
     );
     downloader.start(PartialStateSnapTarget::full_range(state_root));
 
@@ -516,6 +517,17 @@ where
 
     let progress = downloader.progress();
     report_partial_snap_progress(progress);
+
+    let computed_root = tokio::task::spawn_blocking(move || {
+        verify_partial_snap_state_root(&provider_factory, &filter, state_root)
+    })
+    .await??;
+    debug!(
+        target: "reth::cli",
+        expected_root = %state_root,
+        %computed_root,
+        "Verified partial-state snap root"
+    );
 
     Ok(progress)
 }

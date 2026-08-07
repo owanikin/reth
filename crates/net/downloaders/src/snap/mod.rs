@@ -15,7 +15,10 @@ use reth_network_p2p::{
     snap::client::{SnapClient, SnapResponse},
 };
 use reth_network_peers::PeerId;
-use reth_storage_api::{AllowAllContractFilter, ContractFilter, PartialStateSnapWriter};
+use reth_storage_api::{
+    errors::provider::ProviderError, AllowAllContractFilter, ContractFilter,
+    PartialStateRootProvider, PartialStateSnapWriter,
+};
 use reth_trie_common::TrieAccount;
 use std::{
     collections::VecDeque,
@@ -117,6 +120,41 @@ pub struct PartialStateSnapRunOutcome {
     pub progress: PartialStateSnapProgress,
     /// Number of persisted snap events.
     pub events: u64,
+}
+
+/// Error returned when verifying persisted partial snap state.
+#[derive(Debug, Error)]
+pub enum PartialStateSnapRootError {
+    /// Computing the persisted partial-state root failed.
+    #[error("failed to compute partial-state snap root: {0}")]
+    Provider(#[source] ProviderError),
+    /// The persisted partial-state root does not match the snap target.
+    #[error(
+        "partial-state snap root mismatch: expected {expected_root}, computed {computed_root}"
+    )]
+    RootMismatch {
+        /// State root requested from the snap peer.
+        expected_root: B256,
+        /// State root computed from persisted partial state.
+        computed_root: B256,
+    },
+}
+
+/// Computes the persisted partial-state root and checks it against the snap target.
+pub fn verify_partial_snap_state_root<P>(
+    provider: &P,
+    filter: &dyn ContractFilter,
+    expected_root: B256,
+) -> Result<B256, PartialStateSnapRootError>
+where
+    P: PartialStateRootProvider + ?Sized,
+{
+    let computed_root =
+        provider.partial_state_root(filter).map_err(PartialStateSnapRootError::Provider)?;
+    if computed_root != expected_root {
+        return Err(PartialStateSnapRootError::RootMismatch { expected_root, computed_root })
+    }
+    Ok(computed_root)
 }
 
 /// Stream item emitted by the partial-state snap downloader.
@@ -1020,6 +1058,62 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
+    #[test]
+    fn verifies_matching_partial_snap_state_root() {
+        let expected_root = B256::repeat_byte(0x11);
+        let provider = TestPartialStateRootProvider::new(Ok(expected_root));
+
+        assert_eq!(
+            verify_partial_snap_state_root(&provider, &AllowAllContractFilter, expected_root)
+                .unwrap(),
+            expected_root
+        );
+    }
+
+    #[test]
+    fn verifies_empty_partial_snap_state_root() {
+        let provider = TestPartialStateRootProvider::new(Ok(EMPTY_ROOT_HASH));
+
+        assert_eq!(
+            verify_partial_snap_state_root(&provider, &AllowAllContractFilter, EMPTY_ROOT_HASH)
+                .unwrap(),
+            EMPTY_ROOT_HASH
+        );
+    }
+
+    #[test]
+    fn rejects_partial_snap_state_root_mismatch() {
+        let expected_root = B256::repeat_byte(0x11);
+        let computed_root = B256::repeat_byte(0x22);
+        let provider = TestPartialStateRootProvider::new(Ok(computed_root));
+
+        assert!(matches!(
+            verify_partial_snap_state_root(
+                &provider,
+                &AllowAllContractFilter,
+                expected_root
+            ),
+            Err(PartialStateSnapRootError::RootMismatch {
+                expected_root: actual_expected,
+                computed_root: actual_computed,
+            }) if actual_expected == expected_root && actual_computed == computed_root
+        ));
+    }
+
+    #[test]
+    fn propagates_partial_snap_state_root_provider_error() {
+        let provider = TestPartialStateRootProvider::new(Err(ProviderError::UnsupportedProvider));
+
+        assert!(matches!(
+            verify_partial_snap_state_root(
+                &provider,
+                &AllowAllContractFilter,
+                B256::repeat_byte(0x11)
+            ),
+            Err(PartialStateSnapRootError::Provider(ProviderError::UnsupportedProvider))
+        ));
+    }
+
     #[tokio::test]
     async fn requests_account_range_for_target() {
         let root = B256::repeat_byte(0x11);
@@ -1650,6 +1744,23 @@ mod tests {
 
         fn is_tracked(&self, _address: &Address) -> bool {
             false
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct TestPartialStateRootProvider {
+        root: Result<B256, ProviderError>,
+    }
+
+    impl TestPartialStateRootProvider {
+        const fn new(root: Result<B256, ProviderError>) -> Self {
+            Self { root }
+        }
+    }
+
+    impl PartialStateRootProvider for TestPartialStateRootProvider {
+        fn partial_state_root(&self, _filter: &dyn ContractFilter) -> Result<B256, ProviderError> {
+            self.root.clone()
         }
     }
 
