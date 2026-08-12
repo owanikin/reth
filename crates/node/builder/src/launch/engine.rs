@@ -40,10 +40,10 @@ use reth_provider::{
     providers::{BlockchainProvider, NodeTypesForProvider, ProviderNodeTypes},
     BlockNumReader, ProviderFactory, StorageSettingsCache,
 };
-use reth_storage_api::ConfiguredContractFilter;
+use reth_storage_api::{ConfiguredContractFilter, PartialStateSnapPivot, PartialStateSnapProvider};
 use reth_tasks::TaskExecutor;
 use reth_tokio_util::EventSender;
-use reth_tracing::tracing::{debug, error, info};
+use reth_tracing::tracing::{debug, error, info, warn};
 use reth_trie_db::ChangesetCache;
 use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::sync::{mpsc::unbounded_channel, oneshot};
@@ -357,14 +357,25 @@ impl EngineNodeLauncher {
                                 if let Some(head) = ev.canonical_header() {
                                     if let Some(filter) = partial_state_filter.clone() {
                                         if !partial_state_snap_started && head.number() > 0 {
-                                            partial_state_snap_started = true;
-                                            spawn_partial_state_snap_sync(
-                                                &partial_state_task_executor,
-                                                partial_state_network_client.clone(),
-                                                partial_state_provider_factory.clone(),
-                                                filter,
-                                                head.state_root(),
-                                            );
+                                            match partial_state_provider_factory.snap_state_pivot() {
+                                                Ok(pivot) => {
+                                                    partial_state_snap_started = true;
+                                                    spawn_partial_state_snap_sync(
+                                                        &partial_state_task_executor,
+                                                        partial_state_network_client.clone(),
+                                                        partial_state_provider_factory.clone(),
+                                                        filter,
+                                                        pivot,
+                                                    );
+                                                }
+                                                Err(err) => {
+                                                    warn!(
+                                                        target: "reth::cli",
+                                                        %err,
+                                                        "Failed to select persisted partial-state snap pivot"
+                                                    );
+                                                }
+                                            }
                                         }
                                     }
                                     // Once we're progressing via live sync, we can consider the node is not syncing anymore
@@ -458,24 +469,32 @@ impl EngineNodeLauncher {
     }
 }
 
-/// Spawns the partial-state snap downloader for the given state root.
+/// Spawns the partial-state snap downloader for the given persisted pivot.
 fn spawn_partial_state_snap_sync<N, Client>(
     task_executor: &TaskExecutor,
     client: Client,
     provider_factory: ProviderFactory<N>,
     filter: ConfiguredContractFilter,
-    state_root: alloy_primitives::B256,
+    pivot: PartialStateSnapPivot,
 ) where
     N: ProviderNodeTypes + 'static,
     Client: SnapClient + Clone + Unpin + 'static,
 {
-    info!(target: "reth::cli", %state_root, "Starting partial-state snap sync");
+    info!(
+        target: "reth::cli",
+        block_number = pivot.block_number,
+        block_hash = %pivot.block_hash,
+        state_root = %pivot.state_root,
+        "Starting partial-state snap sync"
+    );
     task_executor.spawn_critical_task("partial-state snap sync", async move {
-        match run_partial_state_snap_sync(client, provider_factory, filter, state_root).await {
+        match run_partial_state_snap_sync(client, provider_factory, filter, pivot).await {
             Ok(progress) => {
                 info!(
                     target: "reth::cli",
-                    %state_root,
+                    block_number = pivot.block_number,
+                    block_hash = %pivot.block_hash,
+                    state_root = %pivot.state_root,
                     accounts = progress.accounts,
                     slots = progress.storage_slots,
                     slots_skipped = progress.storage_skipped,
@@ -485,7 +504,14 @@ fn spawn_partial_state_snap_sync<N, Client>(
                 );
             }
             Err(err) => {
-                error!(target: "reth::cli", %state_root, %err, "Partial-state snap sync failed");
+                error!(
+                    target: "reth::cli",
+                    block_number = pivot.block_number,
+                    block_hash = %pivot.block_hash,
+                    state_root = %pivot.state_root,
+                    %err,
+                    "Partial-state snap sync failed"
+                );
             }
         }
     });
@@ -496,7 +522,7 @@ async fn run_partial_state_snap_sync<N, Client>(
     client: Client,
     provider_factory: ProviderFactory<N>,
     filter: ConfiguredContractFilter,
-    state_root: alloy_primitives::B256,
+    pivot: PartialStateSnapPivot,
 ) -> eyre::Result<reth_downloaders::snap::PartialStateSnapProgress>
 where
     N: ProviderNodeTypes + 'static,
@@ -507,7 +533,7 @@ where
         PartialStateSnapDownloaderConfig::default(),
         filter.clone(),
     );
-    downloader.start(PartialStateSnapTarget::full_range(state_root));
+    downloader.start(PartialStateSnapTarget::full_range(pivot.state_root));
 
     while let Some(event) = downloader.next().await {
         let event = event?;
@@ -519,12 +545,14 @@ where
     report_partial_snap_progress(progress);
 
     let computed_root = tokio::task::spawn_blocking(move || {
-        verify_partial_snap_state_root(&provider_factory, &filter, state_root)
+        verify_partial_snap_state_root(&provider_factory, &filter, pivot.state_root)
     })
     .await??;
     debug!(
         target: "reth::cli",
-        expected_root = %state_root,
+        block_number = pivot.block_number,
+        block_hash = %pivot.block_hash,
+        expected_root = %pivot.state_root,
         %computed_root,
         "Verified partial-state snap root"
     );

@@ -127,9 +127,25 @@ pub struct PartialStateSnapTrieNodes {
     pub nodes: Vec<Bytes>,
 }
 
+/// Persisted state version available for snap serving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartialStateSnapPivot {
+    /// Number of the persisted block.
+    pub block_number: BlockNumber,
+    /// Hash of the persisted block.
+    pub block_hash: BlockHash,
+    /// State root committed to by the persisted block.
+    pub state_root: B256,
+}
+
 /// Reads snap state records that can be served to peers.
 #[auto_impl(&, Arc, Box)]
 pub trait PartialStateSnapProvider: Send + Sync {
+    /// Returns the persisted state version that this provider can serve over snap.
+    fn snap_state_pivot(&self) -> ProviderResult<PartialStateSnapPivot> {
+        Err(ProviderError::UnsupportedProvider)
+    }
+
     /// Returns a snap account range for the requested state root.
     fn snap_account_range(
         &self,

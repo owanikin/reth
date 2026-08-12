@@ -132,6 +132,9 @@ pub enum ProviderError {
     /// Bytecode for this address is unavailable because the partial-state node does not track it.
     #[error("bytecode for address {0} is not tracked by this partial-state node")]
     CodeNotTracked(Address),
+    /// Snap state for the requested root is not the state currently persisted by this provider.
+    #[error(transparent)]
+    SnapStateRootUnavailable(Box<SnapStateRootUnavailableError>),
     /// Static File is not found at specified path.
     #[cfg(feature = "std")]
     #[error("not able to find {_0} static file at {_1:?}")]
@@ -268,6 +271,16 @@ pub struct RootMismatch {
     pub block_number: BlockNumber,
     /// The target block hash.
     pub block_hash: BlockHash,
+}
+
+/// Error returned when a snap request targets a state root other than the persisted state.
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("snap state root {requested} is unavailable; provider serves persisted root {available}")]
+pub struct SnapStateRootUnavailableError {
+    /// State root requested by the snap peer.
+    pub requested: B256,
+    /// State root currently persisted by the provider.
+    pub available: B256,
 }
 
 /// A Static File Writer Error.

@@ -1,8 +1,8 @@
 use crate::{
     providers::{NodeTypesForProvider, ProviderNodeTypes},
-    DatabaseProvider, ProviderFactory,
+    BlockNumReader, DatabaseProvider, HeaderProvider, ProviderFactory,
 };
-use alloy_consensus::constants::EMPTY_ROOT_HASH;
+use alloy_consensus::{constants::EMPTY_ROOT_HASH, BlockHeader};
 use alloy_primitives::{Bytes, B256, U256};
 use reth_db_api::{
     cursor::{DbCursorRO, DbDupCursorRO},
@@ -12,11 +12,11 @@ use reth_db_api::{
 use reth_primitives_traits::{Account, Bytecode, StorageEntry};
 use reth_storage_api::{
     ContractFilter, DatabaseProviderFactory, PartialStateRootProvider, PartialStateSnapAccount,
-    PartialStateSnapAccountRange, PartialStateSnapByteCodes, PartialStateSnapProvider,
-    PartialStateSnapStorage, PartialStateSnapStorageRanges, PartialStateSnapTrieNodes,
-    PartialStateSnapTriePath, PartialStateSnapWriter,
+    PartialStateSnapAccountRange, PartialStateSnapByteCodes, PartialStateSnapPivot,
+    PartialStateSnapProvider, PartialStateSnapStorage, PartialStateSnapStorageRanges,
+    PartialStateSnapTrieNodes, PartialStateSnapTriePath, PartialStateSnapWriter,
 };
-use reth_storage_errors::provider::ProviderError;
+use reth_storage_errors::provider::{ProviderError, SnapStateRootUnavailableError};
 use reth_trie::root::{StateRootBuilder, StorageRootBuilder};
 use reth_trie_common::TrieAccount;
 
@@ -99,6 +99,10 @@ impl<N> PartialStateSnapProvider for ProviderFactory<N>
 where
     N: ProviderNodeTypes,
 {
+    fn snap_state_pivot(&self) -> Result<PartialStateSnapPivot, ProviderError> {
+        self.database_provider_ro()?.snap_state_pivot()
+    }
+
     fn snap_account_range(
         &self,
         root_hash: B256,
@@ -163,13 +167,30 @@ where
     TX: DbTx + Send + Sync + 'static,
     N: NodeTypesForProvider,
 {
+    fn snap_state_pivot(&self) -> Result<PartialStateSnapPivot, ProviderError> {
+        // Full block persistence advances Finish in the same transaction as hashed state, so this
+        // header commits to the exact database state visible through this provider transaction.
+        let block_number = self.best_block_number()?;
+        let header = self
+            .sealed_header(block_number)?
+            .ok_or_else(|| ProviderError::HeaderNotFound(block_number.into()))?;
+
+        Ok(PartialStateSnapPivot {
+            block_number,
+            block_hash: header.hash(),
+            state_root: header.state_root(),
+        })
+    }
+
     fn snap_account_range(
         &self,
-        _root_hash: B256,
+        root_hash: B256,
         starting_hash: B256,
         limit_hash: B256,
         response_bytes: u64,
     ) -> Result<PartialStateSnapAccountRange, ProviderError> {
+        self.ensure_snap_state_root(root_hash)?;
+
         let mut cursor = self.tx_ref().cursor_read::<tables::HashedAccounts>()?;
         let mut next = cursor.seek(starting_hash)?;
         let mut accounts = Vec::new();
@@ -201,12 +222,14 @@ where
 
     fn snap_storage_ranges(
         &self,
-        _root_hash: B256,
+        root_hash: B256,
         account_hashes: &[B256],
         starting_hash: B256,
         limit_hash: B256,
         response_bytes: u64,
     ) -> Result<PartialStateSnapStorageRanges, ProviderError> {
+        self.ensure_snap_state_root(root_hash)?;
+
         let mut cursor = self.tx_ref().cursor_dup_read::<tables::HashedStorages>()?;
         let mut slots = Vec::with_capacity(account_hashes.len());
         let mut total_bytes = 0u64;
@@ -272,10 +295,11 @@ where
 
     fn snap_trie_nodes(
         &self,
-        _root_hash: B256,
+        root_hash: B256,
         _paths: &[PartialStateSnapTriePath],
         _response_bytes: u64,
     ) -> Result<PartialStateSnapTrieNodes, ProviderError> {
+        self.ensure_snap_state_root(root_hash)?;
         Ok(PartialStateSnapTrieNodes::default())
     }
 }
@@ -329,6 +353,16 @@ where
     TX: DbTx + Send + Sync + 'static,
     N: NodeTypesForProvider,
 {
+    fn ensure_snap_state_root(&self, requested: B256) -> Result<(), ProviderError> {
+        let available = self.snap_state_pivot()?.state_root;
+        if requested != available {
+            return Err(ProviderError::SnapStateRootUnavailable(Box::new(
+                SnapStateRootUnavailableError { requested, available },
+            )))
+        }
+        Ok(())
+    }
+
     fn account_storage_root(&self, account_hash: B256) -> Result<B256, ProviderError> {
         if let Some(storage_root) =
             self.tx_ref().get::<tables::PartialStateStorageRoots>(account_hash)?
@@ -362,12 +396,41 @@ const fn exceeds_soft_limit(current: u64, next: u64, limit: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::create_test_provider_factory;
-    use alloy_consensus::constants::KECCAK_EMPTY;
+    use crate::{
+        test_utils::create_test_provider_factory, StaticFileProviderFactory, StaticFileWriter,
+    };
+    use alloy_consensus::{constants::KECCAK_EMPTY, Header};
     use alloy_primitives::{address, keccak256};
     use reth_db_api::{cursor::DbDupCursorRO, transaction::DbTx};
-    use reth_storage_api::ConfiguredContractFilter;
+    use reth_stages_types::{StageCheckpoint, StageId};
+    use reth_static_file_types::StaticFileSegment;
+    use reth_storage_api::{ConfiguredContractFilter, DBProvider, StageCheckpointWriter};
     use reth_trie::root::{state_root_unsorted, storage_root};
+
+    fn install_persisted_snap_pivot(
+        factory: &ProviderFactory<crate::test_utils::MockNodeTypesWithDB>,
+        state_root: B256,
+    ) -> PartialStateSnapPivot {
+        let block_number = 0;
+        let block_hash = B256::repeat_byte(0x42);
+        let header = Header { number: block_number, state_root, ..Default::default() };
+
+        {
+            let static_file_provider = factory.static_file_provider();
+            let mut writer =
+                static_file_provider.latest_writer(StaticFileSegment::Headers).unwrap();
+            writer.append_header(&header, &block_hash).unwrap();
+            writer.commit().unwrap();
+        }
+
+        let provider = factory.database_provider_rw().unwrap();
+        provider
+            .save_stage_checkpoint(StageId::Finish, StageCheckpoint::new(block_number))
+            .unwrap();
+        provider.commit().unwrap();
+
+        PartialStateSnapPivot { block_number, block_hash, state_root }
+    }
 
     #[test]
     fn partial_snap_writer_persists_hash_keyed_state() {
@@ -459,6 +522,8 @@ mod tests {
     #[test]
     fn partial_snap_provider_preserves_storage_root_without_local_slots() {
         let factory = create_test_provider_factory();
+        let state_root = B256::repeat_byte(0x88);
+        install_persisted_snap_pivot(&factory, state_root);
         let provider = factory.database_provider_rw().unwrap();
         let account_hash = B256::repeat_byte(0x66);
         let storage_root = B256::repeat_byte(0x77);
@@ -473,12 +538,59 @@ mod tests {
 
         assert_eq!(provider.storage_root_by_hash(account_hash).unwrap(), EMPTY_ROOT_HASH);
 
-        let range = provider
-            .snap_account_range(B256::repeat_byte(0x88), account_hash, account_hash, u64::MAX)
-            .unwrap();
+        let range =
+            provider.snap_account_range(state_root, account_hash, account_hash, u64::MAX).unwrap();
         assert_eq!(range.accounts.len(), 1);
         assert_eq!(range.accounts[0].hash, account_hash);
         assert_eq!(range.accounts[0].account, account);
+    }
+
+    #[test]
+    fn partial_snap_provider_reports_persisted_pivot() {
+        let factory = create_test_provider_factory();
+        let expected = install_persisted_snap_pivot(&factory, B256::repeat_byte(0x11));
+
+        assert_eq!(factory.snap_state_pivot().unwrap(), expected);
+    }
+
+    #[test]
+    fn partial_snap_provider_rejects_unavailable_state_root() {
+        let factory = create_test_provider_factory();
+        let available = B256::repeat_byte(0x11);
+        let requested = B256::repeat_byte(0x22);
+        install_persisted_snap_pivot(&factory, available);
+        let provider = factory.database_provider_ro().unwrap();
+
+        let account_error = provider
+            .snap_account_range(requested, B256::ZERO, B256::repeat_byte(0xff), u64::MAX)
+            .unwrap_err();
+        assert!(matches!(
+            account_error,
+            ProviderError::SnapStateRootUnavailable(error)
+                if error.requested == requested && error.available == available
+        ));
+
+        let storage_error = provider
+            .snap_storage_ranges(
+                requested,
+                &[B256::ZERO],
+                B256::ZERO,
+                B256::repeat_byte(0xff),
+                u64::MAX,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            storage_error,
+            ProviderError::SnapStateRootUnavailable(error)
+                if error.requested == requested && error.available == available
+        ));
+
+        let trie_error = provider.snap_trie_nodes(requested, &[], u64::MAX).unwrap_err();
+        assert!(matches!(
+            trie_error,
+            ProviderError::SnapStateRootUnavailable(error)
+                if error.requested == requested && error.available == available
+        ));
     }
 
     #[test]
