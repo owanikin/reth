@@ -1,4 +1,7 @@
-use alloc::{collections::BTreeSet, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    vec::Vec,
+};
 use alloy_eips::{
     eip7928::{bal::DecodedBal, compute_block_access_list_hash, BlockAccessList},
     NumHash,
@@ -189,6 +192,40 @@ pub trait PartialStateRootProvider: Send + Sync {
     /// Storage roots for tracked accounts are computed from locally retained slots. Untracked
     /// accounts use their preserved storage-root commitments when available.
     fn partial_state_root(&self, filter: &dyn ContractFilter) -> ProviderResult<B256>;
+}
+
+/// Post-state account commitments resolved against a transition's expected state root.
+///
+/// Partial-state nodes cannot derive a new storage root for an untracked contract from BAL slot
+/// values alone because they intentionally do not retain that contract's storage trie. Callers
+/// resolve those account leaves before opening the state transition. A `None` value represents a
+/// proof that the account is absent from the post-state.
+pub type PartialStateResolvedAccounts = BTreeMap<Address, Option<TrieAccount>>;
+
+/// Inputs required to apply one BAL to persisted partial state.
+#[derive(Debug, Clone, Copy)]
+pub struct PartialStateTransition<'a> {
+    /// State root that the local partial state must have before applying the BAL.
+    pub parent_root: B256,
+    /// State root committed to by the child block.
+    pub expected_root: B256,
+    /// BAL hash committed to by the child block.
+    pub expected_bal_hash: B256,
+    /// Decoded block access list containing post-state values.
+    pub access_list: &'a BlockAccessList,
+    /// Verified post-state account leaves needed for untracked storage changes.
+    pub resolved_accounts: &'a PartialStateResolvedAccounts,
+}
+
+/// Applies BAL state changes while retaining only configured storage and bytecode.
+#[auto_impl(&, Arc, Box)]
+pub trait PartialStateTransitionProvider: Send + Sync {
+    /// Applies a transition atomically and returns the verified child state root.
+    fn apply_partial_state_transition(
+        &self,
+        transition: PartialStateTransition<'_>,
+        filter: &dyn ContractFilter,
+    ) -> ProviderResult<B256>;
 }
 
 /// A contract filter backed by a static set of tracked contract addresses.

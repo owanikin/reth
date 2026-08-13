@@ -135,6 +135,9 @@ pub enum ProviderError {
     /// Snap state for the requested root is not the state currently persisted by this provider.
     #[error(transparent)]
     SnapStateRootUnavailable(Box<SnapStateRootUnavailableError>),
+    /// Applying a BAL to persisted partial state failed validation.
+    #[error(transparent)]
+    PartialStateTransition(Box<PartialStateTransitionError>),
     /// Static File is not found at specified path.
     #[cfg(feature = "std")]
     #[error("not able to find {_0} static file at {_1:?}")]
@@ -281,6 +284,59 @@ pub struct SnapStateRootUnavailableError {
     pub requested: B256,
     /// State root currently persisted by the provider.
     pub available: B256,
+}
+
+/// Error returned while applying a BAL to persisted partial state.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PartialStateTransitionError {
+    /// The current partial state does not match the transition's parent root.
+    #[error("partial-state parent root mismatch: expected {expected}, computed {computed}")]
+    ParentRootMismatch {
+        /// Root expected by the transition.
+        expected: B256,
+        /// Root computed from persisted partial state.
+        computed: B256,
+    },
+    /// The BAL does not match the child block's BAL commitment.
+    #[error("partial-state BAL hash mismatch: expected {expected}, computed {computed}")]
+    BalHashMismatch {
+        /// BAL hash committed to by the child block.
+        expected: B256,
+        /// Hash computed from the supplied BAL.
+        computed: B256,
+    },
+    /// An untracked storage change is missing its resolved post-state account commitment.
+    #[error("post-state account commitment for {address} at root {state_root} was not resolved")]
+    AccountCommitmentUnavailable {
+        /// Account whose storage commitment is required.
+        address: Address,
+        /// Post-state root against which the account must be resolved.
+        state_root: B256,
+    },
+    /// A resolved account disagrees with the post-state values declared by the BAL.
+    #[error(
+        "resolved post-state account for {address} disagrees with the BAL at root {state_root}"
+    )]
+    ResolvedAccountMismatch {
+        /// Account whose resolved leaf disagrees with the BAL.
+        address: Address,
+        /// Post-state root against which the account was resolved.
+        state_root: B256,
+    },
+    /// Applying the BAL produced a root other than the child block's state root.
+    #[error("partial-state child root mismatch: expected {expected}, computed {computed}")]
+    ChildRootMismatch {
+        /// State root committed to by the child block.
+        expected: B256,
+        /// Root computed after applying the BAL.
+        computed: B256,
+    },
+}
+
+impl From<PartialStateTransitionError> for ProviderError {
+    fn from(error: PartialStateTransitionError) -> Self {
+        Self::PartialStateTransition(Box::new(error))
+    }
 }
 
 /// A Static File Writer Error.

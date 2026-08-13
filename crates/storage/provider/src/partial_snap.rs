@@ -372,7 +372,7 @@ where
         self.storage_root_by_hash(account_hash)
     }
 
-    fn storage_root_by_hash(&self, account_hash: B256) -> Result<B256, ProviderError> {
+    pub(crate) fn storage_root_by_hash(&self, account_hash: B256) -> Result<B256, ProviderError> {
         let mut cursor = self.tx_ref().cursor_dup_read::<tables::HashedStorages>()?;
         let mut next = cursor.seek_by_key_subkey(account_hash, B256::ZERO)?;
         let mut root_builder = StorageRootBuilder::default();
