@@ -3,12 +3,14 @@
 use crate::{
     common::{Attached, LaunchContextWith, WithConfigs},
     hooks::NodeHooks,
+    launch::partial_state::{advance_partial_state_to_target, retain_payload_bal},
     rpc::{EngineShutdown, EngineValidatorAddOn, EngineValidatorBuilder, RethRpcAddOns, RpcHandle},
     setup::build_networked_pipeline,
     AddOns, AddOnsContext, FullNode, LaunchContext, LaunchNode, NodeAdapter,
     NodeBuilderWithComponents, NodeComponents, NodeComponentsBuilder, NodeHandle, NodeTypesAdapter,
 };
 use alloy_consensus::BlockHeader;
+use alloy_eips::BlockNumHash;
 use futures::{stream::FusedStream, stream_select, FutureExt, StreamExt};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_downloaders::snap::{
@@ -16,6 +18,7 @@ use reth_downloaders::snap::{
     PartialStateSnapDownloader, PartialStateSnapDownloaderConfig, PartialStateSnapEvent,
     PartialStateSnapTarget,
 };
+use reth_engine_primitives::{BeaconEngineMessage, ExecutionPayload as _};
 use reth_engine_tree::{
     chain::{ChainEvent, FromOrchestrator},
     engine::{EngineApiKind, EngineApiRequest, EngineRequestHandler},
@@ -40,7 +43,9 @@ use reth_provider::{
     providers::{BlockchainProvider, NodeTypesForProvider, ProviderNodeTypes},
     BlockNumReader, ProviderFactory, StorageSettingsCache,
 };
-use reth_storage_api::{ConfiguredContractFilter, PartialStateSnapPivot, PartialStateSnapProvider};
+use reth_storage_api::{
+    BalProvider, ConfiguredContractFilter, PartialStateSnapPivot, PartialStateSnapProvider,
+};
 use reth_tasks::TaskExecutor;
 use reth_tokio_util::EventSender;
 use reth_tracing::tracing::{debug, error, info, warn};
@@ -207,6 +212,14 @@ impl EngineNodeLauncher {
             .build_tree_validator(&add_ons_ctx, engine_tree_config.clone(), changeset_cache.clone())
             .await?;
 
+        // Retain payload BALs before the engine consumes the execution data. Canonical partial
+        // state applies them after forkchoice selects the corresponding block.
+        let payload_bal_store = ctx
+            .configs()
+            .partial_state
+            .is_enabled()
+            .then(|| ctx.provider_factory().bal_store().clone());
+
         // Create the consensus engine stream with optional reorg
         let consensus_engine_stream = UnboundedReceiverStream::from(consensus_engine_rx)
             .maybe_skip_fcu(node_config.debug.skip_fcu)
@@ -227,6 +240,19 @@ impl EngineNodeLauncher {
                 node_config.debug.reorg_depth,
             )
             .await?
+            .inspect(move |message| {
+                let payload = match message {
+                    BeaconEngineMessage::NewPayload { payload, .. } |
+                    BeaconEngineMessage::RethNewPayload { payload, .. } => Some(payload),
+                    BeaconEngineMessage::ForkchoiceUpdated { .. } => None,
+                };
+                if let Some(store) = &payload_bal_store &&
+                    let Some(payload) = payload &&
+                    let Some(raw_bal) = payload.block_access_list()
+                {
+                    retain_payload_bal(store, payload.num_hash(), raw_bal);
+                }
+            })
             // Store messages _after_ skipping so that `replay-engine` command
             // would replay only the messages that were observed by the engine
             // during this run.
@@ -310,12 +336,16 @@ impl EngineNodeLauncher {
             .is_enabled()
             .then(|| ctx.configs().partial_state.contract_filter());
         let partial_state_provider_factory = ctx.provider_factory().clone();
+        let partial_state_canonical_provider = ctx.blockchain_db().clone();
+        let partial_state_bal_store =
+            partial_state_filter.as_ref().map(|_| ctx.provider_factory().bal_store().clone());
         let partial_state_network_client = network_client.clone();
         let partial_state_task_executor = ctx.task_executor().clone();
 
         info!(target: "reth::cli", "Starting consensus engine");
         let consensus_engine = move |mut on_graceful_shutdown| async move {
-            let mut partial_state_snap_started = false;
+            let mut partial_state_head_tx = None;
+            let mut partial_state_sync_started = false;
             if let Some(initial_target) = initial_target {
                 debug!(target: "reth::cli", %initial_target,  "start backfill sync");
                 // network_handle's sync state is already initialized at Syncing
@@ -356,17 +386,18 @@ impl EngineNodeLauncher {
                             ChainEvent::Handler(ev) => {
                                 if let Some(head) = ev.canonical_header() {
                                     if let Some(filter) = partial_state_filter.clone() {
-                                        if !partial_state_snap_started && head.number() > 0 {
+                                        if !partial_state_sync_started && head.number() > 0 {
                                             match partial_state_provider_factory.snap_state_pivot() {
                                                 Ok(pivot) => {
-                                                    partial_state_snap_started = true;
-                                                    spawn_partial_state_snap_sync(
+                                                    partial_state_sync_started = true;
+                                                    partial_state_head_tx = Some(spawn_partial_state_snap_sync(
                                                         &partial_state_task_executor,
                                                         partial_state_network_client.clone(),
                                                         partial_state_provider_factory.clone(),
+                                                        partial_state_canonical_provider.clone(),
                                                         filter,
                                                         pivot,
-                                                    );
+                                                    ));
                                                 }
                                                 Err(err) => {
                                                     warn!(
@@ -375,6 +406,26 @@ impl EngineNodeLauncher {
                                                         "Failed to select persisted partial-state snap pivot"
                                                     );
                                                 }
+                                            }
+                                        }
+                                        if let Some(tx) = &partial_state_head_tx {
+                                            if head.block_access_list_hash().is_some() {
+                                                if tx.send(head.num_hash()).is_err() {
+                                                    error!(
+                                                        target: "reth::cli",
+                                                        block_number = head.number(),
+                                                        block_hash = %head.hash(),
+                                                        "Partial-state canonical advancer stopped"
+                                                    );
+                                                    partial_state_head_tx = None;
+                                                }
+                                            } else if head.number() > 0 {
+                                                error!(
+                                                    target: "reth::cli",
+                                                    block_number = head.number(),
+                                                    block_hash = %head.hash(),
+                                                    "Canonical block has no BAL commitment"
+                                                );
                                             }
                                         }
                                     }
@@ -403,6 +454,15 @@ impl EngineNodeLauncher {
                         }
                     }
                     payload = built_payloads.select_next_some(), if !built_payloads.is_terminated() => {
+                        if let Some(store) = &partial_state_bal_store &&
+                            let Some(raw_bal) = payload.block_access_list()
+                        {
+                            retain_payload_bal(
+                                store,
+                                payload.block().num_hash(),
+                                raw_bal,
+                            );
+                        }
                         if let Some(executed_block) = payload.executed_block() {
                             debug!(target: "reth::cli", block=?executed_block.recovered_block.num_hash(),  "inserting built payload");
                             orchestrator.handler_mut().handler_mut().on_event(EngineApiRequest::InsertExecutedBlock(executed_block).into());
@@ -474,9 +534,11 @@ fn spawn_partial_state_snap_sync<N, Client>(
     task_executor: &TaskExecutor,
     client: Client,
     provider_factory: ProviderFactory<N>,
+    canonical_provider: BlockchainProvider<N>,
     filter: ConfiguredContractFilter,
     pivot: PartialStateSnapPivot,
-) where
+) -> tokio::sync::mpsc::UnboundedSender<BlockNumHash>
+where
     N: ProviderNodeTypes + 'static,
     Client: SnapClient + Clone + Unpin + 'static,
 {
@@ -487,8 +549,16 @@ fn spawn_partial_state_snap_sync<N, Client>(
         state_root = %pivot.state_root,
         "Starting partial-state snap sync"
     );
+    let (head_tx, mut head_rx) = unbounded_channel();
     task_executor.spawn_critical_task("partial-state snap sync", async move {
-        match run_partial_state_snap_sync(client, provider_factory, filter, pivot).await {
+        match run_partial_state_snap_sync(
+            client.clone(),
+            provider_factory.clone(),
+            filter.clone(),
+            pivot,
+        )
+        .await
+        {
             Ok(progress) => {
                 info!(
                     target: "reth::cli",
@@ -512,9 +582,49 @@ fn spawn_partial_state_snap_sync<N, Client>(
                     %err,
                     "Partial-state snap sync failed"
                 );
+                return
+            }
+        }
+
+        let mut partial_head = pivot;
+        while let Some(target) = head_rx.recv().await {
+            match advance_partial_state_to_target(
+                &client,
+                &provider_factory,
+                &canonical_provider,
+                &filter,
+                &mut partial_head,
+                target,
+            )
+            .await
+            {
+                Ok(advanced) if advanced > 0 => {
+                    debug!(
+                        target: "reth::cli",
+                        blocks = advanced,
+                        block_number = partial_head.block_number,
+                        block_hash = %partial_head.block_hash,
+                        state_root = %partial_head.state_root,
+                        "Partial-state canonical head advanced"
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    error!(
+                        target: "reth::cli",
+                        current_block = partial_head.block_number,
+                        current_hash = %partial_head.block_hash,
+                        target_block = target.number,
+                        target_hash = %target.hash,
+                        %err,
+                        "Failed to advance canonical partial state"
+                    );
+                    return
+                }
             }
         }
     });
+    head_tx
 }
 
 /// Runs a partial-state snap download and persists each successful snap event.

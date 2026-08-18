@@ -94,7 +94,7 @@ where
     let address = changes.address;
     let account_hash = keccak256(address);
     let mut account =
-        provider.tx_ref().get::<tables::HashedAccounts>(account_hash)?.unwrap_or_default();
+        provider.tx_ref().get::<tables::PartialStateAccounts>(account_hash)?.unwrap_or_default();
 
     if let Some(change) =
         changes.balance_changes.iter().max_by_key(|change| change.block_access_index)
@@ -120,7 +120,7 @@ where
     let storage_root = if has_storage_changes {
         if filter.should_sync_storage(&address) {
             apply_tracked_storage_changes(provider, account_hash, changes)?;
-            provider.storage_root_by_hash(account_hash)?
+            provider.partial_storage_root_by_hash(account_hash)?
         } else {
             let resolved = transition.resolved_accounts.get(&address).ok_or_else(|| {
                 ProviderError::from(PartialStateTransitionError::AccountCommitmentUnavailable {
@@ -151,7 +151,7 @@ where
             resolved.storage_root
         }
     } else if filter.should_sync_storage(&address) {
-        provider.storage_root_by_hash(account_hash)?
+        provider.partial_storage_root_by_hash(account_hash)?
     } else {
         provider
             .tx_ref()
@@ -162,7 +162,7 @@ where
     if account.is_empty() && storage_root == EMPTY_ROOT_HASH {
         delete_account(provider, account_hash)?;
     } else {
-        provider.tx_ref().put::<tables::HashedAccounts>(account_hash, account)?;
+        provider.tx_ref().put::<tables::PartialStateAccounts>(account_hash, account)?;
         write_storage_commitment(provider, account_hash, storage_root)?;
     }
     Ok(())
@@ -177,7 +177,7 @@ where
     TX: DbTx + DbTxMut + 'static,
     N: ProviderNodeTypes,
 {
-    let mut cursor = provider.tx_ref().cursor_dup_write::<tables::HashedStorages>()?;
+    let mut cursor = provider.tx_ref().cursor_dup_write::<tables::PartialStateStorages>()?;
     for slot_changes in &changes.storage_changes {
         let Some(change) =
             slot_changes.changes.iter().max_by_key(|change| change.block_access_index)
@@ -206,9 +206,9 @@ where
     TX: DbTx + DbTxMut + 'static,
     N: ProviderNodeTypes,
 {
-    provider.tx_ref().delete::<tables::HashedAccounts>(account_hash, None)?;
+    provider.tx_ref().delete::<tables::PartialStateAccounts>(account_hash, None)?;
     provider.tx_ref().delete::<tables::PartialStateStorageRoots>(account_hash, None)?;
-    let mut storage = provider.tx_ref().cursor_dup_write::<tables::HashedStorages>()?;
+    let mut storage = provider.tx_ref().cursor_dup_write::<tables::PartialStateStorages>()?;
     if storage.seek_exact(account_hash)?.is_some() {
         storage.delete_current_duplicates()?;
     }
@@ -337,7 +337,7 @@ mod tests {
                     vec![StorageChange::new(1, tracked_child_value)],
                 ))
                 .with_balance_change(BalanceChange::new(1, tracked_child.balance))
-                .with_code_change(CodeChange::new(1, tracked_code.clone())),
+                .with_code_change(CodeChange::new(1, tracked_code)),
             AccountChanges::new(untracked)
                 .with_storage_change(SlotChanges::new(
                     untracked_slot,
@@ -345,7 +345,7 @@ mod tests {
                 ))
                 .with_balance_change(BalanceChange::new(1, untracked_child.balance))
                 .with_nonce_change(NonceChange::new(1, untracked_child.nonce))
-                .with_code_change(CodeChange::new(1, untracked_code.clone())),
+                .with_code_change(CodeChange::new(1, untracked_code)),
             AccountChanges::new(untouched).with_storage_read(U256::from(3)),
         ];
         let resolved_accounts =
@@ -369,11 +369,11 @@ mod tests {
 
         let provider = factory.database_provider_ro().unwrap();
         assert_eq!(
-            provider.tx_ref().get::<tables::HashedAccounts>(tracked_hash).unwrap(),
+            provider.tx_ref().get::<tables::PartialStateAccounts>(tracked_hash).unwrap(),
             Some(Account::from(tracked_child))
         );
         assert_eq!(
-            provider.tx_ref().get::<tables::HashedAccounts>(untracked_hash).unwrap(),
+            provider.tx_ref().get::<tables::PartialStateAccounts>(untracked_hash).unwrap(),
             Some(Account::from(untracked_child))
         );
         assert_eq!(
@@ -385,7 +385,8 @@ mod tests {
             Some(untracked_child_storage_root)
         );
 
-        let mut storage = provider.tx_ref().cursor_dup_read::<tables::HashedStorages>().unwrap();
+        let mut storage =
+            provider.tx_ref().cursor_dup_read::<tables::PartialStateStorages>().unwrap();
         assert_eq!(
             storage.seek_by_key_subkey(tracked_hash, tracked_slot_hash).unwrap(),
             Some(StorageEntry::new(tracked_slot_hash, tracked_child_value))
@@ -393,6 +394,103 @@ mod tests {
         assert_eq!(storage.seek_by_key_subkey(untracked_hash, B256::ZERO).unwrap(), None);
         assert!(provider.tx_ref().get::<tables::Bytecodes>(tracked_code_hash).unwrap().is_some());
         assert_eq!(provider.tx_ref().get::<tables::Bytecodes>(untracked_code_hash).unwrap(), None);
+    }
+
+    #[test]
+    fn preserves_partial_commitments_across_canonical_state_advancement() {
+        let factory = create_test_provider_factory();
+        let address = address!("0000000000000000000000000000000000000001");
+        let account_hash = keccak256(address);
+        let slot = U256::from(1);
+        let slot_hash = keccak256(slot.to_be_bytes::<32>());
+        let parent_value = U256::from(10);
+        let first_value = U256::from(11);
+        let second_value = U256::from(12);
+        let parent_account = TrieAccount {
+            balance: U256::from(100),
+            storage_root: storage_root([(slot_hash, parent_value)]),
+            code_hash: KECCAK_EMPTY,
+            ..Default::default()
+        };
+        let first_account = TrieAccount {
+            balance: U256::from(101),
+            storage_root: storage_root([(slot_hash, first_value)]),
+            code_hash: KECCAK_EMPTY,
+            ..Default::default()
+        };
+        let second_account = TrieAccount {
+            balance: U256::from(102),
+            storage_root: storage_root([(slot_hash, second_value)]),
+            code_hash: KECCAK_EMPTY,
+            ..Default::default()
+        };
+        let parent_root = state_root_unsorted([(account_hash, parent_account)]);
+        let first_root = state_root_unsorted([(account_hash, first_account)]);
+        let second_root = state_root_unsorted([(account_hash, second_account)]);
+
+        let provider = factory.database_provider_rw().unwrap();
+        {
+            let mut writer = provider.partial_state_snap_writer();
+            writer.write_account(account_hash, parent_account).unwrap();
+            writer.write_storage(account_hash, slot_hash, parent_value).unwrap();
+        }
+        provider.commit().unwrap();
+
+        let filter = ConfiguredContractFilter::new([address]);
+        let resolved_accounts = PartialStateResolvedAccounts::default();
+        let first_access_list = vec![AccountChanges::new(address)
+            .with_storage_change(SlotChanges::new(slot, vec![StorageChange::new(1, first_value)]))
+            .with_balance_change(BalanceChange::new(1, first_account.balance))];
+        factory
+            .apply_partial_state_transition(
+                PartialStateTransition {
+                    parent_root,
+                    expected_root: first_root,
+                    expected_bal_hash: compute_block_access_list_hash(&first_access_list),
+                    access_list: &first_access_list,
+                    resolved_accounts: &resolved_accounts,
+                },
+                &filter,
+            )
+            .unwrap();
+
+        // Canonical execution advances the regular hashed-state tables independently.
+        let provider = factory.database_provider_rw().unwrap();
+        provider
+            .tx_ref()
+            .put::<tables::HashedAccounts>(
+                account_hash,
+                Account { balance: U256::from(999), ..Default::default() },
+            )
+            .unwrap();
+        provider
+            .tx_ref()
+            .put::<tables::HashedStorages>(
+                account_hash,
+                StorageEntry::new(slot_hash, U256::from(999)),
+            )
+            .unwrap();
+        provider.commit().unwrap();
+
+        assert_eq!(factory.partial_state_root(&filter).unwrap(), first_root);
+
+        let second_access_list = vec![AccountChanges::new(address)
+            .with_storage_change(SlotChanges::new(slot, vec![StorageChange::new(1, second_value)]))
+            .with_balance_change(BalanceChange::new(1, second_account.balance))];
+        factory
+            .apply_partial_state_transition(
+                PartialStateTransition {
+                    parent_root: first_root,
+                    expected_root: second_root,
+                    expected_bal_hash: compute_block_access_list_hash(&second_access_list),
+                    access_list: &second_access_list,
+                    resolved_accounts: &resolved_accounts,
+                },
+                &filter,
+            )
+            .unwrap();
+
+        assert_eq!(factory.partial_state_root(&filter).unwrap(), second_root);
     }
 
     #[test]
@@ -439,7 +537,7 @@ mod tests {
                 .database_provider_ro()
                 .unwrap()
                 .tx_ref()
-                .get::<tables::HashedAccounts>(account_hash)
+                .get::<tables::PartialStateAccounts>(account_hash)
                 .unwrap(),
             Some(Account::from(parent_account))
         );
@@ -538,12 +636,16 @@ mod tests {
         assert_eq!(root, EMPTY_ROOT_HASH);
 
         let provider = factory.database_provider_ro().unwrap();
-        assert_eq!(provider.tx_ref().get::<tables::HashedAccounts>(account_hash).unwrap(), None);
+        assert_eq!(
+            provider.tx_ref().get::<tables::PartialStateAccounts>(account_hash).unwrap(),
+            None
+        );
         assert_eq!(
             provider.tx_ref().get::<tables::PartialStateStorageRoots>(account_hash).unwrap(),
             None
         );
-        let mut storage = provider.tx_ref().cursor_dup_read::<tables::HashedStorages>().unwrap();
+        let mut storage =
+            provider.tx_ref().cursor_dup_read::<tables::PartialStateStorages>().unwrap();
         assert_eq!(storage.seek_by_key_subkey(account_hash, B256::ZERO).unwrap(), None);
     }
 }

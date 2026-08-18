@@ -1,7 +1,7 @@
 //! Partial-state snap downloader scaffolding.
 
 use alloy_consensus::constants::{EMPTY_ROOT_HASH, KECCAK_EMPTY};
-use alloy_primitives::{B256, U256};
+use alloy_primitives::{keccak256, Address, B256, U256};
 use alloy_rlp::Decodable;
 use futures::{Future, Stream};
 use futures_util::{FutureExt, StreamExt};
@@ -17,7 +17,7 @@ use reth_network_p2p::{
 use reth_network_peers::PeerId;
 use reth_storage_api::{
     errors::provider::ProviderError, AllowAllContractFilter, ContractFilter,
-    PartialStateRootProvider, PartialStateSnapWriter,
+    PartialStateResolvedAccounts, PartialStateRootProvider, PartialStateSnapWriter,
 };
 use reth_trie_common::TrieAccount;
 use std::{
@@ -138,6 +138,106 @@ pub enum PartialStateSnapRootError {
         /// State root computed from persisted partial state.
         computed_root: B256,
     },
+}
+
+/// Error returned while resolving post-state account commitments for a BAL transition.
+#[derive(Debug, Error)]
+pub enum PartialStateAccountResolverError {
+    /// Snap request failed.
+    #[error(transparent)]
+    Request(#[from] RequestError),
+    /// Peer returned a snap response that does not match an account-range request.
+    #[error("unexpected snap response while resolving account {account_hash}")]
+    UnexpectedResponse {
+        /// Account hash being resolved.
+        account_hash: B256,
+    },
+    /// Peer returned an invalid exact account range.
+    #[error(
+        "invalid snap account range for {account_hash}: expected at most one exact account, got {returned}"
+    )]
+    InvalidAccountRange {
+        /// Account hash being resolved.
+        account_hash: B256,
+        /// Number of account leaves returned by the peer.
+        returned: usize,
+    },
+    /// An empty exact range did not include a proof of account absence.
+    #[error("snap peer returned an unproven empty account range for {account_hash}")]
+    UnprovenAccountAbsence {
+        /// Account hash whose absence was not proven.
+        account_hash: B256,
+    },
+    /// Account leaf body failed to decode.
+    #[error("failed to decode resolved snap account {account_hash}")]
+    AccountDecode {
+        /// Account hash whose body failed to decode.
+        account_hash: B256,
+        /// RLP decoding error.
+        source: alloy_rlp::Error,
+    },
+}
+
+/// Resolves post-state account leaves required to apply a BAL to partial state.
+///
+/// Only untracked accounts with storage changes need resolution: their new storage-root
+/// commitment cannot be derived without the intentionally omitted storage trie. The transition's
+/// final state-root check authenticates these returned leaves against `state_root`.
+pub async fn resolve_partial_state_accounts<C>(
+    client: &C,
+    state_root: B256,
+    access_list: &[alloy_eips::eip7928::AccountChanges],
+    filter: &dyn ContractFilter,
+) -> Result<PartialStateResolvedAccounts, PartialStateAccountResolverError>
+where
+    C: SnapClient + ?Sized,
+{
+    let addresses = access_list
+        .iter()
+        .filter(|changes| {
+            !changes.storage_changes.is_empty() && !filter.should_sync_storage(&changes.address)
+        })
+        .map(|changes| changes.address)
+        .collect::<std::collections::BTreeSet<Address>>();
+    let mut resolved = PartialStateResolvedAccounts::new();
+
+    for address in addresses {
+        let account_hash = keccak256(address);
+        let request = GetAccountRangeMessage {
+            request_id: 0,
+            root_hash: state_root,
+            starting_hash: account_hash,
+            limit_hash: account_hash,
+            response_bytes: DEFAULT_PARTIAL_STATE_SNAP_RESPONSE_BYTES,
+        };
+        let response = client.get_account_range_with_priority(request, Priority::High).await?;
+        let (_, response) = response.split();
+        let SnapResponse::AccountRange(response) = response else {
+            return Err(PartialStateAccountResolverError::UnexpectedResponse { account_hash })
+        };
+
+        let account = match response.accounts.as_slice() {
+            [] if response.proof.is_empty() => {
+                return Err(PartialStateAccountResolverError::UnprovenAccountAbsence {
+                    account_hash,
+                })
+            }
+            [] => None,
+            [account] if account.hash == account_hash => {
+                Some(TrieAccount::decode(&mut account.body.as_ref()).map_err(|source| {
+                    PartialStateAccountResolverError::AccountDecode { account_hash, source }
+                })?)
+            }
+            accounts => {
+                return Err(PartialStateAccountResolverError::InvalidAccountRange {
+                    account_hash,
+                    returned: accounts.len(),
+                })
+            }
+        };
+        resolved.insert(address, account);
+    }
+    Ok(resolved)
 }
 
 /// Computes the persisted partial-state root and checks it against the snap target.
@@ -279,7 +379,7 @@ where
     }
 
     /// Creates a new partial-state snap downloader with the given configuration.
-    pub fn with_config(client: C, config: PartialStateSnapDownloaderConfig) -> Self {
+    pub const fn with_config(client: C, config: PartialStateSnapDownloaderConfig) -> Self {
         Self {
             client,
             filter: None,
@@ -303,7 +403,11 @@ where
     F: ContractFilter,
 {
     /// Creates a new partial-state snap downloader with a contract filter.
-    pub fn with_filter(client: C, config: PartialStateSnapDownloaderConfig, filter: F) -> Self {
+    pub const fn with_filter(
+        client: C,
+        config: PartialStateSnapDownloaderConfig,
+        filter: F,
+    ) -> Self {
         Self {
             client,
             filter: Some(filter),
@@ -523,22 +627,21 @@ where
 
     /// Queues a storage request from the pending queue if none is currently in flight.
     fn queue_storage_ranges(&mut self) {
-        if self.in_flight_storage_ranges.is_none() {
-            if let Some(request) = self.pending_storage_ranges.pop_front() {
-                let fut =
-                    self.client.get_storage_ranges_with_priority(request.clone(), Priority::High);
-                self.in_flight_storage_ranges = Some(StorageRangesRequestFuture { request, fut });
-            }
+        if self.in_flight_storage_ranges.is_none() &&
+            let Some(request) = self.pending_storage_ranges.pop_front()
+        {
+            let fut = self.client.get_storage_ranges_with_priority(request.clone(), Priority::High);
+            self.in_flight_storage_ranges = Some(StorageRangesRequestFuture { request, fut });
         }
     }
 
     /// Queues a bytecodes request from the pending queue if none is currently in flight.
     fn queue_bytecodes(&mut self) {
-        if self.in_flight_bytecodes.is_none() {
-            if let Some(request) = self.pending_bytecodes.pop_front() {
-                let fut = self.client.get_byte_codes_with_priority(request.clone(), Priority::High);
-                self.in_flight_bytecodes = Some(ByteCodesRequestFuture { request, fut });
-            }
+        if self.in_flight_bytecodes.is_none() &&
+            let Some(request) = self.pending_bytecodes.pop_front()
+        {
+            let fut = self.client.get_byte_codes_with_priority(request.clone(), Priority::High);
+            self.in_flight_bytecodes = Some(ByteCodesRequestFuture { request, fut });
         }
     }
 }
@@ -1042,6 +1145,7 @@ fn next_hash(mut hash: B256) -> Option<B256> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_eips::eip7928::{AccountChanges, SlotChanges, StorageChange};
     use alloy_primitives::{Address, Bytes, U256};
     use futures_util::StreamExt;
     use reth_eth_wire_types::snap::{
@@ -1050,7 +1154,7 @@ mod tests {
     };
     use reth_network_p2p::download::DownloadClient;
     use reth_network_peers::WithPeerId;
-    use reth_storage_api::ContractFilter;
+    use reth_storage_api::{ConfiguredContractFilter, ContractFilter};
     use std::{
         collections::{BTreeSet, VecDeque},
         convert::Infallible,
@@ -1111,6 +1215,125 @@ mod tests {
                 B256::repeat_byte(0x11)
             ),
             Err(PartialStateSnapRootError::Provider(ProviderError::UnsupportedProvider))
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolves_only_untracked_accounts_with_storage_changes() {
+        let root = B256::repeat_byte(0x11);
+        let peer = PeerId::repeat_byte(0x22);
+        let tracked = Address::repeat_byte(0x33);
+        let untracked = Address::repeat_byte(0x44);
+        let account_only = Address::repeat_byte(0x55);
+        let untracked_hash = keccak256(untracked);
+        let account = TrieAccount {
+            nonce: 7,
+            balance: U256::from(8),
+            storage_root: B256::repeat_byte(0x66),
+            code_hash: KECCAK_EMPTY,
+        };
+        let client = MockSnapClient::new([Ok(WithPeerId::new(
+            peer,
+            SnapResponse::AccountRange(AccountRangeMessage {
+                request_id: 0,
+                accounts: vec![AccountData {
+                    hash: untracked_hash,
+                    body: alloy_rlp::encode(account).into(),
+                }],
+                proof: vec![],
+            }),
+        ))]);
+        let access_list = vec![
+            AccountChanges::new(tracked).with_storage_change(SlotChanges::new(
+                U256::from(1),
+                vec![StorageChange::new(1, U256::from(2))],
+            )),
+            AccountChanges::new(untracked).with_storage_change(SlotChanges::new(
+                U256::from(3),
+                vec![StorageChange::new(1, U256::from(4))],
+            )),
+            AccountChanges::new(account_only)
+                .with_balance_change(alloy_eips::eip7928::BalanceChange::new(1, U256::from(5))),
+        ];
+        let filter = ConfiguredContractFilter::new([tracked]);
+
+        let resolved =
+            resolve_partial_state_accounts(&client, root, &access_list, &filter).await.unwrap();
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved.get(&untracked), Some(&Some(account)));
+        assert_eq!(
+            client.account_range_requests(),
+            vec![GetAccountRangeMessage {
+                request_id: 0,
+                root_hash: root,
+                starting_hash: untracked_hash,
+                limit_hash: untracked_hash,
+                response_bytes: DEFAULT_PARTIAL_STATE_SNAP_RESPONSE_BYTES,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_absent_untracked_account() {
+        let root = B256::repeat_byte(0x11);
+        let address = Address::repeat_byte(0x44);
+        let client = MockSnapClient::new([Ok(WithPeerId::new(
+            PeerId::repeat_byte(0x22),
+            SnapResponse::AccountRange(AccountRangeMessage {
+                request_id: 0,
+                accounts: vec![],
+                proof: vec![Bytes::from_static(&[0x01])],
+            }),
+        ))]);
+        let access_list = vec![AccountChanges::new(address).with_storage_change(SlotChanges::new(
+            U256::from(1),
+            vec![StorageChange::new(1, U256::ZERO)],
+        ))];
+
+        let resolved = resolve_partial_state_accounts(
+            &client,
+            root,
+            &access_list,
+            &ConfiguredContractFilter::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resolved.get(&address), Some(&None));
+    }
+
+    #[tokio::test]
+    async fn rejects_unproven_empty_account_response() {
+        let root = B256::repeat_byte(0x11);
+        let address = Address::repeat_byte(0x44);
+        let account_hash = keccak256(address);
+        let client = MockSnapClient::new([Ok(WithPeerId::new(
+            PeerId::repeat_byte(0x22),
+            SnapResponse::AccountRange(AccountRangeMessage {
+                request_id: 0,
+                accounts: vec![],
+                proof: vec![],
+            }),
+        ))]);
+        let access_list = vec![AccountChanges::new(address).with_storage_change(SlotChanges::new(
+            U256::from(1),
+            vec![StorageChange::new(1, U256::ZERO)],
+        ))];
+
+        let err = resolve_partial_state_accounts(
+            &client,
+            root,
+            &access_list,
+            &ConfiguredContractFilter::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            PartialStateAccountResolverError::UnprovenAccountAbsence { account_hash: hash }
+                if hash == account_hash
         ));
     }
 

@@ -470,6 +470,15 @@ tables! {
         type Value = Account;
     }
 
+    /// Stores partial-state accounts indexed by `keccak256Address`.
+    ///
+    /// These accounts are isolated from [`HashedAccounts`] because canonical execution may advance
+    /// that table independently of the partial-state head.
+    table PartialStateAccounts {
+        type Key = B256;
+        type Value = Account;
+    }
+
     /// Stores non-empty storage-root commitments downloaded for partial-state accounts.
     ///
     /// Partial-state nodes intentionally omit storage for untracked accounts, so their storage
@@ -477,6 +486,15 @@ tables! {
     table PartialStateStorageRoots {
         type Key = B256;
         type Value = B256;
+    }
+
+    /// Stores retained partial-state storage indexed by account and slot hashes.
+    ///
+    /// This is isolated from [`HashedStorages`] for the same reason as [`PartialStateAccounts`].
+    table PartialStateStorages {
+        type Key = B256;
+        type Value = StorageEntry;
+        type SubKey = B256;
     }
 
     /// Stores the current storage values indexed with `keccak256Address` and

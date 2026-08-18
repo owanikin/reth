@@ -3,7 +3,7 @@ use alloc::{
     vec::Vec,
 };
 use alloy_eips::{
-    eip7928::{bal::DecodedBal, compute_block_access_list_hash, BlockAccessList},
+    eip7928::{bal::DecodedBal, compute_block_access_list_hash, AccountChanges, BlockAccessList},
     NumHash,
 };
 use alloy_primitives::{keccak256, Address, BlockHash, BlockNumber, Bytes, Sealed, B256, U256};
@@ -212,7 +212,7 @@ pub struct PartialStateTransition<'a> {
     /// BAL hash committed to by the child block.
     pub expected_bal_hash: B256,
     /// Decoded block access list containing post-state values.
-    pub access_list: &'a BlockAccessList,
+    pub access_list: &'a [AccountChanges],
     /// Verified post-state account leaves needed for untracked storage changes.
     pub resolved_accounts: &'a PartialStateResolvedAccounts,
 }
@@ -378,8 +378,6 @@ impl BalHistory {
 }
 
 /// Coordinates partial-state metadata and BAL history.
-///
-/// Applying BAL state changes is intentionally left for later phases.
 #[derive(Debug, Clone)]
 pub struct PartialState<F = ConfiguredContractFilter> {
     filter: F,
@@ -442,13 +440,11 @@ impl<F> PartialState<F> {
         self.state_root = ancestor_root;
     }
 
-    /// Applies a BAL and computes the next state root.
+    /// Returns an unsupported-provider error.
     ///
-    /// Direct BAL-to-trie mutation is intentionally not implemented in `reth-storage-api`: this
-    /// type does not own a provider, database transaction, or trie writer. Reth's engine currently
-    /// validates BAL payloads by executing them through the BAL-aware payload processor, then the
-    /// accepted BAL can be recorded with [`Self::record_canonical_bal`].
-    pub fn apply_bal_and_compute_root(
+    /// State mutation requires a provider-backed [`PartialStateTransitionProvider`]; this metadata
+    /// container does not own a database transaction.
+    pub const fn apply_bal_and_compute_root(
         &mut self,
         _current_root: B256,
         _access_list: &BlockAccessList,

@@ -320,7 +320,7 @@ pub enum PartialStateTransitionError {
     ResolvedAccountMismatch {
         /// Account whose resolved leaf disagrees with the BAL.
         address: Address,
-        /// Post-state root against which the account was resolved.
+        /// State root against which the account was resolved.
         state_root: B256,
     },
     /// Applying the BAL produced a root other than the child block's state root.

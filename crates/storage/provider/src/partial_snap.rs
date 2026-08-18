@@ -62,7 +62,7 @@ where
         let storage_root = account.storage_root;
         self.provider
             .tx_ref()
-            .put::<tables::HashedAccounts>(account_hash, Account::from(account))?;
+            .put::<tables::PartialStateAccounts>(account_hash, Account::from(account))?;
 
         if storage_root == EMPTY_ROOT_HASH {
             self.provider
@@ -84,7 +84,7 @@ where
     ) -> Result<(), Self::Error> {
         self.provider
             .tx_ref()
-            .put::<tables::HashedStorages>(account_hash, StorageEntry::new(slot_hash, value))
+            .put::<tables::PartialStateStorages>(account_hash, StorageEntry::new(slot_hash, value))
             .map_err(Into::into)
     }
 
@@ -310,10 +310,10 @@ where
     N: NodeTypesForProvider,
 {
     fn partial_state_root(&self, filter: &dyn ContractFilter) -> Result<B256, ProviderError> {
-        let mut account_cursor = self.tx_ref().cursor_read::<tables::HashedAccounts>()?;
+        let mut account_cursor = self.tx_ref().cursor_read::<tables::PartialStateAccounts>()?;
         let mut commitment_cursor =
             self.tx_ref().cursor_read::<tables::PartialStateStorageRoots>()?;
-        let mut storage_cursor = self.tx_ref().cursor_dup_read::<tables::HashedStorages>()?;
+        let mut storage_cursor = self.tx_ref().cursor_dup_read::<tables::PartialStateStorages>()?;
         let mut next_account = account_cursor.seek(B256::ZERO)?;
         let mut next_commitment = commitment_cursor.seek(B256::ZERO)?;
         let mut root_builder = StateRootBuilder::default();
@@ -373,7 +373,21 @@ where
     }
 
     pub(crate) fn storage_root_by_hash(&self, account_hash: B256) -> Result<B256, ProviderError> {
-        let mut cursor = self.tx_ref().cursor_dup_read::<tables::HashedStorages>()?;
+        self.storage_root_by_hash_in::<tables::HashedStorages>(account_hash)
+    }
+
+    pub(crate) fn partial_storage_root_by_hash(
+        &self,
+        account_hash: B256,
+    ) -> Result<B256, ProviderError> {
+        self.storage_root_by_hash_in::<tables::PartialStateStorages>(account_hash)
+    }
+
+    fn storage_root_by_hash_in<T>(&self, account_hash: B256) -> Result<B256, ProviderError>
+    where
+        T: reth_db_api::table::DupSort<Key = B256, Value = StorageEntry, SubKey = B256>,
+    {
+        let mut cursor = self.tx_ref().cursor_dup_read::<T>()?;
         let mut next = cursor.seek_by_key_subkey(account_hash, B256::ZERO)?;
         let mut root_builder = StorageRootBuilder::default();
 
@@ -457,7 +471,7 @@ mod tests {
 
         let stored_account = provider
             .tx_ref()
-            .get::<tables::HashedAccounts>(account_hash)
+            .get::<tables::PartialStateAccounts>(account_hash)
             .unwrap()
             .expect("account should be stored");
         assert_eq!(
@@ -470,7 +484,7 @@ mod tests {
         );
 
         let mut storage_cursor =
-            provider.tx_ref().cursor_dup_read::<tables::HashedStorages>().unwrap();
+            provider.tx_ref().cursor_dup_read::<tables::PartialStateStorages>().unwrap();
         let stored_storage = storage_cursor
             .seek_by_key_subkey(account_hash, slot_hash)
             .unwrap()
@@ -509,7 +523,7 @@ mod tests {
 
         let stored_account = provider
             .tx_ref()
-            .get::<tables::HashedAccounts>(account_hash)
+            .get::<tables::PartialStateAccounts>(account_hash)
             .unwrap()
             .expect("account should be stored");
         assert_eq!(stored_account.bytecode_hash, None);
@@ -534,7 +548,14 @@ mod tests {
             code_hash: KECCAK_EMPTY,
         };
 
-        provider.partial_state_snap_writer().write_account(account_hash, account).unwrap();
+        provider
+            .tx_ref()
+            .put::<tables::HashedAccounts>(account_hash, Account::from(account))
+            .unwrap();
+        provider
+            .tx_ref()
+            .put::<tables::PartialStateStorageRoots>(account_hash, storage_root)
+            .unwrap();
 
         assert_eq!(provider.storage_root_by_hash(account_hash).unwrap(), EMPTY_ROOT_HASH);
 
@@ -688,7 +709,7 @@ mod tests {
         // Tracked storage is never substituted with its preserved commitment.
         provider
             .tx_ref()
-            .delete::<tables::HashedStorages>(
+            .delete::<tables::PartialStateStorages>(
                 tracked_hash,
                 Some(StorageEntry { key: tracked_slot, value: tracked_value }),
             )
