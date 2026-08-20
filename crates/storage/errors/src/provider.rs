@@ -289,6 +289,39 @@ pub struct SnapStateRootUnavailableError {
 /// Error returned while applying a BAL to persisted partial state.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PartialStateTransitionError {
+    /// A different transition is already journaled at this block number.
+    #[error(
+        "partial-state transition journal conflict at block {block_number}: existing={existing}, requested={requested}"
+    )]
+    JournalConflict {
+        /// Block number shared by the conflicting transitions.
+        block_number: BlockNumber,
+        /// Hash already stored in the journal.
+        existing: BlockHash,
+        /// Hash of the transition being applied.
+        requested: BlockHash,
+    },
+    /// No transition journal exists for the requested block.
+    #[error("partial-state transition journal is unavailable for block {block_number}")]
+    JournalNotFound {
+        /// Block number whose journal was requested.
+        block_number: BlockNumber,
+    },
+    /// The journal at a block number belongs to a different block hash.
+    #[error(
+        "partial-state transition journal hash mismatch at block {block_number}: expected {expected}, got {actual}"
+    )]
+    JournalBlockHashMismatch {
+        /// Block number whose journal was requested.
+        block_number: BlockNumber,
+        /// Block hash requested by the caller.
+        expected: BlockHash,
+        /// Block hash stored in the journal.
+        actual: BlockHash,
+    },
+    /// Genesis has no parent transition to restore.
+    #[error("cannot revert a partial-state transition at genesis")]
+    CannotRevertGenesis,
     /// The current partial state does not match the transition's parent root.
     #[error("partial-state parent root mismatch: expected {expected}, computed {computed}")]
     ParentRootMismatch {
@@ -329,6 +362,14 @@ pub enum PartialStateTransitionError {
         /// State root committed to by the child block.
         expected: B256,
         /// Root computed after applying the BAL.
+        computed: B256,
+    },
+    /// Reverting a journal produced a root other than the recorded parent root.
+    #[error("partial-state rollback root mismatch: expected {expected}, computed {computed}")]
+    RollbackRootMismatch {
+        /// Parent state root stored in the transition journal.
+        expected: B256,
+        /// Root computed after restoring all before-images.
         computed: B256,
     },
 }

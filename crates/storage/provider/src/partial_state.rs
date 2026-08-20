@@ -1,16 +1,20 @@
 use crate::{providers::ProviderNodeTypes, DatabaseProvider, ProviderFactory};
 use alloy_consensus::constants::{EMPTY_ROOT_HASH, KECCAK_EMPTY};
-use alloy_eips::eip7928::{compute_block_access_list_hash, AccountChanges};
-use alloy_primitives::{keccak256, Bytes, B256};
+use alloy_eips::{
+    eip7928::{compute_block_access_list_hash, AccountChanges},
+    BlockNumHash,
+};
+use alloy_primitives::{keccak256, Address, BlockNumber, Bytes, B256};
 use reth_db_api::{
     cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW},
+    models::{BlockNumberAddress, PartialStateAccountBefore, StoredPartialStateTransition},
     tables,
     transaction::{DbTx, DbTxMut},
 };
 use reth_primitives_traits::{Account, Bytecode, StorageEntry};
 use reth_storage_api::{
     ContractFilter, DBProvider, DatabaseProviderFactory, PartialStateRootProvider,
-    PartialStateTransition, PartialStateTransitionProvider,
+    PartialStateSnapPivot, PartialStateTransition, PartialStateTransitionProvider,
 };
 use reth_storage_errors::provider::{PartialStateTransitionError, ProviderError, ProviderResult};
 use reth_trie_common::TrieAccount;
@@ -28,6 +32,27 @@ where
         let root = apply_partial_state_transition(&provider, transition, filter)?;
         provider.commit()?;
         Ok(root)
+    }
+
+    fn revert_partial_state_transition(
+        &self,
+        block: BlockNumHash,
+        filter: &dyn ContractFilter,
+    ) -> ProviderResult<PartialStateSnapPivot> {
+        let provider = self.database_provider_rw()?;
+        let pivot = revert_partial_state_transition(&provider, block, filter)?;
+        provider.commit()?;
+        Ok(pivot)
+    }
+
+    fn prune_partial_state_transition_journal(
+        &self,
+        block_number: BlockNumber,
+    ) -> ProviderResult<usize> {
+        let provider = self.database_provider_rw()?;
+        let pruned = prune_partial_state_transition_journal(&provider, block_number)?;
+        provider.commit()?;
+        Ok(pruned)
     }
 }
 
@@ -58,6 +83,8 @@ where
         .into())
     }
 
+    journal_transition(provider, transition)?;
+
     for changes in transition.access_list {
         apply_account_changes(provider, transition, filter, changes)?;
     }
@@ -71,6 +98,36 @@ where
         .into())
     }
     Ok(computed_root)
+}
+
+fn journal_transition<TX, N>(
+    provider: &DatabaseProvider<TX, N>,
+    transition: PartialStateTransition<'_>,
+) -> ProviderResult<()>
+where
+    TX: DbTx + DbTxMut + 'static,
+    N: ProviderNodeTypes,
+{
+    if let Some(existing) =
+        provider.tx_ref().get::<tables::PartialStateTransitionJournals>(transition.block.number)?
+    {
+        return Err(PartialStateTransitionError::JournalConflict {
+            block_number: transition.block.number,
+            existing: existing.block_hash,
+            requested: transition.block.hash,
+        }
+        .into())
+    }
+    provider.tx_ref().put::<tables::PartialStateTransitionJournals>(
+        transition.block.number,
+        StoredPartialStateTransition {
+            block_hash: transition.block.hash,
+            parent_block_hash: transition.parent_block_hash,
+            parent_state_root: transition.parent_root,
+            state_root: transition.expected_root,
+        },
+    )?;
+    Ok(())
 }
 
 fn apply_account_changes<TX, N>(
@@ -93,6 +150,7 @@ where
 
     let address = changes.address;
     let account_hash = keccak256(address);
+    journal_account_before(provider, transition.block.number, address, account_hash)?;
     let mut account =
         provider.tx_ref().get::<tables::PartialStateAccounts>(account_hash)?.unwrap_or_default();
 
@@ -119,7 +177,13 @@ where
 
     let storage_root = if has_storage_changes {
         if filter.should_sync_storage(&address) {
-            apply_tracked_storage_changes(provider, account_hash, changes)?;
+            apply_tracked_storage_changes(
+                provider,
+                transition.block.number,
+                address,
+                account_hash,
+                changes,
+            )?;
             provider.partial_storage_root_by_hash(account_hash)?
         } else {
             let resolved = transition.resolved_accounts.get(&address).ok_or_else(|| {
@@ -168,8 +232,39 @@ where
     Ok(())
 }
 
+fn journal_account_before<TX, N>(
+    provider: &DatabaseProvider<TX, N>,
+    block_number: BlockNumber,
+    address: Address,
+    account_hash: B256,
+) -> ProviderResult<()>
+where
+    TX: DbTx + DbTxMut + 'static,
+    N: ProviderNodeTypes,
+{
+    let mut journal =
+        provider.tx_ref().cursor_dup_write::<tables::PartialStateAccountChangeSets>()?;
+    if journal.seek_by_key_subkey(block_number, address)?.is_some() {
+        return Ok(())
+    }
+
+    journal.upsert(
+        block_number,
+        &PartialStateAccountBefore {
+            address,
+            account: provider.tx_ref().get::<tables::PartialStateAccounts>(account_hash)?,
+            storage_root: provider
+                .tx_ref()
+                .get::<tables::PartialStateStorageRoots>(account_hash)?,
+        },
+    )?;
+    Ok(())
+}
+
 fn apply_tracked_storage_changes<TX, N>(
     provider: &DatabaseProvider<TX, N>,
+    block_number: BlockNumber,
+    address: Address,
     account_hash: B256,
     changes: &AccountChanges,
 ) -> ProviderResult<()>
@@ -178,6 +273,9 @@ where
     N: ProviderNodeTypes,
 {
     let mut cursor = provider.tx_ref().cursor_dup_write::<tables::PartialStateStorages>()?;
+    let mut journal =
+        provider.tx_ref().cursor_dup_write::<tables::PartialStateStorageChangeSets>()?;
+    let journal_key = BlockNumberAddress((block_number, address));
     for slot_changes in &changes.storage_changes {
         let Some(change) =
             slot_changes.changes.iter().max_by_key(|change| change.block_access_index)
@@ -185,16 +283,176 @@ where
             continue
         };
         let slot_hash = keccak256(slot_changes.slot.to_be_bytes::<32>());
-        if cursor
+        let previous = cursor
             .seek_by_key_subkey(account_hash, slot_hash)?
-            .is_some_and(|entry| entry.key == slot_hash)
-        {
+            .filter(|entry| entry.key == slot_hash);
+        if journal.seek_by_key_subkey(journal_key, slot_hash)?.is_none() {
+            journal.upsert(
+                journal_key,
+                &StorageEntry::new(
+                    slot_hash,
+                    previous.map_or_else(Default::default, |entry| entry.value),
+                ),
+            )?;
+        }
+        if previous.is_some() {
             cursor.delete_current()?;
         }
         if !change.new_value.is_zero() {
             cursor.upsert(account_hash, &StorageEntry::new(slot_hash, change.new_value))?;
         }
     }
+    Ok(())
+}
+
+fn revert_partial_state_transition<TX, N>(
+    provider: &DatabaseProvider<TX, N>,
+    block: BlockNumHash,
+    filter: &dyn ContractFilter,
+) -> ProviderResult<PartialStateSnapPivot>
+where
+    TX: DbTx + DbTxMut + Send + Sync + 'static,
+    N: ProviderNodeTypes,
+{
+    let Some(parent_number) = block.number.checked_sub(1) else {
+        return Err(PartialStateTransitionError::CannotRevertGenesis.into())
+    };
+    let journal = provider
+        .tx_ref()
+        .get::<tables::PartialStateTransitionJournals>(block.number)?
+        .ok_or(PartialStateTransitionError::JournalNotFound { block_number: block.number })?;
+    if journal.block_hash != block.hash {
+        return Err(PartialStateTransitionError::JournalBlockHashMismatch {
+            block_number: block.number,
+            expected: block.hash,
+            actual: journal.block_hash,
+        }
+        .into())
+    }
+
+    let current_root = provider.partial_state_root(filter)?;
+    if current_root != journal.state_root {
+        return Err(PartialStateTransitionError::RollbackRootMismatch {
+            expected: journal.state_root,
+            computed: current_root,
+        }
+        .into())
+    }
+
+    let account_changes = provider
+        .tx_ref()
+        .cursor_read::<tables::PartialStateAccountChangeSets>()?
+        .walk_range(block.number..=block.number)?
+        .map(|entry| entry.map(|(_, change)| change))
+        .collect::<Result<Vec<_>, _>>()?;
+    let storage_changes = provider
+        .tx_ref()
+        .cursor_dup_read::<tables::PartialStateStorageChangeSets>()?
+        .walk_range(BlockNumberAddress::range(block.number..=block.number))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    restore_partial_storage(provider, &storage_changes)?;
+    for change in &account_changes {
+        let account_hash = keccak256(change.address);
+        if let Some(account) = change.account {
+            provider.tx_ref().put::<tables::PartialStateAccounts>(account_hash, account)?;
+        } else {
+            provider.tx_ref().delete::<tables::PartialStateAccounts>(account_hash, None)?;
+        }
+        if let Some(storage_root) = change.storage_root {
+            provider
+                .tx_ref()
+                .put::<tables::PartialStateStorageRoots>(account_hash, storage_root)?;
+        } else {
+            provider.tx_ref().delete::<tables::PartialStateStorageRoots>(account_hash, None)?;
+        }
+    }
+
+    let computed_root = provider.partial_state_root(filter)?;
+    if computed_root != journal.parent_state_root {
+        return Err(PartialStateTransitionError::RollbackRootMismatch {
+            expected: journal.parent_state_root,
+            computed: computed_root,
+        }
+        .into())
+    }
+    delete_transition_journal(provider, block.number, &account_changes)?;
+
+    Ok(PartialStateSnapPivot {
+        block_number: parent_number,
+        block_hash: journal.parent_block_hash,
+        state_root: journal.parent_state_root,
+    })
+}
+
+fn restore_partial_storage<TX, N>(
+    provider: &DatabaseProvider<TX, N>,
+    changes: &[(BlockNumberAddress, StorageEntry)],
+) -> ProviderResult<()>
+where
+    TX: DbTx + DbTxMut + 'static,
+    N: ProviderNodeTypes,
+{
+    let mut storage = provider.tx_ref().cursor_dup_write::<tables::PartialStateStorages>()?;
+    for (block_address, entry) in changes {
+        let account_hash = keccak256(block_address.address());
+        if storage
+            .seek_by_key_subkey(account_hash, entry.key)?
+            .is_some_and(|current| current.key == entry.key)
+        {
+            storage.delete_current()?;
+        }
+        if !entry.value.is_zero() {
+            storage.upsert(account_hash, entry)?;
+        }
+    }
+    Ok(())
+}
+
+fn prune_partial_state_transition_journal<TX, N>(
+    provider: &DatabaseProvider<TX, N>,
+    block_number: BlockNumber,
+) -> ProviderResult<usize>
+where
+    TX: DbTx + DbTxMut + 'static,
+    N: ProviderNodeTypes,
+{
+    let blocks = provider
+        .tx_ref()
+        .cursor_read::<tables::PartialStateTransitionJournals>()?
+        .walk_range(..block_number)?
+        .map(|entry| entry.map(|(number, _)| number))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for number in &blocks {
+        let account_changes = provider
+            .tx_ref()
+            .cursor_read::<tables::PartialStateAccountChangeSets>()?
+            .walk_range(*number..=*number)?
+            .map(|entry| entry.map(|(_, change)| change))
+            .collect::<Result<Vec<_>, _>>()?;
+        delete_transition_journal(provider, *number, &account_changes)?;
+    }
+    Ok(blocks.len())
+}
+
+fn delete_transition_journal<TX, N>(
+    provider: &DatabaseProvider<TX, N>,
+    block_number: BlockNumber,
+    account_changes: &[PartialStateAccountBefore],
+) -> ProviderResult<()>
+where
+    TX: DbTx + DbTxMut + 'static,
+    N: ProviderNodeTypes,
+{
+    for change in account_changes {
+        provider.tx_ref().delete::<tables::PartialStateStorageChangeSets>(
+            BlockNumberAddress((block_number, change.address)),
+            None,
+        )?;
+    }
+    provider.tx_ref().delete::<tables::PartialStateAccountChangeSets>(block_number, None)?;
+    provider.tx_ref().delete::<tables::PartialStateTransitionJournals>(block_number, None)?;
     Ok(())
 }
 
@@ -355,6 +613,8 @@ mod tests {
         let root = factory
             .apply_partial_state_transition(
                 PartialStateTransition {
+                    block: BlockNumHash::new(1, B256::repeat_byte(0x11)),
+                    parent_block_hash: B256::repeat_byte(0x10),
                     parent_root,
                     expected_root,
                     expected_bal_hash: compute_block_access_list_hash(&access_list),
@@ -444,6 +704,8 @@ mod tests {
         factory
             .apply_partial_state_transition(
                 PartialStateTransition {
+                    block: BlockNumHash::new(1, B256::repeat_byte(0x11)),
+                    parent_block_hash: B256::repeat_byte(0x10),
                     parent_root,
                     expected_root: first_root,
                     expected_bal_hash: compute_block_access_list_hash(&first_access_list),
@@ -480,6 +742,8 @@ mod tests {
         factory
             .apply_partial_state_transition(
                 PartialStateTransition {
+                    block: BlockNumHash::new(2, B256::repeat_byte(0x12)),
+                    parent_block_hash: B256::repeat_byte(0x11),
                     parent_root: first_root,
                     expected_root: second_root,
                     expected_bal_hash: compute_block_access_list_hash(&second_access_list),
@@ -491,6 +755,149 @@ mod tests {
             .unwrap();
 
         assert_eq!(factory.partial_state_root(&filter).unwrap(), second_root);
+        assert_eq!(factory.prune_partial_state_transition_journal(2).unwrap(), 1);
+
+        let provider = factory.database_provider_ro().unwrap();
+        assert_eq!(
+            provider.tx_ref().get::<tables::PartialStateTransitionJournals>(1).unwrap(),
+            None
+        );
+        assert!(provider
+            .tx_ref()
+            .get::<tables::PartialStateTransitionJournals>(2)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            provider
+                .tx_ref()
+                .cursor_dup_read::<tables::PartialStateAccountChangeSets>()
+                .unwrap()
+                .seek_by_key_subkey(1, address)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            provider
+                .tx_ref()
+                .cursor_dup_read::<tables::PartialStateStorageChangeSets>()
+                .unwrap()
+                .seek_by_key_subkey(BlockNumberAddress((1, address)), slot_hash)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn reverts_journaled_partial_state_transition() {
+        let factory = create_test_provider_factory();
+        let address = address!("0000000000000000000000000000000000000001");
+        let account_hash = keccak256(address);
+        let slot = U256::from(1);
+        let slot_hash = keccak256(slot.to_be_bytes::<32>());
+        let parent_value = U256::from(10);
+        let child_value = U256::from(11);
+        let parent_account = TrieAccount {
+            balance: U256::from(100),
+            storage_root: storage_root([(slot_hash, parent_value)]),
+            code_hash: KECCAK_EMPTY,
+            ..Default::default()
+        };
+        let child_account = TrieAccount {
+            balance: U256::from(101),
+            storage_root: storage_root([(slot_hash, child_value)]),
+            code_hash: KECCAK_EMPTY,
+            ..Default::default()
+        };
+        let parent_root = state_root_unsorted([(account_hash, parent_account)]);
+        let child_root = state_root_unsorted([(account_hash, child_account)]);
+        let parent_block_hash = B256::repeat_byte(0x10);
+        let child_block = BlockNumHash::new(1, B256::repeat_byte(0x11));
+
+        let provider = factory.database_provider_rw().unwrap();
+        {
+            let mut writer = provider.partial_state_snap_writer();
+            writer.write_account(account_hash, parent_account).unwrap();
+            writer.write_storage(account_hash, slot_hash, parent_value).unwrap();
+        }
+        provider.commit().unwrap();
+
+        let access_list = vec![AccountChanges::new(address)
+            .with_storage_change(SlotChanges::new(slot, vec![StorageChange::new(1, child_value)]))
+            .with_balance_change(BalanceChange::new(1, child_account.balance))];
+        let filter = ConfiguredContractFilter::new([address]);
+        factory
+            .apply_partial_state_transition(
+                PartialStateTransition {
+                    block: child_block,
+                    parent_block_hash,
+                    parent_root,
+                    expected_root: child_root,
+                    expected_bal_hash: compute_block_access_list_hash(&access_list),
+                    access_list: &access_list,
+                    resolved_accounts: &PartialStateResolvedAccounts::default(),
+                },
+                &filter,
+            )
+            .unwrap();
+
+        let provider = factory.database_provider_ro().unwrap();
+        assert_eq!(
+            provider.tx_ref().get::<tables::PartialStateTransitionJournals>(1).unwrap(),
+            Some(StoredPartialStateTransition {
+                block_hash: child_block.hash,
+                parent_block_hash,
+                parent_state_root: parent_root,
+                state_root: child_root,
+            })
+        );
+        let account_before = provider
+            .tx_ref()
+            .cursor_dup_read::<tables::PartialStateAccountChangeSets>()
+            .unwrap()
+            .seek_by_key_subkey(1, address)
+            .unwrap()
+            .unwrap();
+        assert_eq!(account_before.account, Some(Account::from(parent_account)));
+        assert_eq!(account_before.storage_root, Some(parent_account.storage_root));
+        assert_eq!(
+            provider
+                .tx_ref()
+                .cursor_dup_read::<tables::PartialStateStorageChangeSets>()
+                .unwrap()
+                .seek_by_key_subkey(BlockNumberAddress((1, address)), slot_hash)
+                .unwrap(),
+            Some(StorageEntry::new(slot_hash, parent_value))
+        );
+        drop(provider);
+
+        assert_eq!(
+            factory.revert_partial_state_transition(child_block, &filter).unwrap(),
+            PartialStateSnapPivot {
+                block_number: 0,
+                block_hash: parent_block_hash,
+                state_root: parent_root,
+            }
+        );
+        assert_eq!(factory.partial_state_root(&filter).unwrap(), parent_root);
+
+        let provider = factory.database_provider_ro().unwrap();
+        assert_eq!(
+            provider.tx_ref().get::<tables::PartialStateAccounts>(account_hash).unwrap(),
+            Some(Account::from(parent_account))
+        );
+        assert_eq!(
+            provider
+                .tx_ref()
+                .cursor_dup_read::<tables::PartialStateStorages>()
+                .unwrap()
+                .seek_by_key_subkey(account_hash, slot_hash)
+                .unwrap(),
+            Some(StorageEntry::new(slot_hash, parent_value))
+        );
+        assert_eq!(
+            provider.tx_ref().get::<tables::PartialStateTransitionJournals>(1).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -517,6 +924,8 @@ mod tests {
         let err = factory
             .apply_partial_state_transition(
                 PartialStateTransition {
+                    block: BlockNumHash::new(1, B256::repeat_byte(0x11)),
+                    parent_block_hash: B256::repeat_byte(0x10),
                     parent_root,
                     expected_root: B256::repeat_byte(0xff),
                     expected_bal_hash: compute_block_access_list_hash(&access_list),
@@ -532,6 +941,15 @@ mod tests {
                 if matches!(*error, PartialStateTransitionError::ChildRootMismatch { .. })
         ));
         assert_eq!(factory.partial_state_root(&filter).unwrap(), parent_root);
+        assert_eq!(
+            factory
+                .database_provider_ro()
+                .unwrap()
+                .tx_ref()
+                .get::<tables::PartialStateTransitionJournals>(1)
+                .unwrap(),
+            None
+        );
         assert_eq!(
             factory
                 .database_provider_ro()
@@ -570,6 +988,8 @@ mod tests {
         let err = factory
             .apply_partial_state_transition(
                 PartialStateTransition {
+                    block: BlockNumHash::new(1, B256::repeat_byte(0x11)),
+                    parent_block_hash: B256::repeat_byte(0x10),
                     parent_root,
                     expected_root: B256::repeat_byte(0xee),
                     expected_bal_hash: compute_block_access_list_hash(&access_list),
@@ -624,6 +1044,8 @@ mod tests {
         let root = factory
             .apply_partial_state_transition(
                 PartialStateTransition {
+                    block: BlockNumHash::new(1, B256::repeat_byte(0x11)),
+                    parent_block_hash: B256::repeat_byte(0x10),
                     parent_root,
                     expected_root: EMPTY_ROOT_HASH,
                     expected_bal_hash: compute_block_access_list_hash(&access_list),

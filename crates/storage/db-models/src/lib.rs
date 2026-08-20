@@ -13,7 +13,7 @@ extern crate alloc;
 
 /// Accounts
 pub mod accounts;
-pub use accounts::AccountBeforeTx;
+pub use accounts::{AccountBeforeTx, PartialStateAccountBefore};
 
 /// Blocks
 pub mod blocks;
@@ -26,3 +26,7 @@ pub use storage::StorageBeforeTx;
 /// Client Version
 pub mod client_version;
 pub use client_version::ClientVersion;
+
+/// Partial-state transition journal models.
+pub mod partial_state;
+pub use partial_state::StoredPartialStateTransition;

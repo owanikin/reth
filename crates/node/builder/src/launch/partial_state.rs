@@ -126,6 +126,8 @@ where
         };
         let computed_root = provider_factory.apply_partial_state_transition(
             PartialStateTransition {
+                block: BlockNumHash::new(number, block_hash),
+                parent_block_hash: header.parent_hash(),
                 parent_root: head.state_root,
                 expected_root: header.state_root(),
                 expected_bal_hash,

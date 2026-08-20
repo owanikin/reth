@@ -21,8 +21,8 @@ use crate::{
         accounts::BlockNumberAddress,
         blocks::{HeaderHash, StoredBlockOmmers},
         storage_sharded_key::StorageShardedKey,
-        AccountBeforeTx, ClientVersion, CompactU256, IntegerList, ShardedKey,
-        StoredBlockBodyIndices, StoredBlockWithdrawals,
+        AccountBeforeTx, ClientVersion, CompactU256, IntegerList, PartialStateAccountBefore,
+        ShardedKey, StoredBlockBodyIndices, StoredBlockWithdrawals, StoredPartialStateTransition,
     },
     table::{Decode, DupSort, Encode, Table, TableInfo},
 };
@@ -493,6 +493,28 @@ tables! {
     /// This is isolated from [`HashedStorages`] for the same reason as [`PartialStateAccounts`].
     table PartialStateStorages {
         type Key = B256;
+        type Value = StorageEntry;
+        type SubKey = B256;
+    }
+
+    /// Stores metadata for each reversible partial-state transition.
+    table PartialStateTransitionJournals {
+        type Key = BlockNumber;
+        type Value = StoredPartialStateTransition;
+    }
+
+    /// Stores account and storage-root commitments before partial-state transitions.
+    table PartialStateAccountChangeSets {
+        type Key = BlockNumber;
+        type Value = PartialStateAccountBefore;
+        type SubKey = Address;
+    }
+
+    /// Stores retained storage values before partial-state transitions.
+    ///
+    /// A zero value represents a slot that did not exist before the transition.
+    table PartialStateStorageChangeSets {
+        type Key = BlockNumberAddress;
         type Value = StorageEntry;
         type SubKey = B256;
     }

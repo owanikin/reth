@@ -4,7 +4,7 @@ use alloc::{
 };
 use alloy_eips::{
     eip7928::{bal::DecodedBal, compute_block_access_list_hash, AccountChanges, BlockAccessList},
-    NumHash,
+    BlockNumHash, NumHash,
 };
 use alloy_primitives::{keccak256, Address, BlockHash, BlockNumber, Bytes, Sealed, B256, U256};
 use auto_impl::auto_impl;
@@ -205,6 +205,10 @@ pub type PartialStateResolvedAccounts = BTreeMap<Address, Option<TrieAccount>>;
 /// Inputs required to apply one BAL to persisted partial state.
 #[derive(Debug, Clone, Copy)]
 pub struct PartialStateTransition<'a> {
+    /// Number and hash of the block whose BAL produces this transition.
+    pub block: BlockNumHash,
+    /// Hash of the parent block.
+    pub parent_block_hash: BlockHash,
     /// State root that the local partial state must have before applying the BAL.
     pub parent_root: B256,
     /// State root committed to by the child block.
@@ -226,6 +230,19 @@ pub trait PartialStateTransitionProvider: Send + Sync {
         transition: PartialStateTransition<'_>,
         filter: &dyn ContractFilter,
     ) -> ProviderResult<B256>;
+
+    /// Reverts the journaled transition for `block` and returns its restored parent pivot.
+    fn revert_partial_state_transition(
+        &self,
+        block: BlockNumHash,
+        filter: &dyn ContractFilter,
+    ) -> ProviderResult<PartialStateSnapPivot>;
+
+    /// Removes transition journals for blocks strictly below `block_number`.
+    fn prune_partial_state_transition_journal(
+        &self,
+        block_number: BlockNumber,
+    ) -> ProviderResult<usize>;
 }
 
 /// A contract filter backed by a static set of tracked contract addresses.

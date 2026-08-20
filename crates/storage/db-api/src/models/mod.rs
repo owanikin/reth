@@ -22,8 +22,8 @@ pub use blocks::*;
 pub use integer_list::IntegerList;
 pub use metadata::*;
 pub use reth_db_models::{
-    AccountBeforeTx, ClientVersion, StaticFileBlockWithdrawals, StorageBeforeTx,
-    StoredBlockBodyIndices, StoredBlockWithdrawals,
+    AccountBeforeTx, ClientVersion, PartialStateAccountBefore, StaticFileBlockWithdrawals,
+    StorageBeforeTx, StoredBlockBodyIndices, StoredBlockWithdrawals, StoredPartialStateTransition,
 };
 pub use sharded_key::ShardedKey;
 
