@@ -54,6 +54,12 @@ where
         provider.commit()?;
         Ok(pruned)
     }
+
+    fn reset_partial_state(&self) -> ProviderResult<()> {
+        let provider = self.database_provider_rw()?;
+        reset_partial_state(&provider)?;
+        provider.commit()
+    }
 }
 
 fn apply_partial_state_transition<TX, N>(
@@ -453,6 +459,21 @@ where
     }
     provider.tx_ref().delete::<tables::PartialStateAccountChangeSets>(block_number, None)?;
     provider.tx_ref().delete::<tables::PartialStateTransitionJournals>(block_number, None)?;
+    Ok(())
+}
+
+fn reset_partial_state<TX, N>(provider: &DatabaseProvider<TX, N>) -> ProviderResult<()>
+where
+    TX: DbTx + DbTxMut + 'static,
+    N: ProviderNodeTypes,
+{
+    // Bytecodes are content-addressed and shared with canonical state, so old entries are harmless.
+    provider.tx_ref().clear::<tables::PartialStateStorageChangeSets>()?;
+    provider.tx_ref().clear::<tables::PartialStateAccountChangeSets>()?;
+    provider.tx_ref().clear::<tables::PartialStateTransitionJournals>()?;
+    provider.tx_ref().clear::<tables::PartialStateStorages>()?;
+    provider.tx_ref().clear::<tables::PartialStateStorageRoots>()?;
+    provider.tx_ref().clear::<tables::PartialStateAccounts>()?;
     Ok(())
 }
 

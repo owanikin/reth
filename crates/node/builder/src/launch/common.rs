@@ -517,11 +517,15 @@ where
         };
 
         let prune_config = self.prune_config();
-        let balstore_cache_size = self
+        let mut balstore_cache_size = self
             .node_config()
             .db
             .balstore_cache_size
             .unwrap_or(BalConfig::DEFAULT_IN_MEMORY_RETENTION_DISTANCE);
+        if self.configs().partial_state.is_enabled() {
+            balstore_cache_size =
+                balstore_cache_size.max(self.configs().partial_state.bal_retention());
+        }
         let bal_store = BalStoreHandle::new(InMemoryBalStore::new(
             BalConfig::with_in_memory_retention_distance(balstore_cache_size),
         ));

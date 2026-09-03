@@ -243,6 +243,9 @@ pub trait PartialStateTransitionProvider: Send + Sync {
         &self,
         block_number: BlockNumber,
     ) -> ProviderResult<usize>;
+
+    /// Clears partial state and its transition journals before a full partial-state resync.
+    fn reset_partial_state(&self) -> ProviderResult<()>;
 }
 
 /// A contract filter backed by a static set of tracked contract addresses.
