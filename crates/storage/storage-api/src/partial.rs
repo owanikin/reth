@@ -21,6 +21,13 @@ pub const MIN_PARTIAL_STATE_BAL_RETENTION: u64 = 64;
 
 /// Determines which contracts' storage and bytecode are retained by a partial-state node.
 pub trait ContractFilter: Send + Sync {
+    /// Returns a stable identity for this filter configuration.
+    ///
+    /// Implementations must return the same hash across process restarts for equivalent storage
+    /// and bytecode retention rules. Partial-state checkpoints use this to prevent state retained
+    /// under one filter from being resumed under another.
+    fn filter_hash(&self) -> B256;
+
     /// Returns `true` if storage for this contract should be downloaded and retained.
     fn should_sync_storage(&self, address: &Address) -> bool;
 
@@ -139,6 +146,55 @@ pub struct PartialStateSnapPivot {
     pub block_hash: BlockHash,
     /// State root committed to by the persisted block.
     pub state_root: B256,
+}
+
+/// Lifecycle state of a persisted partial-state checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartialStateCheckpointStatus {
+    /// Snap state is currently being downloaded and must not be used as canonical state.
+    Syncing,
+    /// The persisted state root was verified and can be advanced with canonical BALs.
+    Complete,
+}
+
+/// Durable identity of the partial state currently stored by the node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartialStateCheckpoint {
+    /// Block and state root represented by the partial-state tables.
+    pub pivot: PartialStateSnapPivot,
+    /// Identity of the filter used to retain storage and bytecode.
+    pub filter_hash: B256,
+    /// Whether the state is still downloading or has passed root verification.
+    pub status: PartialStateCheckpointStatus,
+}
+
+impl PartialStateCheckpoint {
+    /// Returns `true` if this checkpoint can be resumed with `filter`.
+    pub fn is_complete_for(&self, filter: &dyn ContractFilter) -> bool {
+        self.status == PartialStateCheckpointStatus::Complete &&
+            self.filter_hash == filter.filter_hash()
+    }
+}
+
+/// Manages the durable lifecycle of partial-state sync and canonical advancement.
+#[auto_impl(&, Arc, Box)]
+pub trait PartialStateCheckpointProvider: Send + Sync {
+    /// Returns the current partial-state checkpoint, if one has been initialized.
+    fn partial_state_checkpoint(&self) -> ProviderResult<Option<PartialStateCheckpoint>>;
+
+    /// Clears stale partial state and records an incomplete snap-sync target atomically.
+    fn begin_partial_state_sync(
+        &self,
+        pivot: PartialStateSnapPivot,
+        filter: &dyn ContractFilter,
+    ) -> ProviderResult<()>;
+
+    /// Verifies the downloaded state and marks its checkpoint complete atomically.
+    fn complete_partial_state_sync(
+        &self,
+        pivot: PartialStateSnapPivot,
+        filter: &dyn ContractFilter,
+    ) -> ProviderResult<PartialStateCheckpoint>;
 }
 
 /// Reads snap state records that can be served to peers.
@@ -287,6 +343,17 @@ impl FromIterator<Address> for ConfiguredContractFilter {
 }
 
 impl ContractFilter for ConfiguredContractFilter {
+    fn filter_hash(&self) -> B256 {
+        const DOMAIN: &[u8] = b"reth-partial-state-configured-filter-v1";
+
+        let mut encoded = Vec::with_capacity(DOMAIN.len() + self.contracts.len() * 20);
+        encoded.extend_from_slice(DOMAIN);
+        for address in &self.contracts {
+            encoded.extend_from_slice(address.as_slice());
+        }
+        keccak256(encoded)
+    }
+
     fn should_sync_storage(&self, address: &Address) -> bool {
         self.contracts.contains(address)
     }
@@ -313,6 +380,10 @@ impl ContractFilter for ConfiguredContractFilter {
 pub struct AllowAllContractFilter;
 
 impl ContractFilter for AllowAllContractFilter {
+    fn filter_hash(&self) -> B256 {
+        keccak256(b"reth-partial-state-allow-all-filter-v1")
+    }
+
     fn should_sync_storage(&self, _address: &Address) -> bool {
         true
     }
@@ -512,6 +583,23 @@ mod tests {
         );
         assert!(!filter.should_sync_storage_by_hash(&untracked_hash));
         assert!(!filter.should_sync_code_by_hash(&untracked_hash));
+    }
+
+    #[test]
+    fn configured_filter_hash_is_stable_and_order_independent() {
+        let first = address!("0000000000000000000000000000000000000001");
+        let second = address!("0000000000000000000000000000000000000002");
+
+        let forward = ConfiguredContractFilter::new([first, second]);
+        let reverse = ConfiguredContractFilter::new([second, first]);
+        let different = ConfiguredContractFilter::new([first]);
+
+        assert_eq!(forward.filter_hash(), reverse.filter_hash());
+        assert_ne!(forward.filter_hash(), different.filter_hash());
+        assert_ne!(
+            ConfiguredContractFilter::default().filter_hash(),
+            AllowAllContractFilter.filter_hash()
+        );
     }
 
     #[test]

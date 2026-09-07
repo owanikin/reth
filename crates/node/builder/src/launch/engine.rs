@@ -18,9 +18,8 @@ use futures::{stream::FusedStream, stream_select, FutureExt, StreamExt};
 use reth_chain_state::CanonStateSubscriptions;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_downloaders::snap::{
-    persist_snap_event, report_partial_snap_progress, verify_partial_snap_state_root,
-    PartialStateSnapDownloader, PartialStateSnapDownloaderConfig, PartialStateSnapEvent,
-    PartialStateSnapTarget,
+    persist_snap_event, report_partial_snap_progress, PartialStateSnapDownloader,
+    PartialStateSnapDownloaderConfig, PartialStateSnapEvent, PartialStateSnapTarget,
 };
 use reth_engine_primitives::{BeaconEngineMessage, ExecutionPayload as _};
 use reth_engine_tree::{
@@ -48,8 +47,8 @@ use reth_provider::{
     BlockNumReader, HeaderProvider, ProviderFactory, StorageSettingsCache,
 };
 use reth_storage_api::{
-    BalProvider, ConfiguredContractFilter, PartialStateSnapPivot, PartialStateSnapProvider,
-    PartialStateTransitionProvider,
+    BalProvider, ConfiguredContractFilter, ContractFilter, PartialStateCheckpointProvider,
+    PartialStateSnapPivot, PartialStateSnapProvider,
 };
 use reth_tasks::TaskExecutor;
 use reth_tokio_util::EventSender;
@@ -352,6 +351,30 @@ impl EngineNodeLauncher {
         let consensus_engine = move |mut on_graceful_shutdown| async move {
             let mut partial_state_task = None;
             let mut partial_state_sync_started = false;
+            if let Some(filter) = partial_state_filter.clone() {
+                match partial_state_provider_factory.partial_state_checkpoint() {
+                    Ok(Some(checkpoint)) if checkpoint.is_complete_for(&filter) => {
+                        partial_state_sync_started = true;
+                        partial_state_task = Some(spawn_partial_state_sync(
+                            &partial_state_task_executor,
+                            partial_state_network_client.clone(),
+                            partial_state_provider_factory.clone(),
+                            partial_state_canonical_provider.clone(),
+                            filter,
+                            checkpoint.pivot,
+                            partial_state_bal_retention,
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        warn!(
+                            target: "reth::cli",
+                            %err,
+                            "Failed to inspect persisted partial-state checkpoint on startup"
+                        );
+                    }
+                }
+            }
             if let Some(initial_target) = initial_target {
                 debug!(target: "reth::cli", %initial_target,  "start backfill sync");
                 // network_handle's sync state is already initialized at Syncing
@@ -396,7 +419,7 @@ impl EngineNodeLauncher {
                                             match partial_state_provider_factory.snap_state_pivot() {
                                                 Ok(pivot) => {
                                                     partial_state_sync_started = true;
-                                                    partial_state_task = Some(spawn_partial_state_snap_sync(
+                                                    partial_state_task = Some(spawn_partial_state_sync(
                                                         &partial_state_task_executor,
                                                         partial_state_network_client.clone(),
                                                         partial_state_provider_factory.clone(),
@@ -537,8 +560,8 @@ impl EngineNodeLauncher {
     }
 }
 
-/// Spawns the partial-state snap downloader for the given persisted pivot.
-fn spawn_partial_state_snap_sync<N, Client>(
+/// Spawns partial-state recovery and canonical advancement.
+fn spawn_partial_state_sync<N, Client>(
     task_executor: &TaskExecutor,
     client: Client,
     provider_factory: ProviderFactory<N>,
@@ -551,53 +574,81 @@ where
     N: ProviderNodeTypes + 'static,
     Client: SnapClient + Clone + Unpin + 'static,
 {
-    info!(
-        target: "reth::cli",
-        block_number = pivot.block_number,
-        block_hash = %pivot.block_hash,
-        state_root = %pivot.state_root,
-        "Starting partial-state snap sync"
-    );
     let mut canonical_notifications = canonical_provider.subscribe_to_canonical_state();
     let (task_alive, task) = watch::channel(());
     task_executor.spawn_critical_task("partial-state snap sync", async move {
         let _task_alive = task_alive;
-        match run_partial_state_snap_sync(
-            client.clone(),
-            provider_factory.clone(),
-            filter.clone(),
-            pivot,
-        )
-        .await
-        {
-            Ok(progress) => {
+        let mut partial_head = match provider_factory.partial_state_checkpoint() {
+            Ok(Some(checkpoint)) if checkpoint.is_complete_for(&filter) => {
+                info!(
+                    target: "reth::cli",
+                    block_number = checkpoint.pivot.block_number,
+                    block_hash = %checkpoint.pivot.block_hash,
+                    state_root = %checkpoint.pivot.state_root,
+                    "Resuming persisted partial-state canonical checkpoint"
+                );
+                checkpoint.pivot
+            }
+            Ok(checkpoint) => {
+                if let Some(checkpoint) = checkpoint {
+                    warn!(
+                        target: "reth::cli",
+                        block_number = checkpoint.pivot.block_number,
+                        block_hash = %checkpoint.pivot.block_hash,
+                        state_root = %checkpoint.pivot.state_root,
+                        status = ?checkpoint.status,
+                        filter_changed = checkpoint.filter_hash != filter.filter_hash(),
+                        "Persisted partial-state checkpoint cannot be resumed; rebuilding"
+                    );
+                }
                 info!(
                     target: "reth::cli",
                     block_number = pivot.block_number,
                     block_hash = %pivot.block_hash,
                     state_root = %pivot.state_root,
-                    accounts = progress.accounts,
-                    slots = progress.storage_slots,
-                    slots_skipped = progress.storage_skipped,
-                    codes = progress.bytecodes,
-                    codes_skipped = progress.bytecodes_skipped,
-                    "Partial-state snap sync complete"
+                    "Starting partial-state snap sync"
                 );
+                match run_partial_state_snap_sync(
+                    client.clone(),
+                    provider_factory.clone(),
+                    filter.clone(),
+                    pivot,
+                )
+                .await
+                {
+                    Ok(progress) => {
+                        info!(
+                            target: "reth::cli",
+                            block_number = pivot.block_number,
+                            block_hash = %pivot.block_hash,
+                            state_root = %pivot.state_root,
+                            accounts = progress.accounts,
+                            slots = progress.storage_slots,
+                            slots_skipped = progress.storage_skipped,
+                            codes = progress.bytecodes,
+                            codes_skipped = progress.bytecodes_skipped,
+                            "Partial-state snap sync complete"
+                        );
+                        pivot
+                    }
+                    Err(err) => {
+                        error!(
+                            target: "reth::cli",
+                            block_number = pivot.block_number,
+                            block_hash = %pivot.block_hash,
+                            state_root = %pivot.state_root,
+                            %err,
+                            "Partial-state snap sync failed"
+                        );
+                        return
+                    }
+                }
             }
             Err(err) => {
-                error!(
-                    target: "reth::cli",
-                    block_number = pivot.block_number,
-                    block_hash = %pivot.block_hash,
-                    state_root = %pivot.state_root,
-                    %err,
-                    "Partial-state snap sync failed"
-                );
+                error!(target: "reth::cli", %err, "Failed to read partial-state checkpoint");
                 return
             }
-        }
-
-        let mut partial_head = pivot;
+        };
         let target = match current_canonical_tip(&canonical_provider) {
             Ok(target) => target,
             Err(err) => {
@@ -768,7 +819,6 @@ where
     Client: SnapClient + Clone + Unpin + 'static,
 {
     let pivot = provider_factory.snap_state_pivot()?;
-    provider_factory.reset_partial_state()?;
     let progress =
         run_partial_state_snap_sync(client, provider_factory.clone(), filter.clone(), pivot)
             .await?;
@@ -786,6 +836,8 @@ where
     N: ProviderNodeTypes + 'static,
     Client: SnapClient + Clone + Unpin + 'static,
 {
+    provider_factory.begin_partial_state_sync(pivot, &filter)?;
+
     let mut downloader = PartialStateSnapDownloader::with_filter(
         client,
         PartialStateSnapDownloaderConfig::default(),
@@ -802,8 +854,8 @@ where
     let progress = downloader.progress();
     report_partial_snap_progress(progress);
 
-    let computed_root = tokio::task::spawn_blocking(move || {
-        verify_partial_snap_state_root(&provider_factory, &filter, pivot.state_root)
+    let checkpoint = tokio::task::spawn_blocking(move || {
+        provider_factory.complete_partial_state_sync(pivot, &filter)
     })
     .await??;
     debug!(
@@ -811,7 +863,7 @@ where
         block_number = pivot.block_number,
         block_hash = %pivot.block_hash,
         expected_root = %pivot.state_root,
-        %computed_root,
+        computed_root = %checkpoint.pivot.state_root,
         "Verified partial-state snap root"
     );
 

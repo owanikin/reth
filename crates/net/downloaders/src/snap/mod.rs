@@ -1949,6 +1949,14 @@ mod tests {
     }
 
     impl ContractFilter for TestHashFilter {
+        fn filter_hash(&self) -> B256 {
+            let mut encoded = Vec::with_capacity(self.tracked.len() * 32);
+            for hash in &self.tracked {
+                encoded.extend_from_slice(hash.as_slice());
+            }
+            keccak256(encoded)
+        }
+
         fn should_sync_storage(&self, _address: &Address) -> bool {
             false
         }

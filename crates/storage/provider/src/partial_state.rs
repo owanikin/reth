@@ -7,17 +7,81 @@ use alloy_eips::{
 use alloy_primitives::{keccak256, Address, BlockNumber, Bytes, B256};
 use reth_db_api::{
     cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW},
-    models::{BlockNumberAddress, PartialStateAccountBefore, StoredPartialStateTransition},
+    models::{
+        BlockNumberAddress, PartialStateAccountBefore, StoredPartialStateCheckpoint,
+        StoredPartialStateTransition,
+    },
     tables,
     transaction::{DbTx, DbTxMut},
 };
 use reth_primitives_traits::{Account, Bytecode, StorageEntry};
 use reth_storage_api::{
-    ContractFilter, DBProvider, DatabaseProviderFactory, PartialStateRootProvider,
+    ContractFilter, DBProvider, DatabaseProviderFactory, PartialStateCheckpoint,
+    PartialStateCheckpointProvider, PartialStateCheckpointStatus, PartialStateRootProvider,
     PartialStateSnapPivot, PartialStateTransition, PartialStateTransitionProvider,
 };
-use reth_storage_errors::provider::{PartialStateTransitionError, ProviderError, ProviderResult};
+use reth_storage_errors::provider::{
+    PartialStateCheckpointError, PartialStateTransitionError, ProviderError, ProviderResult,
+};
 use reth_trie_common::TrieAccount;
+
+const PARTIAL_STATE_CHECKPOINT_KEY: u8 = 0;
+
+impl<N> PartialStateCheckpointProvider for ProviderFactory<N>
+where
+    N: ProviderNodeTypes,
+{
+    fn partial_state_checkpoint(&self) -> ProviderResult<Option<PartialStateCheckpoint>> {
+        read_partial_state_checkpoint(&self.database_provider_ro()?)
+    }
+
+    fn begin_partial_state_sync(
+        &self,
+        pivot: PartialStateSnapPivot,
+        filter: &dyn ContractFilter,
+    ) -> ProviderResult<()> {
+        let provider = self.database_provider_rw()?;
+        reset_partial_state(&provider)?;
+        write_partial_state_checkpoint(
+            &provider,
+            PartialStateCheckpoint {
+                pivot,
+                filter_hash: filter.filter_hash(),
+                status: PartialStateCheckpointStatus::Syncing,
+            },
+        )?;
+        provider.commit()
+    }
+
+    fn complete_partial_state_sync(
+        &self,
+        pivot: PartialStateSnapPivot,
+        filter: &dyn ContractFilter,
+    ) -> ProviderResult<PartialStateCheckpoint> {
+        let provider = self.database_provider_rw()?;
+        let checkpoint = read_partial_state_checkpoint(&provider)?
+            .ok_or(PartialStateCheckpointError::Unavailable)?;
+        ensure_checkpoint_identity(checkpoint, pivot, filter)?;
+
+        let computed_root = provider.partial_state_root(filter)?;
+        if computed_root != pivot.state_root {
+            return Err(PartialStateCheckpointError::RootMismatch {
+                expected: pivot.state_root,
+                computed: computed_root,
+            }
+            .into())
+        }
+
+        let checkpoint = PartialStateCheckpoint {
+            pivot,
+            filter_hash: filter.filter_hash(),
+            status: PartialStateCheckpointStatus::Complete,
+        };
+        write_partial_state_checkpoint(&provider, checkpoint)?;
+        provider.commit()?;
+        Ok(checkpoint)
+    }
+}
 
 impl<N> PartialStateTransitionProvider for ProviderFactory<N>
 where
@@ -62,6 +126,94 @@ where
     }
 }
 
+fn read_partial_state_checkpoint<TX, N>(
+    provider: &DatabaseProvider<TX, N>,
+) -> ProviderResult<Option<PartialStateCheckpoint>>
+where
+    TX: DbTx + 'static,
+    N: ProviderNodeTypes,
+{
+    Ok(provider.tx_ref().get::<tables::PartialStateCheckpoints>(PARTIAL_STATE_CHECKPOINT_KEY)?.map(
+        |stored| PartialStateCheckpoint {
+            pivot: PartialStateSnapPivot {
+                block_number: stored.block_number,
+                block_hash: stored.block_hash,
+                state_root: stored.state_root,
+            },
+            filter_hash: stored.filter_hash,
+            status: if stored.sync_complete {
+                PartialStateCheckpointStatus::Complete
+            } else {
+                PartialStateCheckpointStatus::Syncing
+            },
+        },
+    ))
+}
+
+fn write_partial_state_checkpoint<TX, N>(
+    provider: &DatabaseProvider<TX, N>,
+    checkpoint: PartialStateCheckpoint,
+) -> ProviderResult<()>
+where
+    TX: DbTx + DbTxMut + 'static,
+    N: ProviderNodeTypes,
+{
+    provider.tx_ref().put::<tables::PartialStateCheckpoints>(
+        PARTIAL_STATE_CHECKPOINT_KEY,
+        StoredPartialStateCheckpoint {
+            block_number: checkpoint.pivot.block_number,
+            block_hash: checkpoint.pivot.block_hash,
+            state_root: checkpoint.pivot.state_root,
+            filter_hash: checkpoint.filter_hash,
+            sync_complete: checkpoint.status == PartialStateCheckpointStatus::Complete,
+        },
+    )?;
+    Ok(())
+}
+
+fn ensure_checkpoint_identity(
+    checkpoint: PartialStateCheckpoint,
+    expected: PartialStateSnapPivot,
+    filter: &dyn ContractFilter,
+) -> ProviderResult<()> {
+    let configured = filter.filter_hash();
+    if checkpoint.filter_hash != configured {
+        return Err(PartialStateCheckpointError::FilterMismatch {
+            expected: checkpoint.filter_hash,
+            configured,
+        }
+        .into())
+    }
+    if checkpoint.pivot != expected {
+        return Err(PartialStateCheckpointError::PivotMismatch {
+            expected_number: expected.block_number,
+            expected_hash: expected.block_hash,
+            expected_root: expected.state_root,
+            actual_number: checkpoint.pivot.block_number,
+            actual_hash: checkpoint.pivot.block_hash,
+            actual_root: checkpoint.pivot.state_root,
+        }
+        .into())
+    }
+    Ok(())
+}
+
+fn ensure_complete_checkpoint(
+    checkpoint: PartialStateCheckpoint,
+    expected: PartialStateSnapPivot,
+    filter: &dyn ContractFilter,
+) -> ProviderResult<()> {
+    ensure_checkpoint_identity(checkpoint, expected, filter)?;
+    if checkpoint.status != PartialStateCheckpointStatus::Complete {
+        return Err(PartialStateCheckpointError::Incomplete {
+            block_number: checkpoint.pivot.block_number,
+            block_hash: checkpoint.pivot.block_hash,
+        }
+        .into())
+    }
+    Ok(())
+}
+
 fn apply_partial_state_transition<TX, N>(
     provider: &DatabaseProvider<TX, N>,
     transition: PartialStateTransition<'_>,
@@ -71,6 +223,18 @@ where
     TX: DbTx + DbTxMut + Send + Sync + 'static,
     N: ProviderNodeTypes,
 {
+    if let Some(checkpoint) = read_partial_state_checkpoint(provider)? {
+        ensure_complete_checkpoint(
+            checkpoint,
+            PartialStateSnapPivot {
+                block_number: transition.block.number.saturating_sub(1),
+                block_hash: transition.parent_block_hash,
+                state_root: transition.parent_root,
+            },
+            filter,
+        )?;
+    }
+
     let current_root = provider.partial_state_root(filter)?;
     if current_root != transition.parent_root {
         return Err(PartialStateTransitionError::ParentRootMismatch {
@@ -103,6 +267,18 @@ where
         }
         .into())
     }
+    write_partial_state_checkpoint(
+        provider,
+        PartialStateCheckpoint {
+            pivot: PartialStateSnapPivot {
+                block_number: transition.block.number,
+                block_hash: transition.block.hash,
+                state_root: computed_root,
+            },
+            filter_hash: filter.filter_hash(),
+            status: PartialStateCheckpointStatus::Complete,
+        },
+    )?;
     Ok(computed_root)
 }
 
@@ -336,6 +512,18 @@ where
         .into())
     }
 
+    if let Some(checkpoint) = read_partial_state_checkpoint(provider)? {
+        ensure_complete_checkpoint(
+            checkpoint,
+            PartialStateSnapPivot {
+                block_number: block.number,
+                block_hash: block.hash,
+                state_root: journal.state_root,
+            },
+            filter,
+        )?;
+    }
+
     let current_root = provider.partial_state_root(filter)?;
     if current_root != journal.state_root {
         return Err(PartialStateTransitionError::RollbackRootMismatch {
@@ -384,11 +572,21 @@ where
     }
     delete_transition_journal(provider, block.number, &account_changes)?;
 
-    Ok(PartialStateSnapPivot {
+    let pivot = PartialStateSnapPivot {
         block_number: parent_number,
         block_hash: journal.parent_block_hash,
         state_root: journal.parent_state_root,
-    })
+    };
+    write_partial_state_checkpoint(
+        provider,
+        PartialStateCheckpoint {
+            pivot,
+            filter_hash: filter.filter_hash(),
+            status: PartialStateCheckpointStatus::Complete,
+        },
+    )?;
+
+    Ok(pivot)
 }
 
 fn restore_partial_storage<TX, N>(
@@ -468,6 +666,7 @@ where
     N: ProviderNodeTypes,
 {
     // Bytecodes are content-addressed and shared with canonical state, so old entries are harmless.
+    provider.tx_ref().clear::<tables::PartialStateCheckpoints>()?;
     provider.tx_ref().clear::<tables::PartialStateStorageChangeSets>()?;
     provider.tx_ref().clear::<tables::PartialStateAccountChangeSets>()?;
     provider.tx_ref().clear::<tables::PartialStateTransitionJournals>()?;
@@ -526,9 +725,104 @@ mod tests {
     use alloy_primitives::{address, U256};
     use reth_db_api::{cursor::DbDupCursorRO, transaction::DbTx};
     use reth_storage_api::{
-        ConfiguredContractFilter, DBProvider, PartialStateResolvedAccounts, PartialStateSnapWriter,
+        ConfiguredContractFilter, DBProvider, PartialStateCheckpointProvider,
+        PartialStateCheckpointStatus, PartialStateResolvedAccounts, PartialStateSnapWriter,
     };
     use reth_trie::root::{state_root_unsorted, storage_root};
+
+    #[test]
+    fn persists_partial_state_checkpoint_lifecycle() {
+        let factory = create_test_provider_factory();
+        let address = address!("0000000000000000000000000000000000000001");
+        let account_hash = keccak256(address);
+        let stale_hash = B256::repeat_byte(0xaa);
+        let account = TrieAccount {
+            balance: U256::from(1),
+            storage_root: EMPTY_ROOT_HASH,
+            code_hash: KECCAK_EMPTY,
+            ..Default::default()
+        };
+        let pivot = PartialStateSnapPivot {
+            block_number: 7,
+            block_hash: B256::repeat_byte(0x77),
+            state_root: state_root_unsorted([(account_hash, account)]),
+        };
+        let filter = ConfiguredContractFilter::new([address]);
+
+        let provider = factory.database_provider_rw().unwrap();
+        provider
+            .partial_state_snap_writer()
+            .write_account(stale_hash, TrieAccount::default())
+            .unwrap();
+        provider.commit().unwrap();
+
+        factory.begin_partial_state_sync(pivot, &filter).unwrap();
+        assert_eq!(
+            factory.partial_state_checkpoint().unwrap(),
+            Some(PartialStateCheckpoint {
+                pivot,
+                filter_hash: filter.filter_hash(),
+                status: PartialStateCheckpointStatus::Syncing,
+            })
+        );
+        assert_eq!(
+            factory
+                .database_provider_ro()
+                .unwrap()
+                .tx_ref()
+                .get::<tables::PartialStateAccounts>(stale_hash)
+                .unwrap(),
+            None
+        );
+
+        let provider = factory.database_provider_rw().unwrap();
+        provider.partial_state_snap_writer().write_account(account_hash, account).unwrap();
+        provider.commit().unwrap();
+
+        let checkpoint = factory.complete_partial_state_sync(pivot, &filter).unwrap();
+        assert_eq!(
+            checkpoint,
+            PartialStateCheckpoint {
+                pivot,
+                filter_hash: filter.filter_hash(),
+                status: PartialStateCheckpointStatus::Complete,
+            }
+        );
+        assert_eq!(factory.partial_state_checkpoint().unwrap(), Some(checkpoint));
+
+        factory.reset_partial_state().unwrap();
+        assert_eq!(factory.partial_state_checkpoint().unwrap(), None);
+    }
+
+    #[test]
+    fn partial_state_checkpoint_rejects_filter_changes() {
+        let factory = create_test_provider_factory();
+        let pivot = PartialStateSnapPivot {
+            block_number: 0,
+            block_hash: B256::repeat_byte(0x10),
+            state_root: EMPTY_ROOT_HASH,
+        };
+        let original =
+            ConfiguredContractFilter::new([address!("0000000000000000000000000000000000000001")]);
+        let changed =
+            ConfiguredContractFilter::new([address!("0000000000000000000000000000000000000002")]);
+
+        factory.begin_partial_state_sync(pivot, &original).unwrap();
+        let err = factory.complete_partial_state_sync(pivot, &changed).unwrap_err();
+        assert!(matches!(
+            err,
+            ProviderError::PartialStateCheckpoint(error)
+                if matches!(*error, PartialStateCheckpointError::FilterMismatch { .. })
+        ));
+        assert_eq!(
+            factory.partial_state_checkpoint().unwrap(),
+            Some(PartialStateCheckpoint {
+                pivot,
+                filter_hash: original.filter_hash(),
+                status: PartialStateCheckpointStatus::Syncing,
+            })
+        );
+    }
 
     #[test]
     fn applies_mixed_bal_and_matches_complete_reference_root() {
@@ -647,6 +941,18 @@ mod tests {
             .unwrap();
         assert_eq!(root, expected_root);
         assert_eq!(factory.partial_state_root(&filter).unwrap(), expected_root);
+        assert_eq!(
+            factory.partial_state_checkpoint().unwrap(),
+            Some(PartialStateCheckpoint {
+                pivot: PartialStateSnapPivot {
+                    block_number: 1,
+                    block_hash: B256::repeat_byte(0x11),
+                    state_root: expected_root,
+                },
+                filter_hash: filter.filter_hash(),
+                status: PartialStateCheckpointStatus::Complete,
+            })
+        );
 
         let provider = factory.database_provider_ro().unwrap();
         assert_eq!(
@@ -900,6 +1206,18 @@ mod tests {
             }
         );
         assert_eq!(factory.partial_state_root(&filter).unwrap(), parent_root);
+        assert_eq!(
+            factory.partial_state_checkpoint().unwrap(),
+            Some(PartialStateCheckpoint {
+                pivot: PartialStateSnapPivot {
+                    block_number: 0,
+                    block_hash: parent_block_hash,
+                    state_root: parent_root,
+                },
+                filter_hash: filter.filter_hash(),
+                status: PartialStateCheckpointStatus::Complete,
+            })
+        );
 
         let provider = factory.database_provider_ro().unwrap();
         assert_eq!(
@@ -933,15 +1251,22 @@ mod tests {
             ..Default::default()
         };
         let parent_root = state_root_unsorted([(account_hash, parent_account)]);
+        let parent_pivot = PartialStateSnapPivot {
+            block_number: 0,
+            block_hash: B256::repeat_byte(0x10),
+            state_root: parent_root,
+        };
+        let filter = ConfiguredContractFilter::new([address]);
+        factory.begin_partial_state_sync(parent_pivot, &filter).unwrap();
         let provider = factory.database_provider_rw().unwrap();
         provider.partial_state_snap_writer().write_account(account_hash, parent_account).unwrap();
         provider.commit().unwrap();
+        factory.complete_partial_state_sync(parent_pivot, &filter).unwrap();
 
         let access_list =
             vec![AccountChanges::new(address)
                 .with_balance_change(BalanceChange::new(1, U256::from(11)))];
         let resolved_accounts = PartialStateResolvedAccounts::default();
-        let filter = ConfiguredContractFilter::new([address]);
         let err = factory
             .apply_partial_state_transition(
                 PartialStateTransition {
@@ -979,6 +1304,14 @@ mod tests {
                 .get::<tables::PartialStateAccounts>(account_hash)
                 .unwrap(),
             Some(Account::from(parent_account))
+        );
+        assert_eq!(
+            factory.partial_state_checkpoint().unwrap(),
+            Some(PartialStateCheckpoint {
+                pivot: parent_pivot,
+                filter_hash: filter.filter_hash(),
+                status: PartialStateCheckpointStatus::Complete,
+            })
         );
     }
 

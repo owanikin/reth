@@ -135,6 +135,9 @@ pub enum ProviderError {
     /// Snap state for the requested root is not the state currently persisted by this provider.
     #[error(transparent)]
     SnapStateRootUnavailable(Box<SnapStateRootUnavailableError>),
+    /// Persisted partial-state checkpoint validation failed.
+    #[error(transparent)]
+    PartialStateCheckpoint(Box<PartialStateCheckpointError>),
     /// Applying a BAL to persisted partial state failed validation.
     #[error(transparent)]
     PartialStateTransition(Box<PartialStateTransitionError>),
@@ -284,6 +287,64 @@ pub struct SnapStateRootUnavailableError {
     pub requested: B256,
     /// State root currently persisted by the provider.
     pub available: B256,
+}
+
+/// Error returned when a persisted partial-state checkpoint violates its lifecycle invariants.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PartialStateCheckpointError {
+    /// No partial-state checkpoint has been initialized.
+    #[error("partial-state checkpoint is unavailable")]
+    Unavailable,
+    /// The checkpoint is still being populated by snap sync.
+    #[error("partial-state checkpoint for block {block_number} ({block_hash}) is incomplete")]
+    Incomplete {
+        /// Number of the incomplete snap target.
+        block_number: BlockNumber,
+        /// Hash of the incomplete snap target.
+        block_hash: BlockHash,
+    },
+    /// The checkpoint was created with a different partial-state filter.
+    #[error(
+        "partial-state checkpoint filter mismatch: expected {expected}, configured {configured}"
+    )]
+    FilterMismatch {
+        /// Filter hash stored with the checkpoint.
+        expected: B256,
+        /// Filter hash configured for this process.
+        configured: B256,
+    },
+    /// The checkpoint identifies a different block or root than required by the operation.
+    #[error(
+        "partial-state checkpoint pivot mismatch: expected block {expected_number} ({expected_hash}) root {expected_root}, found block {actual_number} ({actual_hash}) root {actual_root}"
+    )]
+    PivotMismatch {
+        /// Expected block number.
+        expected_number: BlockNumber,
+        /// Expected block hash.
+        expected_hash: BlockHash,
+        /// Expected state root.
+        expected_root: B256,
+        /// Persisted block number.
+        actual_number: BlockNumber,
+        /// Persisted block hash.
+        actual_hash: BlockHash,
+        /// Persisted state root.
+        actual_root: B256,
+    },
+    /// The persisted partial state does not match its snap target root.
+    #[error("partial-state checkpoint root mismatch: expected {expected}, computed {computed}")]
+    RootMismatch {
+        /// Root committed to by the snap target.
+        expected: B256,
+        /// Root computed from the downloaded partial state.
+        computed: B256,
+    },
+}
+
+impl From<PartialStateCheckpointError> for ProviderError {
+    fn from(error: PartialStateCheckpointError) -> Self {
+        Self::PartialStateCheckpoint(Box::new(error))
+    }
 }
 
 /// Error returned while applying a BAL to persisted partial state.

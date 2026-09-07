@@ -22,7 +22,8 @@ use crate::{
         blocks::{HeaderHash, StoredBlockOmmers},
         storage_sharded_key::StorageShardedKey,
         AccountBeforeTx, ClientVersion, CompactU256, IntegerList, PartialStateAccountBefore,
-        ShardedKey, StoredBlockBodyIndices, StoredBlockWithdrawals, StoredPartialStateTransition,
+        ShardedKey, StoredBlockBodyIndices, StoredBlockWithdrawals, StoredPartialStateCheckpoint,
+        StoredPartialStateTransition,
     },
     table::{Decode, DupSort, Encode, Table, TableInfo},
 };
@@ -495,6 +496,14 @@ tables! {
         type Key = B256;
         type Value = StorageEntry;
         type SubKey = B256;
+    }
+
+    /// Stores the single durable checkpoint for the partial-state tables.
+    ///
+    /// Key `0` is reserved for the active checkpoint.
+    table PartialStateCheckpoints {
+        type Key = u8;
+        type Value = StoredPartialStateCheckpoint;
     }
 
     /// Stores metadata for each reversible partial-state transition.

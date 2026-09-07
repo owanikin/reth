@@ -27,6 +27,6 @@ pub use storage::StorageBeforeTx;
 pub mod client_version;
 pub use client_version::ClientVersion;
 
-/// Partial-state transition journal models.
+/// Partial-state persistence models.
 pub mod partial_state;
-pub use partial_state::StoredPartialStateTransition;
+pub use partial_state::{StoredPartialStateCheckpoint, StoredPartialStateTransition};
