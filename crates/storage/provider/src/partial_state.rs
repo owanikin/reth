@@ -126,7 +126,7 @@ where
     }
 }
 
-fn read_partial_state_checkpoint<TX, N>(
+pub(crate) fn read_partial_state_checkpoint<TX, N>(
     provider: &DatabaseProvider<TX, N>,
 ) -> ProviderResult<Option<PartialStateCheckpoint>>
 where
@@ -198,7 +198,7 @@ fn ensure_checkpoint_identity(
     Ok(())
 }
 
-fn ensure_complete_checkpoint(
+pub(crate) fn ensure_complete_checkpoint(
     checkpoint: PartialStateCheckpoint,
     expected: PartialStateSnapPivot,
     filter: &dyn ContractFilter,

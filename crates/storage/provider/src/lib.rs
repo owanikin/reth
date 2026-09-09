@@ -46,6 +46,9 @@ pub use partial_snap::PartialStateSnapDbWriter;
 
 mod partial_state;
 
+mod partial_state_reader;
+pub use partial_state_reader::PartialStateReader;
+
 pub use reth_chain_state::{
     CanonStateNotification, CanonStateNotificationSender, CanonStateNotificationStream,
     CanonStateNotifications, CanonStateSubscriptions,

@@ -138,6 +138,9 @@ pub enum ProviderError {
     /// Persisted partial-state checkpoint validation failed.
     #[error(transparent)]
     PartialStateCheckpoint(Box<PartialStateCheckpointError>),
+    /// A partial-state read encountered unavailable or inconsistent retained data.
+    #[error(transparent)]
+    PartialStateRead(Box<PartialStateReadError>),
     /// Applying a BAL to persisted partial state failed validation.
     #[error(transparent)]
     PartialStateTransition(Box<PartialStateTransitionError>),
@@ -344,6 +347,31 @@ pub enum PartialStateCheckpointError {
 impl From<PartialStateCheckpointError> for ProviderError {
     fn from(error: PartialStateCheckpointError) -> Self {
         Self::PartialStateCheckpoint(Box::new(error))
+    }
+}
+
+/// Error returned when partial state cannot satisfy a bytecode read.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PartialStateReadError {
+    /// No tracked account at the checkpoint references this code hash.
+    #[error("bytecode hash {0} is not tracked at this partial-state checkpoint")]
+    CodeHashNotTracked(B256),
+    /// A tracked account references bytecode that is missing locally.
+    #[error("bytecode {0} is unavailable at this partial-state checkpoint")]
+    MissingBytecode(B256),
+    /// Stored bytecode does not match its account commitment.
+    #[error("partial-state bytecode hash mismatch: expected {expected}, computed {computed}")]
+    BytecodeHashMismatch {
+        /// Code hash committed to by the account.
+        expected: B256,
+        /// Hash of the locally stored code.
+        computed: B256,
+    },
+}
+
+impl From<PartialStateReadError> for ProviderError {
+    fn from(error: PartialStateReadError) -> Self {
+        Self::PartialStateRead(Box::new(error))
     }
 }
 
