@@ -9,7 +9,8 @@ use reth_node_api::{FullNodeComponents, NodePrimitives, PrimitivesTy};
 use reth_primitives_traits::{BlockTy, HeaderTy, ReceiptTy, TxTy};
 use reth_rpc_eth_types::EthStateCache;
 use reth_storage_api::{
-    BalProvider, BlockReader, BlockReaderIdExt, StageCheckpointReader, StateProviderFactory,
+    BalProvider, BlockReader, BlockReaderIdExt, ConfiguredContractFilter, StageCheckpointReader,
+    StateProviderFactory,
 };
 use reth_transaction_pool::{PoolTransaction, TransactionPool};
 
@@ -104,6 +105,11 @@ pub trait RpcNodeCoreExt: RpcNodeCore<Provider: BlockReader> {
     /// Returns `true` if partial-state mode is active for RPC availability checks.
     fn partial_state_enabled(&self) -> bool {
         false
+    }
+
+    /// The immutable filter whose identity must match the verified partial-state checkpoint.
+    fn partial_state_filter(&self) -> Option<&ConfiguredContractFilter> {
+        None
     }
 
     /// Returns `true` if storage and bytecode are available for this contract address.

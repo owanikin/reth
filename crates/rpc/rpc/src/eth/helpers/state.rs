@@ -1,5 +1,8 @@
 //! Contains RPC handler implementations specific to state.
 
+#[cfg(test)]
+mod partial_state;
+
 use crate::EthApi;
 use reth_rpc_convert::RpcConvert;
 use reth_rpc_eth_api::{
@@ -102,5 +105,19 @@ mod tests {
         let address = Address::random();
         let account = eth_api.get_account(address, Default::default()).await.unwrap();
         assert!(account.is_none());
+    }
+
+    #[tokio::test]
+    async fn partial_state_rpc_requires_provider_support() {
+        let eth_api: EthApi<_, EthRpcConverter<ChainSpec>> = EthApi::builder(
+            NoopProvider::default(),
+            testing_pool(),
+            NoopNetwork::default(),
+            EthEvmConfig::mainnet(),
+        )
+        .partial_state(true, [])
+        .build();
+        let err = eth_api.balance(Address::ZERO, None).await.unwrap_err();
+        assert!(matches!(err, EthApiError::PartialStateUnavailable(_)));
     }
 }

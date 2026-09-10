@@ -24,7 +24,9 @@ use reth_rpc_eth_types::{
     builder::config::PendingBlockKind, receipt::EthReceiptConverter, EthApiError, EthStateCache,
     FeeHistoryCache, GasCap, GasPriceOracle, PendingBlock,
 };
-use reth_storage_api::{noop::NoopProvider, BlockReaderIdExt, ProviderHeader};
+use reth_storage_api::{
+    noop::NoopProvider, BlockReaderIdExt, ConfiguredContractFilter, ContractFilter, ProviderHeader,
+};
 use reth_tasks::{
     pool::{BlockingTaskGuard, BlockingTaskPool},
     Runtime,
@@ -189,6 +191,10 @@ where
         self.inner.partial_state_enabled()
     }
 
+    fn partial_state_filter(&self) -> Option<&ConfiguredContractFilter> {
+        self.inner.partial_state_enabled().then_some(&self.inner.partial_state_filter)
+    }
+
     #[inline]
     fn is_partial_state_contract_tracked(&self, address: &Address) -> bool {
         self.inner.is_partial_state_contract_tracked(address)
@@ -300,7 +306,7 @@ pub struct EthApiInner<N: RpcNodeCore, Rpc: RpcConvert> {
     partial_state_enabled: bool,
 
     /// Contracts whose storage and bytecode are available in partial-state mode.
-    partial_state_tracked_contracts: BTreeSet<Address>,
+    partial_state_filter: ConfiguredContractFilter,
 }
 
 impl<N, Rpc> EthApiInner<N, Rpc>
@@ -378,7 +384,7 @@ where
             evm_memory_limit,
             force_blob_sidecar_upcasting,
             partial_state_enabled,
-            partial_state_tracked_contracts,
+            partial_state_filter: ConfiguredContractFilter::new(partial_state_tracked_contracts),
         }
     }
 }
@@ -413,7 +419,7 @@ where
 
     /// Returns true if storage and bytecode are available for this contract address.
     pub fn is_partial_state_contract_tracked(&self, address: &Address) -> bool {
-        !self.partial_state_enabled || self.partial_state_tracked_contracts.contains(address)
+        !self.partial_state_enabled || self.partial_state_filter.is_tracked(address)
     }
 
     /// Returns a handle to the pending block.

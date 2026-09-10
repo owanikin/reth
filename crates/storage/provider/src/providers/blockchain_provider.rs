@@ -11,7 +11,7 @@ use crate::{
     RocksDBProviderFactory, StageCheckpointReader, StateProviderBox, StateProviderFactory,
     StateReader, StaticFileProviderFactory, TransactionVariant, TransactionsProvider,
 };
-use alloy_consensus::transaction::TransactionMeta;
+use alloy_consensus::{transaction::TransactionMeta, BlockHeader};
 use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumHash, BlockNumberOrTag};
 use alloy_primitives::{Address, BlockHash, BlockNumber, TxHash, TxNumber, B256};
 use alloy_rpc_types_engine::ForkchoiceState;
@@ -28,10 +28,10 @@ use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{
-    BlockBodyIndicesProvider, ContractFilter, NodePrimitivesProvider, PartialStateRootProvider,
-    PartialStateSnapAccountRange, PartialStateSnapByteCodes, PartialStateSnapPivot,
-    PartialStateSnapProvider, PartialStateSnapStorageRanges, PartialStateSnapTrieNodes,
-    PartialStateSnapTriePath, StorageChangeSetReader,
+    BlockBodyIndicesProvider, ConfiguredContractFilter, ContractFilter, NodePrimitivesProvider,
+    PartialStateRootProvider, PartialStateSnapAccountRange, PartialStateSnapByteCodes,
+    PartialStateSnapPivot, PartialStateSnapProvider, PartialStateSnapStorageRanges,
+    PartialStateSnapTrieNodes, PartialStateSnapTriePath, StorageChangeSetReader,
 };
 use reth_storage_errors::provider::ProviderResult;
 use reth_trie::{HashedPostState, KeccakKeyHasher};
@@ -568,6 +568,48 @@ impl<N: NodeTypesWithDB> ChainSpecProvider for BlockchainProvider<N> {
 }
 
 impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
+    fn partial_state(
+        &self,
+        block_id: BlockId,
+        filter: &ConfiguredContractFilter,
+    ) -> ProviderResult<StateProviderBox> {
+        use reth_storage_errors::provider::PartialStateReadError;
+
+        if block_id.is_pending() {
+            return Err(PartialStateReadError::Unsupported("pending state").into())
+        }
+        let chain = self.consistent_provider()?;
+        let header = chain.sealed_header_by_id(block_id)?.ok_or_else(|| match block_id {
+            BlockId::Hash(hash) => ProviderError::HeaderNotFound(hash.block_hash.into()),
+            BlockId::Number(BlockNumberOrTag::Number(number)) => {
+                ProviderError::HeaderNotFound(number.into())
+            }
+            BlockId::Number(BlockNumberOrTag::Earliest) => {
+                ProviderError::HeaderNotFound(0u64.into())
+            }
+            BlockId::Number(BlockNumberOrTag::Safe) => ProviderError::SafeBlockNotFound,
+            BlockId::Number(BlockNumberOrTag::Finalized) => ProviderError::FinalizedBlockNotFound,
+            _ => ProviderError::BestBlockNotFound,
+        })?;
+        let pivot = PartialStateSnapPivot {
+            block_number: header.number(),
+            block_hash: header.hash(),
+            state_root: header.state_root(),
+        };
+        chain.ensure_canonical_block(pivot.block_number)?;
+        // A checkpoint awaiting reorg reconciliation must not be served as canonical state.
+        if chain.block_hash(pivot.block_number)? != Some(pivot.block_hash) {
+            return Err(ProviderError::StateForHashNotFound(pivot.block_hash))
+        }
+        let reader = self.database.partial_state_reader(pivot, filter)?;
+        let start = pivot.block_number.saturating_sub(256);
+        let hashes = chain.canonical_hashes_range(start, pivot.block_number)?;
+        if hashes.len() != (pivot.block_number - start) as usize {
+            return Err(PartialStateReadError::Unsupported("incomplete BLOCKHASH history").into())
+        }
+        Ok(Box::new(reader.with_block_hashes((start..pivot.block_number).zip(hashes))))
+    }
+
     /// Storage provider for latest block
     fn latest(&self) -> ProviderResult<StateProviderBox> {
         trace!(target: "providers::blockchain", "Getting latest block state provider");

@@ -113,6 +113,9 @@ pub enum EthApiError {
     /// Bytecode for this address is not available on a partial-state node.
     #[error("bytecode for address {0} is not tracked by this partial-state node")]
     CodeNotTracked(Address),
+    /// The requested state cannot be served from the verified partial-state checkpoint.
+    #[error("{0}")]
+    PartialStateUnavailable(String),
     /// An internal error where prevrandao is not set in the evm's environment
     #[error("prevrandao not in the EVM's environment after merge")]
     PrevrandaoNotSet,
@@ -324,6 +327,9 @@ impl From<EthApiError> for jsonrpsee_types::error::ErrorObject<'static> {
             ),
             EthApiError::StorageNotTracked(_) => rpc_error_with_code(-32001, error.to_string()),
             EthApiError::CodeNotTracked(_) => rpc_error_with_code(-32002, error.to_string()),
+            EthApiError::PartialStateUnavailable(_) => {
+                rpc_error_with_code(-32003, error.to_string())
+            }
             err @ EthApiError::TransactionConfirmationTimeout { .. } => rpc_error_with_code(
                 EthRpcErrorCode::TransactionConfirmationTimeout.code(),
                 err.to_string(),
@@ -526,6 +532,10 @@ impl From<reth_errors::ProviderError> for EthApiError {
             ProviderError::BlockExpired { .. } => Self::PrunedHistoryUnavailable,
             ProviderError::StorageNotTracked(address) => Self::StorageNotTracked(address),
             ProviderError::CodeNotTracked(address) => Self::CodeNotTracked(address),
+            ProviderError::PartialStateCheckpoint(err) => {
+                Self::PartialStateUnavailable(err.to_string())
+            }
+            ProviderError::PartialStateRead(err) => Self::PartialStateUnavailable(err.to_string()),
             err => Self::Internal(err.into()),
         }
     }
@@ -1242,6 +1252,12 @@ mod tests {
 
         let err: EthApiError = reth_errors::ProviderError::CodeNotTracked(address).into();
         assert!(matches!(err, EthApiError::CodeNotTracked(addr) if addr == address));
+
+        let err: jsonrpsee_types::error::ErrorObject<'static> =
+            EthApiError::PartialStateUnavailable("partial-state checkpoint is unavailable".into())
+                .into();
+        assert_eq!(err.code(), -32003);
+        assert!(err.message().contains("checkpoint is unavailable"));
     }
 
     #[test]

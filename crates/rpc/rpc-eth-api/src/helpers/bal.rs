@@ -7,7 +7,6 @@ use reth_errors::RethError;
 use reth_evm::{block::BlockExecutor, ConfigureEvm, Evm};
 use reth_revm::{database::StateProviderDatabase, State};
 use reth_rpc_eth_types::{error::FromEthApiError, EthApiError};
-use reth_storage_api::StateProviderFactory;
 
 use crate::{
     helpers::{Call, LoadBlock, Trace},
@@ -34,10 +33,7 @@ pub trait GetBlockAccessList: Trace + Call + LoadBlock + RpcNodeCoreExt {
             }
 
             self.spawn_blocking_io(move |eth_api| {
-                let state = eth_api
-                    .provider()
-                    .state_by_block_id(block.parent_hash().into())
-                    .map_err(Self::Error::from_eth_err)?;
+                let state = eth_api.state_at_hash(block.parent_hash())?;
 
                 let state = eth_api.state_provider_for_rpc_execution(state);
                 let mut db = State::builder()

@@ -350,9 +350,12 @@ impl From<PartialStateCheckpointError> for ProviderError {
     }
 }
 
-/// Error returned when partial state cannot satisfy a bytecode read.
+/// Error returned when a partial-state snapshot cannot satisfy a read.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PartialStateReadError {
+    /// The snapshot cannot supply the requested operation without unavailable state.
+    #[error("{0} is not supported by the partial-state checkpoint reader")]
+    Unsupported(&'static str),
     /// No tracked account at the checkpoint references this code hash.
     #[error("bytecode hash {0} is not tracked at this partial-state checkpoint")]
     CodeHashNotTracked(B256),

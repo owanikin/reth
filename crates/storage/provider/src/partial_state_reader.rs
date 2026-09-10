@@ -4,17 +4,24 @@ use crate::{
     DatabaseProviderRO, ProviderFactory,
 };
 use alloy_consensus::constants::{EMPTY_ROOT_HASH, KECCAK_EMPTY};
-use alloy_primitives::{keccak256, Address, StorageKey, StorageValue, B256};
+use alloy_primitives::{keccak256, Address, BlockNumber, Bytes, StorageKey, StorageValue, B256};
 use reth_db_api::{cursor::DbDupCursorRO, tables, transaction::DbTx};
 use reth_primitives_traits::{Account, Bytecode};
 use reth_storage_api::{
-    AccountReader, BytecodeReader, ConfiguredContractFilter, ContractFilter,
-    DatabaseProviderFactory, PartialStateCheckpoint, PartialStateSnapPivot,
+    AccountReader, BlockHashReader, BytecodeReader, ConfiguredContractFilter, ContractFilter,
+    DatabaseProviderFactory, HashedPostStateProvider, PartialStateCheckpoint,
+    PartialStateSnapPivot, StateProofProvider, StateProvider, StateRootProvider,
+    StorageRootProvider,
 };
 use reth_storage_errors::provider::{
     PartialStateCheckpointError, PartialStateReadError, ProviderError, ProviderResult,
 };
-use std::collections::BTreeSet;
+use reth_trie_common::{
+    updates::TrieUpdates, AccountProof, ExecutionWitnessMode, HashedPostState, HashedStorage,
+    KeccakKeyHasher, MultiProof, MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
+};
+use revm_database::BundleState;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Reads accounts, storage, and bytecode at a completed partial-state checkpoint.
 ///
@@ -32,6 +39,8 @@ pub struct PartialStateReader<N: ProviderNodeTypes> {
     checkpoint: PartialStateCheckpoint,
     filter: ConfiguredContractFilter,
     tracked_code_hashes: BTreeSet<B256>,
+    /// Recent canonical hashes captured by the factory, never read from a moving head.
+    block_hashes: BTreeMap<BlockNumber, B256>,
 }
 
 impl<N: ProviderNodeTypes> PartialStateReader<N> {
@@ -56,7 +65,21 @@ impl<N: ProviderNodeTypes> PartialStateReader<N> {
             }
         }
 
-        Ok(Self { provider, checkpoint, filter, tracked_code_hashes })
+        Ok(Self {
+            provider,
+            checkpoint,
+            filter,
+            tracked_code_hashes,
+            block_hashes: BTreeMap::from([(expected.block_number, expected.block_hash)]),
+        })
+    }
+
+    pub(crate) fn with_block_hashes(
+        mut self,
+        hashes: impl IntoIterator<Item = (BlockNumber, B256)>,
+    ) -> Self {
+        self.block_hashes.extend(hashes);
+        self
     }
 
     /// Returns the verified block, root, and filter identity represented by this snapshot.
@@ -163,13 +186,141 @@ impl<N: ProviderNodeTypes> BytecodeReader for PartialStateReader<N> {
 impl<N: ProviderNodeTypes> ProviderFactory<N> {
     /// Opens a partial-state snapshot only if its complete checkpoint matches `expected` and
     /// `filter`. The caller must select the desired block explicitly; a lagging checkpoint is not
-    /// silently substituted for the requested state. RPC and normal state providers are unchanged.
+    /// silently substituted for the requested state. Only the checkpoint's own block hash is
+    /// available here; [`crate::providers::BlockchainProvider`] also captures its recent canonical
+    /// hashes.
     pub fn partial_state_reader(
         &self,
         expected: PartialStateSnapPivot,
         filter: &ConfiguredContractFilter,
     ) -> ProviderResult<PartialStateReader<N>> {
         PartialStateReader::new(self.database_provider_ro()?, expected, filter.clone())
+    }
+}
+
+impl<N: ProviderNodeTypes> StateProvider for PartialStateReader<N> {
+    fn storage(&self, address: Address, key: StorageKey) -> ProviderResult<Option<StorageValue>> {
+        Self::storage(self, address, key)
+    }
+
+    fn account_code(&self, address: &Address) -> ProviderResult<Option<Bytecode>> {
+        Self::account_code(self, address)
+    }
+}
+
+impl<N: ProviderNodeTypes> BlockHashReader for PartialStateReader<N> {
+    fn block_hash(&self, number: BlockNumber) -> ProviderResult<Option<B256>> {
+        if number > self.checkpoint.pivot.block_number {
+            return Ok(None)
+        }
+        self.block_hashes
+            .get(&number)
+            .copied()
+            .map(Some)
+            .ok_or_else(|| ProviderError::HeaderNotFound(number.into()))
+    }
+
+    fn canonical_hashes_range(
+        &self,
+        start: BlockNumber,
+        end: BlockNumber,
+    ) -> ProviderResult<Vec<B256>> {
+        (start..end)
+            .map(|number| {
+                self.block_hash(number).and_then(|hash| {
+                    hash.ok_or_else(|| ProviderError::HeaderNotFound(number.into()))
+                })
+            })
+            .collect()
+    }
+}
+
+impl<N: ProviderNodeTypes> HashedPostStateProvider for PartialStateReader<N> {
+    fn hashed_post_state(&self, state: &BundleState) -> HashedPostState {
+        HashedPostState::from_bundle_state::<KeccakKeyHasher>(state.state())
+    }
+}
+
+// Full-state trie providers cannot be used here: their nodes need not describe this checkpoint.
+impl<N: ProviderNodeTypes> StateRootProvider for PartialStateReader<N> {
+    fn state_root(&self, state: HashedPostState) -> ProviderResult<B256> {
+        if state.is_empty() {
+            return Ok(self.checkpoint.pivot.state_root)
+        }
+        Err(PartialStateReadError::Unsupported("state root with an execution overlay").into())
+    }
+
+    fn state_root_from_nodes(&self, _input: TrieInput) -> ProviderResult<B256> {
+        Err(PartialStateReadError::Unsupported("state root from trie nodes").into())
+    }
+
+    fn state_root_with_updates(
+        &self,
+        _state: HashedPostState,
+    ) -> ProviderResult<(B256, TrieUpdates)> {
+        Err(PartialStateReadError::Unsupported("state root with trie updates").into())
+    }
+
+    fn state_root_from_nodes_with_updates(
+        &self,
+        _input: TrieInput,
+    ) -> ProviderResult<(B256, TrieUpdates)> {
+        Err(PartialStateReadError::Unsupported("state root with trie updates").into())
+    }
+}
+
+impl<N: ProviderNodeTypes> StorageRootProvider for PartialStateReader<N> {
+    fn storage_root(&self, address: Address, storage: HashedStorage) -> ProviderResult<B256> {
+        if storage.is_empty() {
+            return Ok(self.account_storage_root(&address)?.unwrap_or(EMPTY_ROOT_HASH))
+        }
+        Err(PartialStateReadError::Unsupported("storage root with an execution overlay").into())
+    }
+
+    fn storage_proof(
+        &self,
+        _address: Address,
+        _slot: B256,
+        _storage: HashedStorage,
+    ) -> ProviderResult<StorageProof> {
+        Err(PartialStateReadError::Unsupported("storage proofs").into())
+    }
+
+    fn storage_multiproof(
+        &self,
+        _address: Address,
+        _slots: &[B256],
+        _storage: HashedStorage,
+    ) -> ProviderResult<StorageMultiProof> {
+        Err(PartialStateReadError::Unsupported("storage proofs").into())
+    }
+}
+
+impl<N: ProviderNodeTypes> StateProofProvider for PartialStateReader<N> {
+    fn proof(
+        &self,
+        _input: TrieInput,
+        _address: Address,
+        _slots: &[B256],
+    ) -> ProviderResult<AccountProof> {
+        Err(PartialStateReadError::Unsupported("account proofs").into())
+    }
+
+    fn multiproof(
+        &self,
+        _input: TrieInput,
+        _targets: MultiProofTargets,
+    ) -> ProviderResult<MultiProof> {
+        Err(PartialStateReadError::Unsupported("account proofs").into())
+    }
+
+    fn witness(
+        &self,
+        _input: TrieInput,
+        _target: HashedPostState,
+        _mode: ExecutionWitnessMode,
+    ) -> ProviderResult<Vec<Bytes>> {
+        Err(PartialStateReadError::Unsupported("execution witnesses").into())
     }
 }
 
@@ -198,6 +349,23 @@ mod tests {
     const SLOT: B256 = B256::repeat_byte(0x11);
     const CODE: &[u8] = &[0x60, 0x01];
     const UNTRACKED_CODE: &[u8] = &[0x60, 0x02];
+
+    #[test]
+    fn state_provider_exposes_commitments_but_rejects_unavailable_trie_data() {
+        let (factory, filter, pivot) = setup();
+        let reader = factory.partial_state_reader(pivot, &filter).unwrap();
+        assert_eq!(reader.state_root(HashedPostState::default()).unwrap(), pivot.state_root);
+        assert_eq!(
+            reader.storage_root(UNTRACKED, HashedStorage::default()).unwrap(),
+            reader.account_storage_root(&UNTRACKED).unwrap().unwrap()
+        );
+        assert!(reader.storage_root(TRACKED, HashedStorage::new(true)).is_err());
+        assert!(reader.state_root_with_updates(HashedPostState::default()).is_err());
+        assert!(reader.proof(TrieInput::default(), TRACKED, &[]).is_err());
+        assert_eq!(reader.block_hash(pivot.block_number).unwrap(), Some(pivot.block_hash));
+        assert!(reader.block_hash(pivot.block_number - 1).is_err());
+        assert_eq!(reader.block_hash(pivot.block_number + 1).unwrap(), None);
+    }
 
     fn accounts() -> [(Address, TrieAccount); 4] {
         [

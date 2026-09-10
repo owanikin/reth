@@ -1,6 +1,6 @@
 use super::{
-    AccountReader, BlockHashReader, BlockIdReader, StateProofProvider, StateRootProvider,
-    StorageRootProvider,
+    AccountReader, BlockHashReader, BlockIdReader, ConfiguredContractFilter, StateProofProvider,
+    StateRootProvider, StorageRootProvider,
 };
 use alloc::boxed::Box;
 use alloy_consensus::constants::KECCAK_EMPTY;
@@ -9,7 +9,7 @@ use alloy_primitives::{Address, BlockHash, BlockNumber, StorageKey, StorageValue
 use auto_impl::auto_impl;
 use reth_execution_types::ExecutionOutcome;
 use reth_primitives_traits::Bytecode;
-use reth_storage_errors::provider::ProviderResult;
+use reth_storage_errors::provider::{PartialStateReadError, ProviderResult};
 use reth_trie_common::HashedPostState;
 use revm_database::BundleState;
 
@@ -142,6 +142,18 @@ pub trait TryIntoHistoricalStateProvider {
 /// to be used, since block `n` was executed on its parent block's state.
 #[auto_impl(&, Box, Arc)]
 pub trait StateProviderFactory: BlockIdReader + Send {
+    /// Opens the completed partial-state checkpoint for the requested canonical block and filter.
+    ///
+    /// Implementations must reject unavailable state, including a checkpoint that lags the
+    /// requested block. They must not substitute full, pending, or different checkpoint state.
+    fn partial_state(
+        &self,
+        _block_id: BlockId,
+        _filter: &ConfiguredContractFilter,
+    ) -> ProviderResult<StateProviderBox> {
+        Err(PartialStateReadError::Unsupported("checkpoint state access on this provider").into())
+    }
+
     /// Storage provider for latest block.
     fn latest(&self) -> ProviderResult<StateProviderBox>;
 
