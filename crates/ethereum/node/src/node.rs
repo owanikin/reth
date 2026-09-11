@@ -536,6 +536,11 @@ where
 
         let validator =
             TransactionValidationTaskExecutor::eth_builder(ctx.provider().clone(), evm_config)
+                .with_partial_state_filter(
+                    ctx.partial_state_config()
+                        .is_enabled()
+                        .then(|| ctx.partial_state_config().contract_filter()),
+                )
                 .set_eip4844(!blobs_disabled)
                 .kzg_settings(ctx.kzg_settings()?)
                 .with_max_tx_input_bytes(ctx.config().txpool.max_tx_input_bytes)
@@ -561,7 +566,7 @@ where
             .with_validator(validator)
             .build_and_spawn_maintenance_task(blob_store, pool_config)?;
 
-        info!(target: "reth::cli", "Transaction pool initialized");
+        info!(target: "reth::cli", partial_state = ctx.partial_state_config().is_enabled(), "Transaction pool initialized");
         debug!(target: "reth::cli", "Spawned txpool maintenance task");
 
         Ok(transaction_pool)

@@ -790,6 +790,11 @@ impl<Node: FullNodeTypes> BuilderContext<Node> {
         &self.config_container.toml_config
     }
 
+    /// Returns partial-state settings after merging CLI, TOML, and the contracts file.
+    pub const fn partial_state_config(&self) -> &reth_node_core::args::PartialStateConfig {
+        &self.config_container.partial_state
+    }
+
     /// Returns the executor of the node.
     ///
     /// This can be used to execute async tasks or functions during the setup.

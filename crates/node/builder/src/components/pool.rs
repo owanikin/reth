@@ -286,6 +286,10 @@ where
             chain_events,
             ctx.task_executor().clone(),
             reth_transaction_pool::maintain::MaintainPoolConfig {
+                partial_state_filter: ctx
+                    .partial_state_config()
+                    .is_enabled()
+                    .then(|| ctx.partial_state_config().contract_filter()),
                 max_tx_lifetime: pool_config.max_queued_lifetime,
                 no_local_exemptions: pool_config.local_transactions_config.no_exemptions,
                 ..Default::default()

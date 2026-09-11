@@ -10536,6 +10536,7 @@ dependencies = [
  "rand 0.9.4",
  "reth-chain-state",
  "reth-chainspec",
+ "reth-db-api",
  "reth-eth-wire-types",
  "reth-ethereum-primitives",
  "reth-evm",

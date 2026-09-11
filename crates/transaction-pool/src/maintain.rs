@@ -26,7 +26,10 @@ use reth_fs_util::FsPathError;
 use reth_primitives_traits::{
     transaction::signed::SignedTransaction, NodePrimitives, SealedHeader,
 };
-use reth_storage_api::{errors::provider::ProviderError, BlockReaderIdExt, StateProviderFactory};
+use reth_storage_api::{
+    errors::provider::ProviderError, BlockReaderIdExt, ConfiguredContractFilter,
+    StateProviderFactory,
+};
 use reth_tasks::Runtime;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -45,8 +48,10 @@ use tracing::{debug, error, info, trace, warn};
 pub const MAX_QUEUED_TRANSACTION_LIFETIME: Duration = Duration::from_secs(3 * 60 * 60);
 
 /// Additional settings for maintaining the transaction pool
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaintainPoolConfig {
+    /// Read account reloads from the matching partial checkpoint, without full-state fallback.
+    pub partial_state_filter: Option<ConfiguredContractFilter>,
     /// Maximum (reorg) depth we handle when updating the transaction pool: `new.number -
     /// last_seen.number`
     ///
@@ -72,6 +77,7 @@ pub struct MaintainPoolConfig {
 impl Default for MaintainPoolConfig {
     fn default() -> Self {
         Self {
+            partial_state_filter: None,
             max_update_depth: 64,
             max_reload_accounts: 100,
             max_tx_lifetime: MAX_QUEUED_TRANSACTION_LIFETIME,
@@ -204,6 +210,7 @@ pub async fn maintain_transaction_pool<N, Client, P, St>(
             let (tx, rx) = oneshot::channel();
             let c = client.clone();
             let at = pool_info.last_seen_block_hash;
+            let filter = config.partial_state_filter.clone();
             let fut = if dirty_addresses.len() > max_reload_accounts {
                 // need to chunk accounts to reload
                 let accs_to_reload =
@@ -213,7 +220,7 @@ pub async fn maintain_transaction_pool<N, Client, P, St>(
                     dirty_addresses.remove(acc);
                 }
                 async move {
-                    let res = load_accounts(c, at, accs_to_reload);
+                    let res = load_accounts(c, at, accs_to_reload, filter.as_ref());
                     let _ = tx.send(res);
                 }
                 .boxed()
@@ -221,12 +228,23 @@ pub async fn maintain_transaction_pool<N, Client, P, St>(
                 // can fetch all dirty accounts at once
                 let accs_to_reload = std::mem::take(&mut dirty_addresses);
                 async move {
-                    let res = load_accounts(c, at, accs_to_reload);
+                    let res = load_accounts(c, at, accs_to_reload, filter.as_ref());
                     let _ = tx.send(res);
                 }
                 .boxed()
             };
-            reload_accounts_fut = rx.fuse();
+            let partial = config.partial_state_filter.is_some();
+            reload_accounts_fut = async move {
+                let res = rx.await;
+                // Canonical notifications can arrive before the partial checkpoint is committed.
+                // Back off rather than continuously spawning failing database reloads.
+                if partial && !matches!(&res, Ok(Ok(loaded)) if loaded.failed_to_load.is_empty()) {
+                    time::sleep(Duration::from_millis(250)).await;
+                }
+                (at, res)
+            }
+            .boxed()
+            .fuse();
             task_spawner.spawn_blocking_task(fut);
         }
 
@@ -294,6 +312,24 @@ pub async fn maintain_transaction_pool<N, Client, P, St>(
             }
         }
         // handle the result of the account reload
+        // A reload may finish after a newer commit/reorg notification. Never apply that stale
+        // snapshot to the new pool head; schedule those accounts for another reload instead.
+        let reloaded = reloaded.and_then(|(at, res)| {
+            if config.partial_state_filter.is_some() && at != pool.block_info().last_seen_block_hash
+            {
+                match res {
+                    Ok(Ok(loaded)) => {
+                        dirty_addresses.extend(loaded.accounts.into_iter().map(|acc| acc.address));
+                        dirty_addresses.extend(loaded.failed_to_load);
+                    }
+                    Ok(Err(err)) => dirty_addresses.extend(err.0),
+                    Err(_) => maintained_state = MaintainedPoolState::Drifted,
+                }
+                None
+            } else {
+                Some(res)
+            }
+        });
         match reloaded {
             Some(Ok(Ok(LoadedAccounts { accounts, failed_to_load }))) => {
                 // reloaded accounts successfully
@@ -354,26 +390,30 @@ pub async fn maintain_transaction_pool<N, Client, P, St>(
                     .filter(|addr| !new_changed_accounts.contains(addr));
 
                 // for these we need to fetch the nonce+balance from the db at the new tip
-                let mut changed_accounts =
-                    match load_accounts(client.clone(), new_tip.hash(), missing_changed_acc) {
-                        Ok(LoadedAccounts { accounts, failed_to_load }) => {
-                            // extend accounts we failed to load from database
-                            dirty_addresses.extend(failed_to_load);
+                let mut changed_accounts = match load_accounts(
+                    client.clone(),
+                    new_tip.hash(),
+                    missing_changed_acc,
+                    config.partial_state_filter.as_ref(),
+                ) {
+                    Ok(LoadedAccounts { accounts, failed_to_load }) => {
+                        // extend accounts we failed to load from database
+                        dirty_addresses.extend(failed_to_load);
 
-                            accounts
-                        }
-                        Err(err) => {
-                            let (addresses, err) = *err;
-                            debug!(
-                                target: "txpool",
-                                %err,
-                                "failed to load missing changed accounts at new tip: {:?}",
-                                new_tip.hash()
-                            );
-                            dirty_addresses.extend(addresses);
-                            vec![]
-                        }
-                    };
+                        accounts
+                    }
+                    Err(err) => {
+                        let (addresses, err) = *err;
+                        debug!(
+                            target: "txpool",
+                            %err,
+                            "failed to load missing changed accounts at new tip: {:?}",
+                            new_tip.hash()
+                        );
+                        dirty_addresses.extend(addresses);
+                        vec![]
+                    }
+                };
 
                 // also include all accounts from new chain
                 // we can use extend here because they are unique
@@ -667,6 +707,7 @@ fn load_accounts<Client, I>(
     client: Client,
     at: BlockHash,
     addresses: I,
+    partial_state_filter: Option<&ConfiguredContractFilter>,
 ) -> Result<LoadedAccounts, Box<(AddressSet, ProviderError)>>
 where
     I: IntoIterator<Item = Address>,
@@ -674,7 +715,11 @@ where
 {
     let addresses = addresses.into_iter();
     let mut res = LoadedAccounts::default();
-    let state = match client.history_by_block_hash(at) {
+    let provider = match partial_state_filter {
+        Some(filter) => client.partial_state(at.into(), filter),
+        None => client.history_by_block_hash(at),
+    };
+    let state = match provider {
         Ok(state) => state,
         Err(err) => return Err(Box::new((addresses.collect(), err))),
     };
@@ -863,6 +908,28 @@ mod tests {
     use reth_fs_util as fs;
     use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
     use reth_tasks::Runtime;
+
+    #[test]
+    fn partial_state_txpool_account_reload_does_not_fall_back_to_full_state() {
+        let provider = MockEthProvider::default().with_genesis_block();
+        let address = Address::repeat_byte(1);
+        provider.add_account(address, ExtendedAccount::new(7, U256::from(100)));
+        let full = load_accounts(provider.clone(), BlockHash::ZERO, [address], None).unwrap();
+        assert_eq!(full.accounts[0].nonce, 7);
+        assert_eq!(full.accounts[0].balance, U256::from(100));
+
+        // A provider without checkpoint support must fail even when full state is readable.
+        let err = load_accounts(
+            provider,
+            BlockHash::ZERO,
+            [address],
+            Some(&ConfiguredContractFilter::default()),
+        )
+        .err()
+        .expect("partial state is unsupported");
+        assert!(err.0.contains(&address));
+        assert!(matches!(err.1, ProviderError::PartialStateRead(_)), "{err:?}");
+    }
 
     #[test]
     fn changed_acc_entry() {

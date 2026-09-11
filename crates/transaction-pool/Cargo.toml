@@ -65,6 +65,7 @@ proptest = { workspace = true, optional = true }
 proptest-arbitrary-interop = { workspace = true, optional = true }
 
 [dev-dependencies]
+reth-db-api.workspace = true
 reth-provider = { workspace = true, features = ["test-utils"] }
 reth-tracing.workspace = true
 alloy-primitives = { workspace = true, features = ["rand"] }

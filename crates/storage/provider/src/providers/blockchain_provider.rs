@@ -603,7 +603,12 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
         }
         let reader = self.database.partial_state_reader(pivot, filter)?;
         let start = pivot.block_number.saturating_sub(256);
-        let hashes = chain.canonical_hashes_range(start, pivot.block_number)?;
+        // Genesis has no ancestor hashes. The range provider expects a nonempty range.
+        let hashes = if pivot.block_number == 0 {
+            Vec::new()
+        } else {
+            chain.canonical_hashes_range(start, pivot.block_number)?
+        };
         if hashes.len() != (pivot.block_number - start) as usize {
             return Err(PartialStateReadError::Unsupported("incomplete BLOCKHASH history").into())
         }

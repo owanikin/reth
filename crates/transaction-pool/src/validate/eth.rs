@@ -1,5 +1,8 @@
 //! Ethereum transaction validator.
 
+#[cfg(test)]
+mod partial_state;
+
 use super::constants::DEFAULT_MAX_TX_INPUT_BYTES;
 use crate::{
     blobstore::BlobStore,
@@ -31,7 +34,10 @@ use reth_primitives_traits::{
     transaction::error::InvalidTransactionError, Account, BlockTy, GotExpected, HeaderTy,
     SealedBlock,
 };
-use reth_storage_api::{AccountInfoReader, BlockReaderIdExt, BytecodeReader, StateProviderFactory};
+use reth_storage_api::{
+    AccountInfoReader, BlockReaderIdExt, BytecodeReader, ConfiguredContractFilter,
+    StateProviderFactory,
+};
 use reth_tasks::Runtime;
 use revm::context_interface::Cfg;
 use revm_primitives::U256;
@@ -79,6 +85,8 @@ type StatefulValidationFn<T> = Arc<
 pub struct EthTransactionValidator<Client, T, Evm> {
     /// This type fetches account info from the db
     client: Client,
+    /// Restricts stateful admission checks to the verified canonical partial checkpoint.
+    partial_state_filter: Option<ConfiguredContractFilter>,
     /// Blobstore used for fetching re-injected blob transactions.
     blob_store: Box<dyn BlobStore>,
     /// tracks activated forks relevant for transaction validation
@@ -130,6 +138,7 @@ pub struct EthTransactionValidator<Client, T, Evm> {
 impl<Client, Tx, Evm> fmt::Debug for EthTransactionValidator<Client, Tx, Evm> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EthTransactionValidator")
+            .field("partial_state_filter", &self.partial_state_filter)
             .field("fork_tracker", &self.fork_tracker)
             .field("eip2718", &self.eip2718)
             .field("eip1559", &self.eip1559)
@@ -338,12 +347,17 @@ where
     /// which can improve performance when validating many transactions.
     ///
     /// If `state` is `None`, a new state provider will be created.
+    /// In partial mode, caller-supplied caches are discarded: they cannot establish that the
+    /// snapshot belongs to the current canonical checkpoint and configured filter.
     pub fn validate_one_with_state(
         &self,
         origin: TransactionOrigin,
         transaction: Tx,
         state: &mut Option<Box<dyn AccountInfoReader + Send>>,
     ) -> TransactionValidationOutcome<Tx> {
+        if self.partial_state_filter.is_some() {
+            *state = None;
+        }
         self.validate_one_with_provider(origin, transaction, state)
     }
 
@@ -361,7 +375,11 @@ where
                 // stateless checks passed, pass transaction down stateful validation pipeline
                 // If we don't have a state provider yet, fetch the latest state
                 if maybe_state.is_none() {
-                    match self.client.latest() {
+                    let provider = match &self.partial_state_filter {
+                        Some(filter) => self.client.partial_state(BlockId::latest(), filter),
+                        None => self.client.latest(),
+                    };
+                    match provider {
                         Ok(new_state) => {
                             *maybe_state = Some(Box::new(new_state));
                         }
@@ -376,7 +394,7 @@ where
 
                 let state = maybe_state.as_deref().expect("provider is set");
 
-                self.validate_stateful(origin, transaction, state)
+                self.validate_stateful_with_provider(origin, transaction, state)
             }
             Err(err) => TransactionValidationOutcome::Invalid(transaction, err),
         }
@@ -384,12 +402,16 @@ where
 
     /// Validates a single transaction against the given state provider, performing both
     /// [stateless](Self::validate_stateless) and [stateful](Self::validate_stateful) checks.
+    /// In partial mode the supplied provider is ignored in favor of a verified checkpoint.
     pub fn validate_one_with_state_provider(
         &self,
         origin: TransactionOrigin,
         transaction: Tx,
         state: impl AccountInfoReader,
     ) -> TransactionValidationOutcome<Tx> {
+        if self.partial_state_filter.is_some() {
+            return self.validate_one(origin, transaction)
+        }
         if let Err(err) = self.validate_stateless(origin, &transaction) {
             return TransactionValidationOutcome::Invalid(transaction, err);
         }
@@ -594,7 +616,24 @@ where
     ///
     /// Checks sender account balance, nonce, bytecode, and validates blob sidecars. The
     /// transaction must have already passed [`validate_stateless`](Self::validate_stateless).
+    /// In partial mode the supplied provider is ignored and the transaction is checked against
+    /// a fresh verified canonical checkpoint, including stateless checks.
     pub fn validate_stateful<P>(
+        &self,
+        origin: TransactionOrigin,
+        transaction: Tx,
+        state: P,
+    ) -> TransactionValidationOutcome<Tx>
+    where
+        P: AccountInfoReader,
+    {
+        if self.partial_state_filter.is_some() {
+            return self.validate_one(origin, transaction)
+        }
+        self.validate_stateful_with_provider(origin, transaction, state)
+    }
+
+    fn validate_stateful_with_provider<P>(
         &self,
         origin: TransactionOrigin,
         mut transaction: Tx,
@@ -954,6 +993,8 @@ where
 #[derive(Debug)]
 pub struct EthTransactionValidatorBuilder<Client, Evm> {
     client: Client,
+    /// Optional partial-state policy for transaction admission.
+    partial_state_filter: Option<ConfiguredContractFilter>,
     /// The EVM configuration to use for validation.
     evm_config: Evm,
     /// Fork indicator whether we are in the Shanghai stage.
@@ -1036,6 +1077,7 @@ impl<Client, Evm> EthTransactionValidatorBuilder<Client, Evm> {
         Self {
             block_gas_limit: ETHEREUM_BLOCK_GAS_LIMIT_30M.into(),
             client,
+            partial_state_filter: None,
             evm_config,
             minimum_priority_fee: None,
             additional_tasks: 1,
@@ -1084,6 +1126,14 @@ impl<Client, Evm> EthTransactionValidatorBuilder<Client, Evm> {
     /// Disables the Cancun fork.
     pub const fn no_cancun(self) -> Self {
         self.set_cancun(false)
+    }
+
+    /// Uses only verified partial checkpoints for stateful admission checks when enabled.
+    /// Missing checkpoints or required sender code produce validation errors, never a full-state
+    /// fallback. Recipient code and storage are not required for transaction admission.
+    pub fn with_partial_state_filter(mut self, filter: Option<ConfiguredContractFilter>) -> Self {
+        self.partial_state_filter = filter;
+        self
     }
 
     /// Whether to allow exemptions for local transaction exemptions.
@@ -1262,6 +1312,7 @@ impl<Client, Evm> EthTransactionValidatorBuilder<Client, Evm> {
     {
         let Self {
             client,
+            partial_state_filter,
             evm_config,
             shanghai,
             cancun,
@@ -1301,6 +1352,7 @@ impl<Client, Evm> EthTransactionValidatorBuilder<Client, Evm> {
 
         EthTransactionValidator {
             client,
+            partial_state_filter,
             eip2718,
             eip1559,
             fork_tracker,
