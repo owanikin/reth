@@ -19,7 +19,7 @@ use reth_storage_api::{
     errors::provider::ProviderError, AllowAllContractFilter, ContractFilter,
     PartialStateResolvedAccounts, PartialStateRootProvider, PartialStateSnapWriter,
 };
-use reth_trie_common::TrieAccount;
+use reth_trie_common::{proof::verify_proof, Nibbles, TrieAccount};
 use std::{
     collections::VecDeque,
     pin::Pin,
@@ -176,13 +176,24 @@ pub enum PartialStateAccountResolverError {
         /// RLP decoding error.
         source: alloy_rlp::Error,
     },
+    /// The account inclusion or absence proof does not match the requested child root.
+    #[error("invalid snap account proof for {account_hash} at root {state_root}: {source}")]
+    InvalidProof {
+        /// Account hash being resolved.
+        account_hash: B256,
+        /// Requested child state root.
+        state_root: B256,
+        /// Proof verification error.
+        source: reth_trie_common::proof::ProofVerificationError,
+    },
 }
 
 /// Resolves post-state account leaves required to apply a BAL to partial state.
 ///
 /// Only untracked accounts with storage changes need resolution: their new storage-root
-/// commitment cannot be derived without the intentionally omitted storage trie. The transition's
-/// final state-root check authenticates these returned leaves against `state_root`.
+/// commitment cannot be derived without the intentionally omitted storage trie. Inclusion and
+/// absence proofs are checked against `state_root` before returning any commitments. The caller
+/// must still verify the BAL and the complete resulting partial-state root before committing it.
 pub async fn resolve_partial_state_accounts<C>(
     client: &C,
     state_root: B256,
@@ -210,23 +221,31 @@ where
             limit_hash: account_hash,
             response_bytes: DEFAULT_PARTIAL_STATE_SNAP_RESPONSE_BYTES,
         };
-        let response = client.get_account_range_with_priority(request, Priority::High).await?;
-        let (_, response) = response.split();
+        let response = request_partial_state_commitment(client, request).await?;
+        let (peer, response) = response.split();
         let SnapResponse::AccountRange(response) = response else {
             return Err(PartialStateAccountResolverError::UnexpectedResponse { account_hash })
         };
 
         let account = match response.accounts.as_slice() {
-            [] if response.proof.is_empty() => {
+            [] if response.proof.is_empty() && state_root != EMPTY_ROOT_HASH => {
                 return Err(PartialStateAccountResolverError::UnprovenAccountAbsence {
                     account_hash,
                 })
             }
             [] => None,
             [account] if account.hash == account_hash => {
-                Some(TrieAccount::decode(&mut account.body.as_ref()).map_err(|source| {
+                let mut body = account.body.as_ref();
+                let decoded = TrieAccount::decode(&mut body).map_err(|source| {
                     PartialStateAccountResolverError::AccountDecode { account_hash, source }
-                })?)
+                })?;
+                if !body.is_empty() {
+                    return Err(PartialStateAccountResolverError::AccountDecode {
+                        account_hash,
+                        source: alloy_rlp::Error::UnexpectedLength,
+                    })
+                }
+                Some(decoded)
             }
             accounts => {
                 return Err(PartialStateAccountResolverError::InvalidAccountRange {
@@ -235,9 +254,48 @@ where
                 })
             }
         };
+        verify_proof(
+            state_root,
+            Nibbles::unpack(account_hash),
+            account.map(alloy_rlp::encode),
+            &response.proof,
+        )
+        .map_err(|source| {
+            client.report_bad_message(peer);
+            PartialStateAccountResolverError::InvalidProof { account_hash, state_root, source }
+        })?;
         resolved.insert(address, account);
     }
     Ok(resolved)
+}
+
+/// Peers can lag a canonical notification briefly. Retry only transport failures and explicit
+/// unavailability, keeping the requested root fixed and the total wait bounded.
+async fn request_partial_state_commitment<C: SnapClient + ?Sized>(
+    client: &C,
+    request: GetAccountRangeMessage,
+) -> PeerRequestResult<SnapResponse> {
+    const ATTEMPTS: usize = 4;
+    for attempt in 1..=ATTEMPTS {
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            client.get_account_range_with_priority(request.clone(), Priority::High),
+        )
+        .await
+        .unwrap_or(Err(RequestError::Timeout));
+        let retry = match &result {
+            Err(error) => error.is_retryable(),
+            Ok(response) => matches!(&response.1, SnapResponse::AccountRange(range)
+                if range.accounts.is_empty() && range.proof.is_empty() && request.root_hash != EMPTY_ROOT_HASH),
+        };
+        if !retry || attempt == ATTEMPTS {
+            return result
+        }
+        tracing::debug!(target: "downloaders::snap", attempt, root = %request.root_hash,
+            account_hash = %request.starting_hash, "Waiting for partial-state account commitment from snap peer");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    unreachable!("the last attempt returns its result")
 }
 
 /// Computes the persisted partial-state root and checks it against the snap target.
@@ -1218,9 +1276,27 @@ mod tests {
         ));
     }
 
+    fn account_commitment_proof(
+        hash: B256,
+        account: TrieAccount,
+        target: B256,
+    ) -> (B256, Vec<Bytes>) {
+        let path = Nibbles::unpack(target);
+        let mut builder = reth_trie_common::HashBuilder::default()
+            .with_proof_retainer(reth_trie_common::proof::ProofRetainer::from_iter([path]));
+        builder.add_leaf(Nibbles::unpack(hash), &alloy_rlp::encode(account));
+        let root = builder.root();
+        let proof = builder
+            .take_proof_nodes()
+            .matching_nodes_sorted(&path)
+            .into_iter()
+            .map(|(_, node)| node)
+            .collect();
+        (root, proof)
+    }
+
     #[tokio::test]
     async fn resolves_only_untracked_accounts_with_storage_changes() {
-        let root = B256::repeat_byte(0x11);
         let peer = PeerId::repeat_byte(0x22);
         let tracked = Address::repeat_byte(0x33);
         let untracked = Address::repeat_byte(0x44);
@@ -1232,6 +1308,7 @@ mod tests {
             storage_root: B256::repeat_byte(0x66),
             code_hash: KECCAK_EMPTY,
         };
+        let (root, proof) = account_commitment_proof(untracked_hash, account, untracked_hash);
         let client = MockSnapClient::new([Ok(WithPeerId::new(
             peer,
             SnapResponse::AccountRange(AccountRangeMessage {
@@ -1240,7 +1317,7 @@ mod tests {
                     hash: untracked_hash,
                     body: alloy_rlp::encode(account).into(),
                 }],
-                proof: vec![],
+                proof,
             }),
         ))]);
         let access_list = vec![
@@ -1276,14 +1353,15 @@ mod tests {
 
     #[tokio::test]
     async fn resolves_absent_untracked_account() {
-        let root = B256::repeat_byte(0x11);
         let address = Address::repeat_byte(0x44);
+        let (root, proof) =
+            account_commitment_proof(B256::ZERO, TrieAccount::default(), keccak256(address));
         let client = MockSnapClient::new([Ok(WithPeerId::new(
             PeerId::repeat_byte(0x22),
             SnapResponse::AccountRange(AccountRangeMessage {
                 request_id: 0,
                 accounts: vec![],
-                proof: vec![Bytes::from_static(&[0x01])],
+                proof,
             }),
         ))]);
         let access_list = vec![AccountChanges::new(address).with_storage_change(SlotChanges::new(
@@ -1303,19 +1381,21 @@ mod tests {
         assert_eq!(resolved.get(&address), Some(&None));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn rejects_unproven_empty_account_response() {
         let root = B256::repeat_byte(0x11);
         let address = Address::repeat_byte(0x44);
         let account_hash = keccak256(address);
-        let client = MockSnapClient::new([Ok(WithPeerId::new(
-            PeerId::repeat_byte(0x22),
-            SnapResponse::AccountRange(AccountRangeMessage {
-                request_id: 0,
-                accounts: vec![],
-                proof: vec![],
-            }),
-        ))]);
+        let client = MockSnapClient::new((0..4).map(|_| {
+            Ok(WithPeerId::new(
+                PeerId::repeat_byte(0x22),
+                SnapResponse::AccountRange(AccountRangeMessage {
+                    request_id: 0,
+                    accounts: vec![],
+                    proof: vec![],
+                }),
+            ))
+        }));
         let access_list = vec![AccountChanges::new(address).with_storage_change(SlotChanges::new(
             U256::from(1),
             vec![StorageChange::new(1, U256::ZERO)],
@@ -1335,6 +1415,133 @@ mod tests {
             PartialStateAccountResolverError::UnprovenAccountAbsence { account_hash: hash }
                 if hash == account_hash
         ));
+        assert_eq!(client.account_range_requests().len(), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn commitment_resolver_retries_unavailable_root_without_changing_target() {
+        let address = Address::repeat_byte(0x44);
+        let hash = keccak256(address);
+        let account = TrieAccount { balance: U256::from(7), ..Default::default() };
+        let (root, proof) = account_commitment_proof(hash, account, hash);
+        let peer = PeerId::repeat_byte(0x22);
+        let client = MockSnapClient::new([
+            Err(RequestError::Timeout),
+            Ok(WithPeerId::new(
+                peer,
+                SnapResponse::AccountRange(AccountRangeMessage {
+                    request_id: 0,
+                    accounts: vec![],
+                    proof: vec![],
+                }),
+            )),
+            Ok(WithPeerId::new(
+                peer,
+                SnapResponse::AccountRange(AccountRangeMessage {
+                    request_id: 0,
+                    accounts: vec![AccountData { hash, body: alloy_rlp::encode(account).into() }],
+                    proof,
+                }),
+            )),
+        ]);
+        let bal = vec![AccountChanges::new(address).with_storage_change(SlotChanges::new(
+            U256::from(1),
+            vec![StorageChange::new(1, U256::from(2))],
+        ))];
+        let resolved = resolve_partial_state_accounts(
+            &client,
+            root,
+            &bal,
+            &ConfiguredContractFilter::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.get(&address), Some(&Some(account)));
+        let requests = client.account_range_requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|request| request == &requests[0]));
+    }
+
+    #[tokio::test]
+    async fn commitment_resolver_rejects_invalid_proofs_and_leaves() {
+        let address = Address::repeat_byte(0x44);
+        let hash = keccak256(address);
+        let account = TrieAccount { balance: U256::from(7), ..Default::default() };
+        let (root, proof) = account_commitment_proof(hash, account, hash);
+        let valid = AccountRangeMessage {
+            request_id: 0,
+            accounts: vec![AccountData { hash, body: alloy_rlp::encode(account).into() }],
+            proof,
+        };
+        let access_list = vec![AccountChanges::new(address).with_storage_change(SlotChanges::new(
+            U256::from(1),
+            vec![StorageChange::new(1, U256::from(2))],
+        ))];
+        let mut wrong_leaf = valid.clone();
+        wrong_leaf.accounts[0].body = alloy_rlp::encode(TrieAccount::default()).into();
+        let mut false_absence = valid.clone();
+        false_absence.accounts.clear();
+        let mut malformed = valid.clone();
+        malformed.accounts[0].body = Bytes::from_static(&[0x01]);
+        let mut trailing = valid.clone();
+        let mut body = trailing.accounts[0].body.to_vec();
+        body.push(0);
+        trailing.accounts[0].body = body.into();
+        let mut wrong_key = valid.clone();
+        wrong_key.accounts[0].hash = B256::ZERO;
+        let mut extra = valid.clone();
+        extra.accounts.push(extra.accounts[0].clone());
+        let mut missing_proof = valid.clone();
+        missing_proof.proof.clear();
+        for (target, response) in [
+            (B256::ZERO, valid),
+            (root, wrong_leaf),
+            (root, false_absence),
+            (root, malformed),
+            (root, trailing),
+            (root, wrong_key),
+            (root, extra),
+            (root, missing_proof),
+        ] {
+            let client = MockSnapClient::new([Ok(WithPeerId::new(
+                PeerId::repeat_byte(0x22),
+                SnapResponse::AccountRange(response),
+            ))]);
+            assert!(resolve_partial_state_accounts(
+                &client,
+                target,
+                &access_list,
+                &ConfiguredContractFilter::default(),
+            )
+            .await
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn commitment_resolver_accepts_empty_trie_absence() {
+        let address = Address::repeat_byte(0x44);
+        let client = MockSnapClient::new([Ok(WithPeerId::new(
+            PeerId::repeat_byte(0x22),
+            SnapResponse::AccountRange(AccountRangeMessage {
+                request_id: 0,
+                accounts: vec![],
+                proof: vec![],
+            }),
+        ))]);
+        let changes = vec![AccountChanges::new(address).with_storage_change(SlotChanges::new(
+            U256::from(1),
+            vec![StorageChange::new(1, U256::ZERO)],
+        ))];
+        let resolved = resolve_partial_state_accounts(
+            &client,
+            EMPTY_ROOT_HASH,
+            &changes,
+            &ConfiguredContractFilter::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.get(&address), Some(&None));
     }
 
     #[tokio::test]

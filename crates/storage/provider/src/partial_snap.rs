@@ -1,9 +1,10 @@
 use crate::{
-    providers::{NodeTypesForProvider, ProviderNodeTypes},
+    providers::{BlockchainProvider, NodeTypesForProvider, ProviderNodeTypes},
     BlockNumReader, DatabaseProvider, HeaderProvider, ProviderFactory,
 };
 use alloy_consensus::{constants::EMPTY_ROOT_HASH, BlockHeader};
 use alloy_primitives::{Bytes, B256, U256};
+use alloy_rlp::Decodable;
 use reth_db_api::{
     cursor::{DbCursorRO, DbDupCursorRO},
     tables,
@@ -18,7 +19,7 @@ use reth_storage_api::{
 };
 use reth_storage_errors::provider::{ProviderError, SnapStateRootUnavailableError};
 use reth_trie::root::{StateRootBuilder, StorageRootBuilder};
-use reth_trie_common::TrieAccount;
+use reth_trie_common::{proof::verify_proof, MultiProofTargets, Nibbles, TrieAccount, TrieNode};
 
 /// Writes partial snap state responses into Reth's hash-keyed state tables.
 #[derive(Debug)]
@@ -33,6 +34,61 @@ where
     /// Creates a new partial snap state writer backed by a database provider.
     pub const fn new(provider: &'a DatabaseProvider<TX, N>) -> Self {
         Self { provider }
+    }
+}
+
+impl<N: ProviderNodeTypes> BlockchainProvider<N> {
+    /// Serves a hashed account commitment at an available recent canonical root.
+    ///
+    /// This is the full peer's serving path, not a local fallback for partial-state advancement.
+    /// Restrict root lookup to a bounded header window; bulk snap ranges remain pinned to the
+    /// persisted pivot. Header and state lookup share the same consistent provider view.
+    pub(crate) fn snap_account_commitment(
+        &self,
+        root_hash: B256,
+        account_hash: B256,
+    ) -> Result<PartialStateSnapAccountRange, ProviderError> {
+        let chain = self.consistent_provider()?;
+        let best = chain.best_block_number()?;
+        let headers = chain.sealed_headers_range(best.saturating_sub(255)..=best)?;
+        let header = headers.iter().rev().find(|header| header.state_root() == root_hash);
+        let Some(header) = header else {
+            return Err(ProviderError::SnapStateRootUnavailable(Box::new(
+                SnapStateRootUnavailableError {
+                    requested: root_hash,
+                    available: headers.last().map_or(EMPTY_ROOT_HASH, |header| header.state_root()),
+                },
+            )))
+        };
+        let state = chain.into_state_provider_at_block_hash(header.hash())?;
+        let multiproof =
+            state.multiproof(Default::default(), MultiProofTargets::account(account_hash))?;
+        let path = Nibbles::unpack(account_hash);
+        let proof = multiproof
+            .account_proof_nodes(&path)
+            .into_iter()
+            .map(|(_, node)| node)
+            .collect::<Vec<_>>();
+        let account = match proof
+            .last()
+            .map(|node| TrieNode::decode(&mut node.as_ref()))
+            .transpose()
+            .map_err(ProviderError::other)?
+        {
+            Some(TrieNode::Leaf(leaf)) if path.ends_with(&leaf.key) => Some(
+                TrieAccount::decode(&mut leaf.value.as_slice()).map_err(ProviderError::other)?,
+            ),
+            _ => None,
+        };
+        verify_proof(root_hash, path, account.map(alloy_rlp::encode), &proof)
+            .map_err(ProviderError::other)?;
+        Ok(PartialStateSnapAccountRange {
+            accounts: account
+                .into_iter()
+                .map(|account| PartialStateSnapAccount { hash: account_hash, account })
+                .collect(),
+            proof,
+        })
     }
 }
 
@@ -419,7 +475,7 @@ mod tests {
     use reth_stages_types::{StageCheckpoint, StageId};
     use reth_static_file_types::StaticFileSegment;
     use reth_storage_api::{ConfiguredContractFilter, DBProvider, StageCheckpointWriter};
-    use reth_trie::root::{state_root_unsorted, storage_root};
+    use reth_trie::root::{state_root_unhashed, state_root_unsorted, storage_root};
 
     fn install_persisted_snap_pivot(
         factory: &ProviderFactory<crate::test_utils::MockNodeTypesWithDB>,
@@ -572,6 +628,93 @@ mod tests {
         let expected = install_persisted_snap_pivot(&factory, B256::repeat_byte(0x11));
 
         assert_eq!(factory.snap_state_pivot().unwrap(), expected);
+    }
+
+    #[test]
+    fn partial_snap_serves_exact_commitments_at_recent_roots() {
+        use crate::CanonChainTracker;
+        use reth_chain_state::{
+            ComputedTrieData, DeferredTrieData, ExecutedBlock, NewCanonicalChain,
+        };
+        use reth_ethereum_primitives::Block;
+        use reth_primitives_traits::{Block as _, SealedHeader};
+        use reth_trie::{HashedPostState, HashedStorage};
+        use std::sync::Arc;
+
+        let factory = create_test_provider_factory();
+        let address = address!("0000000000000000000000000000000000000001");
+        let hash = keccak256(address);
+        let slot = B256::repeat_byte(1);
+        let account = |value| TrieAccount {
+            balance: U256::from(100),
+            storage_root: storage_root([(slot, U256::from(value))]),
+            ..Default::default()
+        };
+        let parent_account = account(10);
+        let other = address!("0000000000000000000000000000000000000002");
+        let other_account = TrieAccount { balance: U256::from(3), ..Default::default() };
+        let parent_root = state_root_unhashed([(address, parent_account), (other, other_account)]);
+        let pivot = install_persisted_snap_pivot(&factory, parent_root);
+        let rw = factory.database_provider_rw().unwrap();
+        rw.tx_ref().put::<tables::HeaderNumbers>(pivot.block_hash, 0).unwrap();
+        rw.tx_ref().put::<tables::HashedAccounts>(hash, Account::from(parent_account)).unwrap();
+        rw.tx_ref()
+            .put::<tables::HashedAccounts>(keccak256(other), Account::from(other_account))
+            .unwrap();
+        rw.tx_ref()
+            .put::<tables::HashedStorages>(hash, StorageEntry::new(slot, U256::from(10)))
+            .unwrap();
+        rw.commit().unwrap();
+        let provider = BlockchainProvider::new(factory.clone()).unwrap();
+        let child_account = account(11);
+        let child_root = state_root_unhashed([(address, child_account), (other, other_account)]);
+        let header = SealedHeader::seal_slow(Header {
+            parent_hash: pivot.block_hash,
+            number: 1,
+            state_root: child_root,
+            ..Default::default()
+        });
+        let hashed_state = HashedPostState::default()
+            .with_accounts([(hash, Some(Account::from(child_account)))])
+            .with_storages([(hash, HashedStorage::from_iter(false, [(slot, U256::from(11))]))]);
+        let block = Block { header: header.clone().unseal(), body: Default::default() };
+        provider.canonical_in_memory_state().update_chain(NewCanonicalChain::Commit {
+            new: vec![ExecutedBlock {
+                recovered_block: Arc::new(block.try_into_recovered().unwrap()),
+                trie_data: DeferredTrieData::ready(ComputedTrieData {
+                    hashed_state: Arc::new(hashed_state.into_sorted()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        });
+        provider.set_canonical_head(header);
+
+        for (root, expected) in [(child_root, child_account), (parent_root, parent_account)] {
+            let range = provider.snap_account_range(root, hash, hash, 1).unwrap();
+            assert_eq!(range.accounts, vec![PartialStateSnapAccount { hash, account: expected }]);
+            verify_proof(
+                root,
+                Nibbles::unpack(hash),
+                Some(alloy_rlp::encode(expected)),
+                &range.proof,
+            )
+            .unwrap();
+            let absent = B256::repeat_byte(0x99);
+            let range = provider.snap_account_range(root, absent, absent, 1).unwrap();
+            assert!(range.accounts.is_empty());
+            verify_proof(root, Nibbles::unpack(absent), None, &range.proof).unwrap();
+        }
+        assert!(matches!(
+            provider.snap_account_range(B256::ZERO, hash, hash, 1),
+            Err(ProviderError::SnapStateRootUnavailable(_))
+        ));
+        // Bulk downloads must not silently substitute the current in-memory state for the pivot.
+        assert!(matches!(
+            provider.snap_account_range(child_root, B256::ZERO, B256::repeat_byte(0xff), 1),
+            Err(ProviderError::SnapStateRootUnavailable(_))
+        ));
+        assert_eq!(factory.snap_state_pivot().unwrap(), pivot);
     }
 
     #[test]

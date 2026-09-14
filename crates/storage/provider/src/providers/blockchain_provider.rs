@@ -168,6 +168,9 @@ impl<N: ProviderNodeTypes> PartialStateSnapProvider for BlockchainProvider<N> {
         limit_hash: B256,
         response_bytes: u64,
     ) -> ProviderResult<PartialStateSnapAccountRange> {
+        if starting_hash == limit_hash {
+            return self.snap_account_commitment(root_hash, starting_hash)
+        }
         self.database.snap_account_range(root_hash, starting_hash, limit_hash, response_bytes)
     }
 

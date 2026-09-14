@@ -38,7 +38,7 @@ alloy-rlp.workspace = true
 futures.workspace = true
 futures-util.workspace = true
 pin-project.workspace = true
-tokio = { workspace = true, features = ["sync", "fs", "io-util"] }
+tokio = { workspace = true, features = ["sync", "fs", "io-util", "time"] }
 tokio-stream.workspace = true
 tokio-util = { workspace = true, features = ["codec"] }
 async-compression = { workspace = true, features = ["gzip", "tokio"], optional = true }
@@ -66,7 +66,7 @@ reth-testing-utils.workspace = true
 reth-tracing.workspace = true
 
 assert_matches.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 rand.workspace = true
 tempfile.workspace = true
 alloy-rlp.workspace = true
