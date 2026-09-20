@@ -968,9 +968,6 @@ where
         let new_head_number = canonical_header.number();
         let new_head_hash = canonical_header.hash();
 
-        // Update tree state with the new canonical head
-        self.state.tree_state.set_canonical_head(canonical_header.num_hash());
-
         // Handle the state update based on whether this is an unwind scenario
         if new_head_number < current_head_number {
             debug!(
@@ -981,7 +978,7 @@ where
                 "FCU unwind detected: reverting to canonical ancestor"
             );
 
-            self.handle_canonical_chain_unwind(current_head_number, canonical_header)
+            self.handle_canonical_chain_unwind(current_head_number, canonical_header)?;
         } else {
             debug!(
                 target: "engine::tree",
@@ -990,14 +987,18 @@ where
                 new_head_hash = ?new_head_hash,
                 "Advancing latest block to canonical ancestor"
             );
-            self.handle_chain_advance_or_same_height(canonical_header)
+            self.handle_chain_advance_or_same_height(canonical_header)?;
         }
+
+        // Loading historical execution data can fail; do not move the head until it succeeds.
+        self.state.tree_state.set_canonical_head(canonical_header.num_hash());
+        Ok(())
     }
 
     /// Handles chain unwind scenarios by collecting blocks to remove and performing an unwind back
     /// to the canonical header
     fn handle_canonical_chain_unwind(
-        &self,
+        &mut self,
         current_head_number: u64,
         canonical_header: &SealedHeader<N::BlockHeader>,
     ) -> ProviderResult<()> {
@@ -1009,48 +1010,37 @@ where
             "Handling unwind: collecting blocks to remove from in-memory state"
         );
 
-        // Collect blocks that need to be removed from memory
+        // Retain persisted ancestors before the persistence task removes them from disk.
         let old_blocks =
-            self.collect_blocks_for_canonical_unwind(new_head_number, current_head_number);
+            self.collect_blocks_for_canonical_unwind(new_head_number, current_head_number)?;
 
         // Load and apply the canonical ancestor block
         self.apply_canonical_ancestor_via_reorg(canonical_header, old_blocks)
     }
 
-    /// Collects blocks from memory that need to be removed during an unwind to a canonical block.
+    /// Collects the removed canonical chain, including blocks already evicted to disk.
     fn collect_blocks_for_canonical_unwind(
         &self,
         new_head_number: u64,
         current_head_number: u64,
-    ) -> Vec<ExecutedBlock<N>> {
+    ) -> ProviderResult<Vec<ExecutedBlock<N>>> {
         let mut old_blocks =
             Vec::with_capacity((current_head_number.saturating_sub(new_head_number)) as usize);
+        let mut hash = self.state.tree_state.canonical_block_hash();
 
-        for block_num in (new_head_number + 1)..=current_head_number {
-            if let Some(block_state) = self.canonical_in_memory_state.state_by_number(block_num) {
-                let executed_block = block_state.block_ref().clone();
-                old_blocks.push(executed_block);
-                debug!(
-                    target: "engine::tree",
-                    block_number = block_num,
-                    "Collected block for removal from in-memory state"
-                );
-            }
+        for _ in (new_head_number + 1)..=current_head_number {
+            let block = self.canonical_block_by_hash(hash)?;
+            hash = block.recovered_block().parent_hash();
+            old_blocks.push(block);
         }
 
-        if old_blocks.is_empty() {
-            debug!(
-                target: "engine::tree",
-                "No blocks found in memory to remove, will clear and reset state"
-            );
-        }
-
-        old_blocks
+        old_blocks.reverse();
+        Ok(old_blocks)
     }
 
     /// Applies the canonical ancestor block via a reorg operation.
     fn apply_canonical_ancestor_via_reorg(
-        &self,
+        &mut self,
         canonical_header: &SealedHeader<N::BlockHeader>,
         old_blocks: Vec<ExecutedBlock<N>>,
     ) -> ProviderResult<()> {
@@ -1059,6 +1049,8 @@ where
 
         // Load the canonical ancestor's block
         let executed_block = self.canonical_block_by_hash(new_head_hash)?;
+        // These remain valid sidechain blocks and may be selected by a subsequent forkchoice.
+        self.reinsert_reorged_blocks(old_blocks.clone());
         // Perform the reorg to properly handle the unwind
         self.canonical_in_memory_state
             .update_chain(NewCanonicalChain::Reorg { new: vec![executed_block], old: old_blocks });

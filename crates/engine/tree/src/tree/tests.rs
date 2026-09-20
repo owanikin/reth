@@ -1207,6 +1207,203 @@ async fn test_fcu_with_canonical_ancestor_updates_latest_block() {
     );
 }
 
+#[tokio::test]
+async fn test_repeated_forkchoice_recovers_missing_ancestor_after_canonical_unwind() {
+    assert_canonical_unwind_retains_executed_ancestors(false).await;
+}
+
+#[tokio::test]
+async fn test_canonical_unwind_retains_ancestors_during_persistence() {
+    assert_canonical_unwind_retains_executed_ancestors(true).await;
+}
+
+async fn assert_canonical_unwind_retains_executed_ancestors(persistence_in_progress: bool) {
+    use reth_provider::{
+        providers::BlockchainProvider, test_utils::create_test_provider_factory,
+        BlockExecutionWriter, BlockHashReader, DBProvider, SaveBlocksMode,
+    };
+
+    reth_tracing::init_test_tracing();
+
+    let factory = create_test_provider_factory();
+    let mut block_builder = TestBlockBuilder::eth().with_state();
+    let signer = block_builder.signer;
+    let blocks: Vec<_> = block_builder.get_executed_blocks(0..11).collect();
+    let genesis = blocks[0].recovered_block().num_hash();
+    let ancestor = blocks[8].recovered_block().num_hash();
+    let missing = blocks[9].recovered_block().num_hash();
+    let tip = blocks[10].recovered_block().num_hash();
+    {
+        let provider = factory.database_provider_rw().unwrap();
+        provider.save_blocks(vec![blocks[0].clone()], SaveBlocksMode::Full).unwrap();
+        provider.commit().unwrap();
+    }
+
+    let provider = BlockchainProvider::new(factory.clone()).unwrap();
+    let runtime = reth_tasks::Runtime::test();
+    let config = TreeConfig::default()
+        .with_legacy_state_root(false)
+        .with_has_enough_parallelism(true)
+        .with_always_process_payload_attributes_on_canonical_head(true)
+        .with_unwind_canonical_header(true);
+    let consensus = Arc::new(EthBeaconConsensus::new(MAINNET.clone()));
+    let changeset_cache = ChangesetCache::new();
+    let evm_config = MockEvmConfig::default();
+    let validator = BasicEngineValidator::new(
+        provider.clone(),
+        consensus.clone(),
+        evm_config.clone(),
+        MockEngineValidator,
+        config.clone(),
+        Box::new(NoopInvalidBlockHook::default()),
+        changeset_cache.clone(),
+        runtime.clone(),
+    );
+    let (outgoing, _events) = unbounded_channel();
+    let (payload_tx, _payload_rx) = unbounded_channel();
+    let (persistence_tx, persistence_rx) = std::sync::mpsc::channel();
+    let mut tree = EngineApiTreeHandler::<_, _, EthEngineTypes, _, _>::new(
+        provider.clone(),
+        consensus,
+        validator,
+        outgoing,
+        EngineApiTreeState::new(
+            10,
+            10,
+            config.invalid_header_hit_eviction_threshold(),
+            genesis,
+            EngineApiKind::Ethereum,
+            runtime.state_trie_overlay_worker_pool(),
+        ),
+        provider.canonical_in_memory_state(),
+        PersistenceHandle::new(persistence_tx),
+        PersistenceState { last_persisted_block: genesis, rx: None },
+        PayloadBuilderHandle::new(payload_tx),
+        config,
+        EngineApiKind::Ethereum,
+        evm_config,
+        changeset_cache,
+        runtime,
+    );
+
+    // Drive the real database writes synchronously so the save/unwind ordering is deterministic.
+    let complete_persistence = |action: PersistenceAction| {
+        let provider = factory.database_provider_rw().unwrap();
+        let (last_block, sender) = match action {
+            PersistenceAction::SaveBlocks(blocks, sender) => {
+                let last = blocks.last().unwrap().recovered_block().num_hash();
+                provider.save_blocks(blocks, SaveBlocksMode::Full).unwrap();
+                (last, sender)
+            }
+            PersistenceAction::RemoveBlocksAbove(number, sender) => {
+                let hash = provider.block_hash(number).unwrap().unwrap();
+                provider.remove_block_and_execution_above(number).unwrap();
+                (BlockNumHash::new(number, hash), sender)
+            }
+            action => panic!("unexpected persistence action: {action:?}"),
+        };
+        provider.commit().unwrap();
+        sender
+            .send(PersistenceResult { last_block: Some(last_block), commit_duration: None })
+            .unwrap();
+    };
+
+    for block in &blocks[1..] {
+        tree.state.tree_state.insert_executed(block.clone());
+    }
+    tree.on_canonical_chain_update(NewCanonicalChain::Commit { new: blocks[1..].to_vec() });
+
+    // Optionally delay the save acknowledgement until after the rewind to exercise an in-flight
+    // persistence job. Otherwise block 9 is already evicted from memory when the rewind starts.
+    tree.persist_blocks(blocks[1..10].to_vec());
+    complete_persistence(persistence_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+    if !persistence_in_progress {
+        assert!(tree.try_poll_persistence().unwrap());
+        assert_eq!(tree.persistence_state.last_persisted_block, missing);
+        assert!(!tree.state.tree_state.contains_hash(&missing.hash));
+    }
+    assert!(tree.state.tree_state.contains_hash(&tip.hash));
+    assert_eq!(factory.block_hash(missing.number).unwrap(), Some(missing.hash));
+    let expected_account =
+        factory.history_by_block_hash(missing.hash).unwrap().basic_account(&signer).unwrap();
+    assert!(expected_account.is_some());
+
+    let forkchoice = |head_block_hash| ForkchoiceState {
+        head_block_hash,
+        safe_block_hash: B256::ZERO,
+        finalized_block_hash: B256::ZERO,
+    };
+    let rewind = tree.on_forkchoice_updated(forkchoice(ancestor.hash), None).unwrap();
+    tree.state
+        .forkchoice_state_tracker
+        .set_latest(forkchoice(ancestor.hash), rewind.outcome.forkchoice_status());
+    assert!(rewind.outcome.await.unwrap().payload_status.is_valid());
+    assert_eq!(tree.state.tree_state.current_canonical_head, ancestor);
+    assert_eq!(tree.canonical_in_memory_state.get_canonical_head().num_hash(), ancestor);
+    assert!(tree.state.tree_state.contains_hash(&missing.hash));
+
+    if persistence_in_progress {
+        assert!(tree.try_poll_persistence().unwrap());
+    }
+    tree.advance_persistence().unwrap();
+    let action = persistence_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_matches!(&action, PersistenceAction::RemoveBlocksAbove(number, _) if *number == ancestor.number);
+    complete_persistence(action);
+    assert!(tree.try_poll_persistence().unwrap());
+    assert_eq!(tree.persistence_state.last_persisted_block, ancestor);
+    assert_eq!(factory.block_hash(missing.number).unwrap(), None);
+
+    let (persisted_parent, retained) = tree.state.tree_state.blocks_by_hash(tip.hash).unwrap();
+    assert_eq!(persisted_parent, ancestor.hash);
+    assert_eq!(
+        retained.iter().map(|block| block.recovered_block().num_hash()).collect::<Vec<_>>(),
+        vec![tip, missing],
+    );
+    assert_eq!(
+        tree.state_provider_builder(missing.hash)
+            .unwrap()
+            .unwrap()
+            .build()
+            .unwrap()
+            .basic_account(&signer)
+            .unwrap(),
+        expected_account,
+    );
+
+    // Selecting the old branch must reach VALID, not repeatedly download its cached tip.
+    for _ in 0..3 {
+        let result = tree.on_forkchoice_updated(forkchoice(tip.hash), None).unwrap();
+        tree.state
+            .forkchoice_state_tracker
+            .set_latest(forkchoice(tip.hash), result.outcome.forkchoice_status());
+        let response = result.outcome.await.unwrap();
+        assert!(response.payload_status.is_valid(), "{response:?}");
+        assert!(result.event.is_none(), "{:?}", result.event);
+        assert_eq!(tree.state.tree_state.current_canonical_head, tip);
+        assert_eq!(tree.canonical_in_memory_state.get_canonical_head().num_hash(), tip);
+    }
+}
+
+#[tokio::test]
+async fn test_canonical_unwind_missing_block_preserves_head() {
+    let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(1..5).collect();
+    let ancestor = blocks[1].recovered_block().clone_sealed_header();
+    let missing = blocks[2].recovered_block().num_hash();
+    let tip = blocks[3].recovered_block().clone_sealed_header();
+    let mut harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks);
+    harness.tree.canonical_in_memory_state.set_canonical_head(tip.clone());
+    harness.tree.state.tree_state.remove_until(missing, missing.hash, None);
+    harness.tree.canonical_in_memory_state.remove_persisted_blocks(missing);
+
+    // The mock provider cannot reload the evicted block.
+    let error = harness.tree.update_latest_block_to_canonical_ancestor(&ancestor).unwrap_err();
+    assert_matches!(error, ProviderError::HeaderNotFound(hash) if hash == missing.hash.into());
+    assert_eq!(harness.tree.state.tree_state.current_canonical_head, tip.num_hash());
+    assert_eq!(harness.tree.canonical_in_memory_state.get_canonical_head(), tip);
+    assert!(!harness.tree.persistence_state.in_progress());
+    assert!(harness.action_rx.try_recv().is_err());
+}
+
 /// Test that verifies the happy path where a new payload extends the canonical chain
 #[test]
 fn test_on_new_payload_canonical_insertion() {
