@@ -31,7 +31,8 @@ Waiting for a persisted BAL-compatible partial-state pivot
 
 Once a usable pivot is available, the existing snap path downloads its state and verifies
 the computed root before marking the replacement checkpoint complete. Canonical catch-up
-then resumes from that checkpoint, discarding obsolete queued notifications.
+then resumes from that checkpoint using the latest forkchoice head, not queued execution
+notifications. See [forkchoice-driven advancement](partial-state-forkchoice.md).
 
 If replay or a reorg reaches a legitimate pre-BAL block, it requests this same bootstrap
 path without fabricating an empty BAL or advancing the checkpoint over the block. A

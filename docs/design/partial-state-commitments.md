@@ -1,9 +1,9 @@
 # Remote Partial-State Commitments
 
 Partial-state BAL advancement no longer reads local full state or execution-result
-overlays to fill in untracked storage roots. Catch-up needs canonical headers and
-retained BALs; notification replay uses the notification's headers and retained BALs.
-Both resolve missing commitments through `SnapClient`.
+overlays to fill in untracked storage roots. Replay follows forkchoice-selected headers
+and retained or downloaded BALs, resolving missing commitments through `SnapClient`.
+See [forkchoice-driven advancement](partial-state-forkchoice.md).
 
 ## Resolution
 
@@ -29,14 +29,13 @@ rollbacks remain valid.
 After those bounded attempts, an unproven empty response, timeout, dropped connection,
 or unavailable snap capability defers advancement instead of terminating the updater.
 The driver preserves the verified head and checkpoint, waits five seconds, then
-reconciles against the node's current canonical headers. It retries even without a new
-notification, and discards queued notifications for superseded branches before reading
-the current chain. It remains subscribed to updates arriving during reconciliation.
+reconciles against the latest forkchoice head. It retries even without a new forkchoice.
+A latest-target channel replaces queued execution notifications.
 
 If the chain changed while waiting, journal rollback and BAL replay follow the new
-local canonical branch. Catch-up also rechecks the target header after fetching proofs,
-before committing a transition. Successful recovery returns to normal notification
-processing. Missing rollback journals still require the existing snap-resync path.
+selected branch. Catch-up also rechecks the selected target after fetching proofs,
+before committing a transition. Missing rollback journals still require the existing
+snap-resync path.
 
 Invalid proofs, malformed accounts, BAL mismatches, root mismatches, and database errors
 remain hard failures. A peer's empty response is never treated as account deletion, and
@@ -45,8 +44,8 @@ the peer's different canonical root is never substituted for the requested root.
 Recovery waits for availability; it cannot manufacture a proof for a branch no connected
 peer serves. Such a node can remain behind indefinitely. This does not add peer branch
 discovery, side-branch proof serving, or a durable request queue. A restart recovers from
-the existing verified checkpoint and reconciles again. Missing retained BALs remain a
-separate hard failure.
+the existing verified checkpoint and reconciles again. Missing retained BALs are requested
+from BAL-capable peers; their unavailability also defers advancement.
 
 ## Serving Peer
 
@@ -77,10 +76,9 @@ checks that untracked slots were not stored. Provider tests cover inclusion and 
 proofs at both persisted and in-memory roots.
 
 Paused-time driver tests cover repeated unavailable responses without checkpoint or
-journal changes, timer-driven recovery without new notifications, rollback followed by
-an unavailable replacement, discarding queued superseded branches, resuming notification
-processing, and rejecting a proof whose target was replaced while the request was in
-flight. Invalid proofs and integrity errors are not classified as recoverable.
+journal changes, timer-driven recovery without new forkchoices, coalescing superseded
+targets, and rejecting a proof whose target was replaced while the request was in flight.
+Invalid proofs and integrity errors are not classified as recoverable.
 
 For a Kurtosis smoke test, rebuild **both** nodes with this branch: the partial node
 needs the resolver and the full peer needs exact-root proof serving. Keep partial-state
@@ -94,5 +92,6 @@ RPC block height. Repeated terminal failures are not a passing test. Start with 
 reorg flags disabled; branch-divergence and peer-outage tests are separate scenarios.
 
 This removes the updater's local full-state resolution dependency. The node still runs
-normal execution and consumes its canonical notifications alongside partial state.
+normal execution alongside partial state; the partial updater no longer depends on its
+canonical notifications.
 It does not yet demonstrate partial-only block execution, state expiry, or disk savings.

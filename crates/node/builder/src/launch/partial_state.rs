@@ -1,14 +1,17 @@
 use alloy_consensus::BlockHeader;
 use alloy_eips::{BlockNumHash, NumHash};
-use alloy_primitives::{keccak256, Bytes, Sealed};
+use alloy_primitives::{keccak256, Bytes, Sealed, B256};
+#[cfg(test)]
 use reth_chain_state::CanonStateNotification;
 use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
 use reth_downloaders::snap::{resolve_partial_state_accounts, PartialStateAccountResolverError};
 use reth_network_p2p::{error::RequestError, snap::client::SnapClient};
+#[cfg(test)]
 use reth_primitives_traits::NodePrimitives;
-use reth_provider::{
-    providers::ProviderNodeTypes, BlockNumReader, HeaderProvider, ProviderFactory,
-};
+use reth_primitives_traits::SealedHeader;
+#[cfg(test)]
+use reth_provider::BlockNumReader;
+use reth_provider::{providers::ProviderNodeTypes, HeaderProvider, ProviderFactory};
 use reth_storage_api::{
     errors::provider::{PartialStateTransitionError, ProviderError},
     BalProvider, BalStoreHandle, ConfiguredContractFilter, DatabaseProviderFactory,
@@ -17,109 +20,8 @@ use reth_storage_api::{
 };
 use reth_tracing::tracing::{debug, info, warn};
 use std::time::Duration;
-use tokio::{
-    sync::broadcast::{self, error::RecvError},
-    time::{sleep_until, Instant},
-};
-
-/// Drives canonical replay, falling back to current-chain reconciliation after unavailable proofs.
-#[derive(Debug)]
-pub(crate) struct PartialStateAdvancer<P: NodePrimitives> {
-    notifications: broadcast::Receiver<CanonStateNotification<P>>,
-    reconcile: bool,
-    retry_at: Option<Instant>,
-}
-
-impl<P: NodePrimitives> PartialStateAdvancer<P> {
-    pub(crate) const fn new(notifications: broadcast::Receiver<CanonStateNotification<P>>) -> Self {
-        Self { notifications, reconcile: true, retry_at: None }
-    }
-
-    /// Waits for work and applies it, or defers unavailable commitments without losing the head.
-    pub(crate) async fn advance<N, Client>(
-        &mut self,
-        client: &Client,
-        provider_factory: &ProviderFactory<N>,
-        canonical_provider: &(impl HeaderProvider + BlockNumReader),
-        filter: &ConfiguredContractFilter,
-        head: &mut PartialStateSnapPivot,
-        retention: u64,
-    ) -> eyre::Result<PartialStateAdvanceOutcome>
-    where
-        N: ProviderNodeTypes<Primitives = P> + 'static,
-        Client: SnapClient,
-    {
-        if let Some(deadline) = self.retry_at.take() {
-            sleep_until(deadline).await;
-        }
-
-        let notification = if self.reconcile {
-            None
-        } else {
-            match self.notifications.recv().await {
-                Ok(notification) => Some(notification),
-                Err(RecvError::Lagged(skipped)) => {
-                    warn!(target: "reth::cli", skipped,
-                        "Partial-state canonical notifications lagged; reconciling current canonical state");
-                    None
-                }
-                Err(RecvError::Closed) => eyre::bail!("Canonical notification stream closed"),
-            }
-        };
-
-        let outcome = if let Some(notification) = notification {
-            advance_partial_state_with_notification(
-                client,
-                provider_factory,
-                filter,
-                head,
-                notification,
-                retention,
-            )
-            .await
-        } else {
-            // Discard queued branches before reading the current chain. Notifications arriving
-            // during reconciliation stay subscribed, so catching up cannot miss the next update.
-            self.notifications = self.notifications.resubscribe();
-            let number = canonical_provider.best_block_number()?;
-            let target = canonical_provider
-                .sealed_header(number)?
-                .ok_or_else(|| eyre::eyre!("canonical header {number} is unavailable"))?
-                .num_hash();
-            advance_partial_state_to_target(
-                client,
-                provider_factory,
-                canonical_provider,
-                filter,
-                head,
-                target,
-                retention,
-            )
-            .await
-        };
-
-        match outcome {
-            Err(err) if commitment_is_unavailable(&err) => {
-                self.reconcile = true;
-                self.retry_at = Some(Instant::now() + Duration::from_secs(5));
-                warn!(target: "reth::cli",
-                    block_number = head.block_number, block_hash = %head.block_hash,
-                    state_root = %head.state_root, retry_seconds = 5, %err,
-                    "Partial-state advancement deferred; waiting for peer commitment availability");
-                Ok(PartialStateAdvanceOutcome::AwaitingCommitment)
-            }
-            Ok(outcome) => {
-                self.reconcile = matches!(
-                    outcome,
-                    PartialStateAdvanceOutcome::ResyncRequired { .. } |
-                        PartialStateAdvanceOutcome::BootstrapRequired { .. }
-                );
-                Ok(outcome)
-            }
-            Err(err) => Err(err),
-        }
-    }
-}
+mod forkchoice;
+pub(crate) use forkchoice::PartialStateAdvancer;
 
 /// A bootstrap decision that does not modify the saved checkpoint or partial tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,6 +158,8 @@ pub(crate) fn retain_payload_bal(store: &BalStoreHandle, num_hash: NumHash, raw:
 pub(crate) enum PartialStateAdvanceOutcome {
     /// The verified head is preserved; the driver will retry against the current canonical chain.
     AwaitingCommitment,
+    /// The selected branch is too long to buffer; a newer persisted pivot is required.
+    TargetTooDistant,
     /// Replay reached a legitimate pre-BAL block; bootstrap from a newer verified snapshot.
     BootstrapRequired {
         /// The block whose transition cannot be reconstructed from a BAL.
@@ -279,11 +183,44 @@ pub(crate) enum PartialStateAdvanceOutcome {
     },
 }
 
+/// Header and BAL view used by replay, without requiring locally executed blocks.
+trait PartialStateChain: Sync {
+    type Header: reth_primitives_traits::BlockHeader;
+    fn tip(&self) -> eyre::Result<BlockNumHash>;
+    fn hash(&self, number: u64) -> eyre::Result<Option<B256>>;
+    fn replay_header(&self, number: u64) -> eyre::Result<Option<SealedHeader<Self::Header>>>;
+    fn oldest_block(&self) -> u64 {
+        0
+    }
+    fn prepare_bal(
+        &self,
+        _block: BlockNumHash,
+        _expected: B256,
+    ) -> impl std::future::Future<Output = eyre::Result<()>> + Send {
+        async { Ok(()) }
+    }
+}
+
+#[cfg(test)]
+impl<T: HeaderProvider + BlockNumReader + Sync> PartialStateChain for T {
+    type Header = T::Header;
+    fn tip(&self) -> eyre::Result<BlockNumHash> {
+        let number = self.best_block_number()?;
+        Ok(self.sealed_header(number)?.ok_or_else(|| eyre::eyre!("missing tip"))?.num_hash())
+    }
+    fn hash(&self, number: u64) -> eyre::Result<Option<B256>> {
+        Ok(self.sealed_header(number)?.map(|header| header.hash()))
+    }
+    fn replay_header(&self, number: u64) -> eyre::Result<Option<SealedHeader<Self::Header>>> {
+        Ok(self.sealed_header(number)?)
+    }
+}
+
 /// Reconciles verified partial state with the current canonical chain using retained BALs.
-pub(crate) async fn advance_partial_state_to_target<N, Client>(
+async fn advance_partial_state_to_target<N, Client>(
     client: &Client,
     provider_factory: &ProviderFactory<N>,
-    canonical_provider: &(impl HeaderProvider + BlockNumReader),
+    canonical_provider: &impl PartialStateChain,
     filter: &ConfiguredContractFilter,
     head: &mut PartialStateSnapPivot,
     notified_target: BlockNumHash,
@@ -297,11 +234,10 @@ where
     let mut reverted = 0;
     let mut observed_canonical_tip = None;
     loop {
-        let canonical_tip_number = canonical_provider.best_block_number()?;
-        let canonical_tip = canonical_provider
-            .sealed_header(canonical_tip_number)?
-            .ok_or_else(|| eyre::eyre!("canonical header {canonical_tip_number} is unavailable"))?
-            .num_hash();
+        // Cached headers and BALs may replay without a network yield. Let forkchoice updates
+        // and shutdown run between atomic transitions, including during a long rollback.
+        tokio::task::yield_now().await;
+        let canonical_tip = canonical_provider.tip()?;
         if canonical_tip != notified_target && observed_canonical_tip != Some(canonical_tip) {
             debug!(
                 target: "reth::cli",
@@ -314,11 +250,19 @@ where
         }
         observed_canonical_tip = Some(canonical_tip);
 
-        let canonical_head = canonical_provider.sealed_header(head.block_number)?;
+        let canonical_head = canonical_provider.hash(head.block_number)?;
         let head_is_canonical =
-            canonical_head.as_ref().is_some_and(|header| header.hash() == head.block_hash) &&
-                head.block_number <= canonical_tip.number;
+            canonical_head == Some(head.block_hash) && head.block_number <= canonical_tip.number;
         if !head_is_canonical {
+            if head.block_number < canonical_provider.oldest_block() ||
+                (head.block_number == canonical_provider.oldest_block() &&
+                    head.block_number != 0)
+            {
+                return Ok(PartialStateAdvanceOutcome::ResyncRequired {
+                    unavailable_block: BlockNumHash::new(head.block_number, head.block_hash),
+                    reverted,
+                })
+            }
             if head.block_number == 0 {
                 eyre::bail!("partial-state genesis {} is not canonical", head.block_hash)
             }
@@ -369,7 +313,7 @@ where
 
         let number = head.block_number + 1;
         let header = canonical_provider
-            .sealed_header(number)?
+            .replay_header(number)?
             .ok_or_else(|| eyre::eyre!("canonical header {number} is unavailable"))?;
         if header.parent_hash() != head.block_hash {
             continue
@@ -386,6 +330,7 @@ where
                 "canonical block {number} ({block_hash}) has no block access list commitment"
             )
         };
+        canonical_provider.prepare_bal(header.num_hash(), expected_bal_hash).await?;
         let decoded_bal =
             provider_factory.bal_store().get_decoded_by_hash(block_hash)?.ok_or_else(|| {
                 eyre::eyre!(
@@ -402,10 +347,8 @@ where
         )
         .await?;
         // Network requests yield long enough for forkchoice to replace the target branch.
-        if canonical_provider.best_block_number()? < number ||
-            canonical_provider
-                .sealed_header(number)?
-                .is_none_or(|current| current.hash() != block_hash)
+        if canonical_provider.tip()?.number < number ||
+            canonical_provider.hash(number)? != Some(block_hash)
         {
             continue
         }
@@ -441,7 +384,8 @@ where
 /// Reorged blocks are removed in descending order before replacement blocks are applied in
 /// ascending order. Only headers and retained BALs are consumed locally. A snap peer must serve
 /// proofs at each replacement block's root; execution outcomes are not used to fill missing state.
-pub(crate) async fn advance_partial_state_with_notification<N, Client>(
+#[cfg(test)]
+async fn advance_partial_state_with_notification<N, Client>(
     client: &Client,
     provider_factory: &ProviderFactory<N>,
     filter: &ConfiguredContractFilter,
@@ -637,6 +581,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod forkchoice;
     use alloy_consensus::{
         constants::{EMPTY_ROOT_HASH, KECCAK_EMPTY},
         Header,
@@ -1160,7 +1105,7 @@ mod tests {
             let filter = ConfiguredContractFilter::new([]);
             let pivot = PartialStateSnapPivot {
                 block_number: 0,
-                block_hash: B256::repeat_byte(0x10),
+                block_hash: Header { state_root: Self::root(10), ..Default::default() }.hash_slow(),
                 state_root: Self::root(10),
             };
             factory.begin_partial_state_sync(pivot, &filter).unwrap();
@@ -1169,6 +1114,7 @@ mod tests {
                 .partial_state_snap_writer()
                 .write_account(keccak256(Self::ADDRESS), Self::account(10))
                 .unwrap();
+            provider.tx_ref().put::<tables::HeaderNumbers>(pivot.block_hash, 0).unwrap();
             provider.commit().unwrap();
             factory.complete_partial_state_sync(pivot, &filter).unwrap();
             let static_files = factory.static_file_provider();
@@ -1281,10 +1227,6 @@ mod tests {
             }
         }
 
-        fn chain(blocks: Vec<RecoveredBlock<Block>>) -> Arc<Chain> {
-            Arc::new(Chain::new(blocks, ExecutionOutcome::default(), BTreeMap::new()))
-        }
-
         fn assert_checkpoint(&self, head: PartialStateSnapPivot) {
             assert_eq!(self.factory.partial_state_checkpoint().unwrap().unwrap().pivot, head);
             assert_eq!(self.factory.partial_state_root(&self.filter).unwrap(), head.state_root);
@@ -1295,189 +1237,6 @@ mod tests {
             assert_eq!(provider.tx_ref().entries::<tables::HashedStorages>().unwrap(), 0);
             assert_eq!(provider.tx_ref().entries::<tables::PartialStateStorages>().unwrap(), 0);
         }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn retries_unavailable_commitments_without_new_notifications() {
-        let fixture = RecoveryFixture::new();
-        let mut head = fixture.pivot;
-        let child = fixture.block(1, head.block_hash, 11);
-        fixture.set_canonical(std::slice::from_ref(&child));
-        let (sender, receiver) = broadcast::channel(16);
-        let mut advancer = PartialStateAdvancer::new(receiver);
-        let client = RecoveryFixture::client(
-            (0..8)
-                .map(|_| (child.state_root(), RecoveryFixture::unavailable()))
-                .chain([(child.state_root(), RecoveryFixture::response(11))])
-                .collect(),
-        );
-
-        for _ in 0..2 {
-            assert_eq!(
-                advancer
-                    .advance(
-                        &client,
-                        &fixture.factory,
-                        &fixture.factory,
-                        &fixture.filter,
-                        &mut head,
-                        64
-                    )
-                    .await
-                    .unwrap(),
-                PartialStateAdvanceOutcome::AwaitingCommitment
-            );
-            assert_eq!(head, fixture.pivot);
-            fixture.assert_checkpoint(head);
-            assert_eq!(
-                fixture
-                    .factory
-                    .database_provider_ro()
-                    .unwrap()
-                    .tx_ref()
-                    .entries::<tables::PartialStateTransitionJournals>()
-                    .unwrap(),
-                0
-            );
-        }
-        let waiting_since = Instant::now();
-        assert_eq!(
-            advancer
-                .advance(
-                    &client,
-                    &fixture.factory,
-                    &fixture.factory,
-                    &fixture.filter,
-                    &mut head,
-                    64
-                )
-                .await
-                .unwrap(),
-            PartialStateAdvanceOutcome::Reconciled { advanced: 1, reverted: 0, pruned: 0 }
-        );
-        assert!(waiting_since.elapsed() >= Duration::from_secs(5));
-        assert_eq!(head.block_hash, child.hash());
-        fixture.assert_checkpoint(head);
-        assert!(client.responses.lock().unwrap().is_empty());
-        drop(sender);
-        assert!(advancer
-            .advance(&client, &fixture.factory, &fixture.factory, &fixture.filter, &mut head, 64)
-            .await
-            .is_err());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn reconciles_latest_branch_after_deferred_reorg_notification() {
-        let fixture = RecoveryFixture::new();
-        let mut head = fixture.pivot;
-        let a1 = fixture.block(1, head.block_hash, 11);
-        let a2 = fixture.block(2, a1.hash(), 12);
-        let b2 = fixture.block(2, a1.hash(), 22);
-        let c2 = fixture.block(2, a1.hash(), 32);
-        let c3 = fixture.block(3, c2.hash(), 33);
-        fixture.set_canonical(&[a1.clone(), a2.clone()]);
-        let (sender, receiver) = broadcast::channel(16);
-        let mut advancer = PartialStateAdvancer::new(receiver);
-        let client = RecoveryFixture::client(
-            [
-                (a1.state_root(), RecoveryFixture::response(11)),
-                (a2.state_root(), RecoveryFixture::response(12)),
-            ]
-            .into_iter()
-            .chain((0..4).map(|_| (b2.state_root(), Err(RequestError::Timeout))))
-            .chain([
-                (c2.state_root(), RecoveryFixture::response(32)),
-                (c3.state_root(), RecoveryFixture::response(33)),
-            ])
-            .collect(),
-        );
-        advancer
-            .advance(&client, &fixture.factory, &fixture.factory, &fixture.filter, &mut head, 64)
-            .await
-            .unwrap();
-        assert_eq!(head.block_hash, a2.hash());
-
-        fixture.set_canonical(&[a1.clone(), b2.clone()]);
-        sender
-            .send(CanonStateNotification::Reorg {
-                old: RecoveryFixture::chain(vec![a2]),
-                new: RecoveryFixture::chain(vec![b2.clone()]),
-            })
-            .unwrap();
-        assert_eq!(
-            advancer
-                .advance(
-                    &client,
-                    &fixture.factory,
-                    &fixture.factory,
-                    &fixture.filter,
-                    &mut head,
-                    64
-                )
-                .await
-                .unwrap(),
-            PartialStateAdvanceOutcome::AwaitingCommitment
-        );
-        // The rollback completed, but the unavailable replacement was never committed.
-        assert_eq!(head.block_hash, a1.hash());
-        fixture.assert_checkpoint(head);
-
-        fixture.set_canonical(&[a1, c2.clone(), c3.clone()]);
-        sender
-            .send(CanonStateNotification::Reorg {
-                old: RecoveryFixture::chain(vec![b2]),
-                new: RecoveryFixture::chain(vec![c2.clone()]),
-            })
-            .unwrap();
-        sender
-            .send(CanonStateNotification::Commit { new: RecoveryFixture::chain(vec![c3.clone()]) })
-            .unwrap();
-        assert_eq!(
-            advancer
-                .advance(
-                    &client,
-                    &fixture.factory,
-                    &fixture.factory,
-                    &fixture.filter,
-                    &mut head,
-                    64
-                )
-                .await
-                .unwrap(),
-            PartialStateAdvanceOutcome::Reconciled { advanced: 2, reverted: 0, pruned: 0 }
-        );
-        assert_eq!(head.block_hash, c3.hash());
-        fixture.assert_checkpoint(head);
-        assert!(client.responses.lock().unwrap().is_empty());
-        assert_eq!(
-            fixture
-                .factory
-                .database_provider_ro()
-                .unwrap()
-                .tx_ref()
-                .get::<tables::PartialStateTransitionJournals>(2)
-                .unwrap()
-                .unwrap()
-                .block_hash,
-            c2.hash()
-        );
-
-        // Normal notification processing resumes after catch-up, without another restart.
-        let c4 = fixture.block(4, c3.hash(), 34);
-        client
-            .responses
-            .lock()
-            .unwrap()
-            .push_back((c4.state_root(), RecoveryFixture::response(34)));
-        sender
-            .send(CanonStateNotification::Commit { new: RecoveryFixture::chain(vec![c4.clone()]) })
-            .unwrap();
-        advancer
-            .advance(&client, &fixture.factory, &fixture.factory, &fixture.filter, &mut head, 64)
-            .await
-            .unwrap();
-        assert_eq!(head.block_hash, c4.hash());
-        fixture.assert_checkpoint(head);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1514,86 +1273,6 @@ mod tests {
         assert_eq!(head.block_hash, new.hash());
         fixture.assert_checkpoint(head);
         assert!(client.responses.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn reconciles_after_canonical_notification_lag() {
-        let fixture = RecoveryFixture::new();
-        let mut head = fixture.pivot;
-        let first = fixture.block(1, head.block_hash, 11);
-        let second = fixture.block(2, first.hash(), 12);
-        let (sender, receiver) = broadcast::channel(1);
-        let mut advancer = PartialStateAdvancer::new(receiver);
-        let client = RecoveryFixture::client(vec![
-            (first.state_root(), RecoveryFixture::response(11)),
-            (second.state_root(), RecoveryFixture::response(12)),
-        ]);
-        advancer
-            .advance(&client, &fixture.factory, &fixture.factory, &fixture.filter, &mut head, 64)
-            .await
-            .unwrap();
-        fixture.set_canonical(&[first.clone(), second.clone()]);
-        for block in [first, second.clone()] {
-            sender
-                .send(CanonStateNotification::Commit { new: RecoveryFixture::chain(vec![block]) })
-                .unwrap();
-        }
-        assert_eq!(
-            advancer
-                .advance(
-                    &client,
-                    &fixture.factory,
-                    &fixture.factory,
-                    &fixture.filter,
-                    &mut head,
-                    64
-                )
-                .await
-                .unwrap(),
-            PartialStateAdvanceOutcome::Reconciled { advanced: 2, reverted: 0, pruned: 0 }
-        );
-        assert_eq!(head.block_hash, second.hash());
-        fixture.assert_checkpoint(head);
-        assert!(client.responses.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn invalid_commitment_proofs_remain_fatal_during_recovery() {
-        let fixture = RecoveryFixture::new();
-        let mut head = fixture.pivot;
-        let child = fixture.block(1, head.block_hash, 11);
-        fixture.set_canonical(std::slice::from_ref(&child));
-        let (_sender, receiver) = broadcast::channel(16);
-        let mut advancer = PartialStateAdvancer::new(receiver);
-        let client = RecoveryFixture::client(vec![
-            (child.state_root(), Err(RequestError::UnsupportedCapability)),
-            (child.state_root(), RecoveryFixture::response(10)),
-        ]);
-        assert_eq!(
-            advancer
-                .advance(
-                    &client,
-                    &fixture.factory,
-                    &fixture.factory,
-                    &fixture.filter,
-                    &mut head,
-                    64
-                )
-                .await
-                .unwrap(),
-            PartialStateAdvanceOutcome::AwaitingCommitment
-        );
-        let err = advancer
-            .advance(&client, &fixture.factory, &fixture.factory, &fixture.filter, &mut head, 64)
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            err.downcast_ref::<PartialStateAccountResolverError>(),
-            Some(PartialStateAccountResolverError::InvalidProof { .. })
-        ));
-        assert!(!commitment_is_unavailable(&err));
-        assert_eq!(head, fixture.pivot);
-        fixture.assert_checkpoint(head);
     }
 
     #[test]
