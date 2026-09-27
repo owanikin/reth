@@ -123,7 +123,7 @@ impl std::fmt::Display for TargetChanged {
 }
 impl std::error::Error for TargetChanged {}
 
-fn unavailable(err: &eyre::Report) -> bool {
+pub(super) fn unavailable(err: &eyre::Report) -> bool {
     err.is::<DataUnavailable>() ||
         commitment_is_unavailable(err) ||
         err.downcast_ref::<RequestError>().is_some_and(|err| {
@@ -266,6 +266,13 @@ async fn fetch_header<Client: HeadersClient>(
         eyre::ensure!(header.hash() == hash, "local partial-state header hash mismatch");
         return Ok(header)
     }
+    fetch_peer_header(client, hash).await
+}
+
+pub(super) async fn fetch_peer_header<Client: HeadersClient>(
+    client: &Client,
+    hash: B256,
+) -> eyre::Result<SealedHeader<Client::Header>> {
     let response = timeout(
         REQUEST_TIMEOUT,
         client.get_headers_with_priority(HeadersRequest::one(hash.into()), Priority::High),

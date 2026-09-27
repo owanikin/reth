@@ -387,6 +387,12 @@ pub enum PartialStateSnapDownloaderError {
     /// Peer returned a snap response that does not match the active request.
     #[error("unexpected snap response: {0}")]
     UnexpectedResponse(&'static str),
+    /// Peer could not serve the beginning of a known nonempty state trie.
+    #[error("snap peer cannot serve partial-state root {root}")]
+    StateUnavailable {
+        /// Requested state root.
+        root: B256,
+    },
 }
 
 /// Downloads snap account ranges for a partial-state initial sync.
@@ -541,6 +547,15 @@ where
         peer_id: PeerId,
         response: AccountRangeMessage,
     ) -> Result<PartialStateSnapEvent, PartialStateSnapDownloaderError> {
+        if request.starting_hash == B256::ZERO &&
+            request.root_hash != EMPTY_ROOT_HASH &&
+            response.accounts.is_empty() &&
+            response.proof.is_empty()
+        {
+            return Err(PartialStateSnapDownloaderError::StateUnavailable {
+                root: request.root_hash,
+            })
+        }
         self.progress.accounts += response.accounts.len() as u64;
         self.progress.account_bytes +=
             response.accounts.iter().map(|account| account.body.len() as u64).sum::<u64>();
@@ -1542,6 +1557,32 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resolved.get(&address), Some(&None));
+    }
+
+    #[tokio::test]
+    async fn empty_initial_response_distinguishes_unavailable_root_from_empty_state() {
+        for root in [B256::repeat_byte(0x11), EMPTY_ROOT_HASH] {
+            let client = MockSnapClient::new([Ok(WithPeerId::new(
+                PeerId::repeat_byte(0x22),
+                SnapResponse::AccountRange(AccountRangeMessage {
+                    request_id: 0,
+                    accounts: vec![],
+                    proof: vec![],
+                }),
+            ))]);
+            let mut downloader = PartialStateSnapDownloader::new(client);
+            downloader.start(PartialStateSnapTarget::full_range(root));
+            let event = downloader.next().await.unwrap();
+            if root == EMPTY_ROOT_HASH {
+                assert!(event.is_ok());
+                assert_eq!(downloader.progress().account_range_responses, 1);
+            } else {
+                assert!(matches!(event,
+                    Err(PartialStateSnapDownloaderError::StateUnavailable { root: unavailable })
+                    if unavailable == root));
+                assert_eq!(downloader.progress(), PartialStateSnapProgress::default());
+            }
+        }
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@ use crate::{
     common::{Attached, LaunchContextWith, WithConfigs},
     hooks::NodeHooks,
     launch::partial_state::{
-        retain_payload_bal, select_partial_state_bootstrap, wait_for_partial_state_bootstrap,
+        retain_payload_bal, select_partial_state_bootstrap, wait_for_bootstrap,
         PartialStateAdvanceOutcome, PartialStateAdvancer, PartialStateBootstrap,
     },
     rpc::{EngineShutdown, EngineValidatorAddOn, EngineValidatorBuilder, RethRpcAddOns, RpcHandle},
@@ -361,6 +361,7 @@ impl EngineNodeLauncher {
         let partial_state_network_client = network_client.clone();
         let partial_state_task_executor = ctx.task_executor().clone();
         let partial_state_bal_retention = ctx.configs().partial_state.bal_retention();
+        let partial_state_trusted_checkpoint = ctx.configs().partial_state.trusted_checkpoint;
 
         info!(target: "reth::cli", "Starting consensus engine");
         let consensus_engine = move |mut on_graceful_shutdown| async move {
@@ -373,6 +374,7 @@ impl EngineNodeLauncher {
                     filter,
                     partial_state_bal_retention,
                     partial_state_target_rx,
+                    partial_state_trusted_checkpoint,
                 )
             });
             if let Some(initial_target) = initial_target {
@@ -524,6 +526,7 @@ impl EngineNodeLauncher {
 }
 
 /// Spawns partial-state recovery and canonical advancement.
+#[expect(clippy::too_many_arguments)]
 fn spawn_partial_state_sync<N, Client>(
     task_executor: &TaskExecutor,
     client: Client,
@@ -532,6 +535,7 @@ fn spawn_partial_state_sync<N, Client>(
     filter: ConfiguredContractFilter,
     retention: u64,
     targets: watch::Receiver<Option<B256>>,
+    trusted_checkpoint: Option<reth_config::PartialStateTrustedCheckpoint>,
 ) -> watch::Receiver<()>
 where
     N: ProviderNodeTypes + 'static,
@@ -546,11 +550,13 @@ where
     let (task_alive, task) = watch::channel(());
     task_executor.spawn_critical_task("partial-state snap sync", async move {
         let _task_alive = task_alive;
-        let bootstrap = wait_for_partial_state_bootstrap(
+        let bootstrap = wait_for_bootstrap(
+            &client,
             &provider_factory,
             &canonical_provider,
             &filter,
             true,
+            trusted_checkpoint,
         )
         .await;
         let mut partial_head = match bootstrap {
@@ -643,6 +649,7 @@ where
                 &canonical_provider,
                 &filter,
                 &mut partial_head,
+                trusted_checkpoint,
             )
             .await
             {
@@ -660,17 +667,18 @@ where
     task
 }
 
-async fn finish_partial_state_advance<N, Client>(
+pub(super) async fn finish_partial_state_advance<N, Client>(
     outcome: eyre::Result<PartialStateAdvanceOutcome>,
     client: Client,
     provider_factory: &ProviderFactory<N>,
     canonical_provider: &BlockchainProvider<N>,
     filter: &ConfiguredContractFilter,
     partial_head: &mut PartialStateSnapPivot,
+    trusted_checkpoint: Option<reth_config::PartialStateTrustedCheckpoint>,
 ) -> eyre::Result<()>
 where
     N: ProviderNodeTypes + 'static,
-    Client: SnapClient + Clone + Unpin + 'static,
+    Client: SnapClient + HeadersClient + Clone + Unpin + 'static,
 {
     match outcome? {
         PartialStateAdvanceOutcome::Reconciled { advanced, reverted, pruned }
@@ -692,6 +700,14 @@ where
         resync @ (PartialStateAdvanceOutcome::ResyncRequired { .. } |
         PartialStateAdvanceOutcome::BootstrapRequired { .. } |
         PartialStateAdvanceOutcome::TargetTooDistant) => {
+            // An explicit seed must never fall back to this node's executed state. An old seed
+            // cannot repair an out-of-window gap; preserve the checkpoint for operator recovery.
+            if let Some(seed) = trusted_checkpoint {
+                eyre::ensure!(
+                    seed.block_number > partial_head.block_number,
+                    "partial-state recovery requires a newer trusted checkpoint; local full-state bootstrap is disabled"
+                );
+            }
             match resync {
                 PartialStateAdvanceOutcome::ResyncRequired { unavailable_block, reverted } => {
                     warn!(target: "reth::cli", block_number = unavailable_block.number,
@@ -704,24 +720,33 @@ where
                         "Partial-state replay reached a pre-BAL block; waiting for a compatible snapshot");
                 }
                 PartialStateAdvanceOutcome::TargetTooDistant => {
-                    let Some(PartialStateBootstrap::Sync(pivot)) = select_partial_state_bootstrap(
-                        provider_factory,
-                        canonical_provider,
-                        filter,
-                        false,
-                    )?
-                    else {
-                        return Ok(())
-                    };
-                    if pivot.block_number <= partial_head.block_number {
-                        return Ok(())
+                    if trusted_checkpoint.is_none() {
+                        let Some(PartialStateBootstrap::Sync(pivot)) =
+                            select_partial_state_bootstrap(
+                                provider_factory,
+                                canonical_provider,
+                                filter,
+                                false,
+                            )?
+                        else {
+                            return Ok(())
+                        };
+                        if pivot.block_number <= partial_head.block_number {
+                            return Ok(())
+                        }
+                        info!(target: "reth::cli", "Partial-state forkchoice target exceeds replay window; waiting for a newer pivot");
                     }
-                    info!(target: "reth::cli", "Partial-state forkchoice target exceeds replay window; waiting for a newer pivot");
                 }
                 _ => unreachable!(),
             }
-            let (pivot, progress) =
-                resync_partial_state(client, provider_factory, canonical_provider, filter).await?;
+            let (pivot, progress) = resync_partial_state(
+                client,
+                provider_factory,
+                canonical_provider,
+                filter,
+                trusted_checkpoint,
+            )
+            .await?;
             *partial_head = pivot;
             info!(
                 target: "reth::cli",
@@ -745,14 +770,21 @@ async fn resync_partial_state<N, Client>(
     provider_factory: &ProviderFactory<N>,
     canonical_provider: &BlockchainProvider<N>,
     filter: &ConfiguredContractFilter,
+    trusted_checkpoint: Option<reth_config::PartialStateTrustedCheckpoint>,
 ) -> eyre::Result<(PartialStateSnapPivot, reth_downloaders::snap::PartialStateSnapProgress)>
 where
     N: ProviderNodeTypes + 'static,
-    Client: SnapClient + Clone + Unpin + 'static,
+    Client: SnapClient + HeadersClient + Clone + Unpin + 'static,
 {
-    let bootstrap =
-        wait_for_partial_state_bootstrap(provider_factory, canonical_provider, filter, false)
-            .await?;
+    let bootstrap = wait_for_bootstrap(
+        &client,
+        provider_factory,
+        canonical_provider,
+        filter,
+        false,
+        trusted_checkpoint,
+    )
+    .await?;
     let (PartialStateBootstrap::Sync(pivot) | PartialStateBootstrap::Resume(pivot)) = bootstrap;
     let progress =
         run_partial_state_snap_sync(client, provider_factory.clone(), filter.clone(), pivot)
@@ -761,7 +793,7 @@ where
 }
 
 /// Runs a partial-state snap download and persists each successful snap event.
-async fn run_partial_state_snap_sync<N, Client>(
+pub(super) async fn run_partial_state_snap_sync<N, Client>(
     client: Client,
     provider_factory: ProviderFactory<N>,
     filter: ConfiguredContractFilter,
@@ -773,11 +805,29 @@ where
 {
     // The independent worker may start before any snap-capable peer has connected.
     loop {
-        match run_partial_state_snap_sync_once(client.clone(), provider_factory.clone(), filter.clone(), pivot).await {
-            Err(err) if err.downcast_ref::<PartialStateSnapDownloaderError>().is_some_and(|error| {
-                matches!(error, PartialStateSnapDownloaderError::Request(request)
-                    if request.is_retryable() || matches!(request, reth_network_p2p::error::RequestError::UnsupportedCapability))
-            }) => {
+        match run_partial_state_snap_sync_once(
+            client.clone(),
+            provider_factory.clone(),
+            filter.clone(),
+            pivot,
+        )
+        .await
+        {
+            Err(err)
+                if err.downcast_ref::<PartialStateSnapDownloaderError>().is_some_and(|error| {
+                    match error {
+                        PartialStateSnapDownloaderError::StateUnavailable { .. } => true,
+                        PartialStateSnapDownloaderError::Request(request) => {
+                            request.is_retryable() ||
+                                matches!(
+                                    request,
+                                    reth_network_p2p::error::RequestError::UnsupportedCapability
+                                )
+                        }
+                        _ => false,
+                    }
+                }) =>
+            {
                 warn!(target: "reth::cli", block_number = pivot.block_number, state_root = %pivot.state_root,
                     %err, "Partial-state bootstrap deferred; waiting for snap peer availability");
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -787,7 +837,7 @@ where
     }
 }
 
-async fn run_partial_state_snap_sync_once<N, Client>(
+pub(super) async fn run_partial_state_snap_sync_once<N, Client>(
     client: Client,
     provider_factory: ProviderFactory<N>,
     filter: ConfiguredContractFilter,
@@ -797,8 +847,6 @@ where
     N: ProviderNodeTypes + 'static,
     Client: SnapClient + Clone + Unpin + 'static,
 {
-    provider_factory.begin_partial_state_sync(pivot, &filter)?;
-
     let mut downloader = PartialStateSnapDownloader::with_filter(
         client,
         PartialStateSnapDownloaderConfig::default(),
@@ -806,11 +854,28 @@ where
     );
     downloader.start(PartialStateSnapTarget::full_range(pivot.state_root));
 
-    while let Some(event) = downloader.next().await {
+    let mut started = false;
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(20), downloader.next())
+            .await
+            .map_err(|_| {
+                PartialStateSnapDownloaderError::Request(
+                    reth_network_p2p::error::RequestError::Timeout,
+                )
+            })?;
+        let Some(event) = event else { break };
         let event = event?;
+        // Do not discard an existing checkpoint merely because a peer cannot serve the new
+        // root yet. Once useful data arrives, replacement state is explicitly marked syncing.
+        if !started {
+            provider_factory.begin_partial_state_sync(pivot, &filter)?;
+            started = true;
+        }
         persist_partial_state_snap_event(&provider_factory, &event)?;
         report_partial_snap_progress(event.progress());
     }
+
+    eyre::ensure!(started, "partial-state snap download ended without an account response");
 
     let progress = downloader.progress();
     report_partial_snap_progress(progress);

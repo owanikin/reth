@@ -1,5 +1,5 @@
 //! Configuration files.
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use reth_network_types::{PeersConfig, SessionsConfig};
 use reth_prune_types::{PruneModes, MINIMUM_UNWIND_SAFE_DISTANCE};
 use reth_stages_types::ExecutionStageThresholds;
@@ -70,6 +70,9 @@ pub struct PartialStateConfig {
     pub contracts_file: Option<PathBuf>,
     /// Number of recent blocks of BAL history to retain.
     pub bal_retention: u64,
+    /// Optional operator-trusted bootstrap seed. Newer complete checkpoints take precedence.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub trusted_checkpoint: Option<PartialStateTrustedCheckpoint>,
 }
 
 impl Default for PartialStateConfig {
@@ -79,6 +82,7 @@ impl Default for PartialStateConfig {
             contracts: BTreeSet::new(),
             contracts_file: None,
             bal_retention: DEFAULT_PARTIAL_STATE_BAL_RETENTION,
+            trusted_checkpoint: None,
         }
     }
 }
@@ -91,6 +95,9 @@ impl PartialStateConfig {
 
     /// Validates the partial-state configuration.
     pub fn validate(&self) -> eyre::Result<()> {
+        if let Some(checkpoint) = self.trusted_checkpoint {
+            checkpoint.validate()?;
+        }
         if self.enabled && self.bal_retention < MIN_PARTIAL_STATE_BAL_RETENTION {
             eyre::bail!(
                 "partial-state BAL retention must be at least {} blocks, got {}",
@@ -99,6 +106,37 @@ impl PartialStateConfig {
             );
         }
 
+        Ok(())
+    }
+}
+
+/// Operator-supplied trust anchor for a research partial-state bootstrap.
+///
+/// The header hash authenticates the requested header, not its execution validity. The operator
+/// must obtain this checkpoint from a trusted source on the configured chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+pub struct PartialStateTrustedCheckpoint {
+    /// Execution chain ID.
+    pub chain_id: u64,
+    /// Genesis hash, distinguishing networks that reuse the same chain ID.
+    pub genesis_hash: B256,
+    /// Bootstrap block number.
+    pub block_number: u64,
+    /// Trusted bootstrap header hash.
+    pub block_hash: B256,
+    /// State root committed by the bootstrap header.
+    pub state_root: B256,
+}
+
+impl PartialStateTrustedCheckpoint {
+    /// Rejects placeholder identities before attempting network requests.
+    pub fn validate(&self) -> eyre::Result<()> {
+        eyre::ensure!(
+            !self.genesis_hash.is_zero() && !self.block_hash.is_zero(),
+            "partial-state trusted checkpoint requires nonzero genesis and block hashes"
+        );
         Ok(())
     }
 }
@@ -700,9 +738,9 @@ where
 
 #[cfg(all(test, feature = "serde"))]
 mod tests {
-    use super::{Config, EXTENSION};
+    use super::{Config, PartialStateTrustedCheckpoint, EXTENSION};
     use crate::PruneConfig;
-    use alloy_primitives::Address;
+    use alloy_primitives::{Address, B256};
     use reth_network_peers::TrustedPeer;
     use reth_prune_types::{
         PruneMode, PruneModes, ReceiptsLogPruneConfig, MINIMUM_UNWIND_SAFE_DISTANCE,
@@ -850,6 +888,13 @@ mod tests {
             ]);
             config.partial_state.contracts_file = Some(PathBuf::from("partial-contracts.json"));
             config.partial_state.bal_retention = 128;
+            config.partial_state.trusted_checkpoint = Some(PartialStateTrustedCheckpoint {
+                chain_id: 1,
+                genesis_hash: B256::repeat_byte(1),
+                block_number: 100,
+                block_hash: B256::repeat_byte(2),
+                state_root: B256::repeat_byte(3),
+            });
 
             std::fs::write(
                 config_path,
@@ -862,6 +907,29 @@ mod tests {
             assert_eq!(config, loaded_config);
             loaded_config.partial_state.validate().unwrap();
         })
+    }
+
+    #[test]
+    fn partial_state_trusted_checkpoint_requires_complete_identity() {
+        let valid = r#"
+            chain_id = 1
+            genesis_hash = "0x1111111111111111111111111111111111111111111111111111111111111111"
+            block_number = 10
+            block_hash = "0x2222222222222222222222222222222222222222222222222222222222222222"
+            state_root = "0x3333333333333333333333333333333333333333333333333333333333333333"
+        "#;
+        let checkpoint: PartialStateTrustedCheckpoint = toml::from_str(valid).unwrap();
+        checkpoint.validate().unwrap();
+        assert!(toml::from_str::<PartialStateTrustedCheckpoint>(
+            &valid.replace("chain_id = 1", "")
+        )
+        .is_err());
+        assert!(toml::from_str::<PartialStateTrustedCheckpoint>(&format!("{valid}\nunknown = 1"))
+            .is_err());
+        assert!(PartialStateTrustedCheckpoint { block_hash: B256::ZERO, ..checkpoint }
+            .validate()
+            .is_err());
+        assert!(toml::from_str::<Config>("").unwrap().partial_state.trusted_checkpoint.is_none());
     }
 
     #[test]

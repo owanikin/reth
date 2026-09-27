@@ -1,11 +1,15 @@
 use super::*;
-use reth_eth_wire_types::BlockAccessLists;
+use reth_eth_wire_types::{
+    snap::{ByteCodesMessage, StorageData, StorageRangesMessage},
+    BlockAccessLists,
+};
 use reth_network_p2p::{
     headers::client::{HeadersClient, HeadersFut, HeadersRequest},
     BalRequirement, BlockAccessListsClient,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::watch;
+mod bootstrap;
 
 #[derive(Debug)]
 struct Peer {
@@ -19,6 +23,10 @@ struct Peer {
     bal_requests: AtomicUsize,
     bad_responses: AtomicUsize,
     change_on_proof: Mutex<Option<(watch::Sender<Option<B256>>, B256)>>,
+    bootstrap_root: Option<B256>,
+    bootstrap_accounts: Vec<AccountData>,
+    snap_available: AtomicBool,
+    tracked_state: Option<(B256, Vec<StorageData>, Bytes)>,
 }
 
 impl Peer {
@@ -39,6 +47,10 @@ impl Peer {
             bal_requests: AtomicUsize::new(0),
             bad_responses: AtomicUsize::new(0),
             change_on_proof: Mutex::new(None),
+            bootstrap_root: None,
+            bootstrap_accounts: Vec::new(),
+            snap_available: AtomicBool::new(true),
+            tracked_state: None,
         }
     }
 }
@@ -108,26 +120,70 @@ impl SnapClient for Peer {
         request: GetAccountRangeMessage,
         priority: Priority,
     ) -> Self::Output {
+        if request.starting_hash != request.limit_hash {
+            assert_eq!(Some(request.root_hash), self.bootstrap_root);
+            let accounts = if self.snap_available.load(Ordering::Relaxed) {
+                self.bootstrap_accounts
+                    .iter()
+                    .filter(|account| {
+                        account.hash >= request.starting_hash && account.hash <= request.limit_hash
+                    })
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            return future::ready(Ok(WithPeerId::new(
+                PeerId::repeat_byte(1),
+                SnapResponse::AccountRange(AccountRangeMessage {
+                    request_id: request.request_id,
+                    accounts,
+                    proof: Vec::new(),
+                }),
+            )));
+        }
         if let Some((sender, hash)) = self.change_on_proof.lock().unwrap().take() {
             sender.send_replace(Some(hash));
         }
         self.snap.get_account_range_with_priority(request, priority)
     }
-    fn get_storage_ranges(&self, _: GetStorageRangesMessage) -> Self::Output {
-        panic!("untracked storage")
+    fn get_storage_ranges(&self, request: GetStorageRangesMessage) -> Self::Output {
+        self.get_storage_ranges_with_priority(request, Priority::Normal)
     }
     fn get_storage_ranges_with_priority(
         &self,
-        _: GetStorageRangesMessage,
+        request: GetStorageRangesMessage,
         _: Priority,
     ) -> Self::Output {
-        panic!("untracked storage")
+        let (hash, slots, _) = self.tracked_state.as_ref().expect("untracked storage");
+        assert_eq!(request.account_hashes, [*hash]);
+        assert_eq!(Some(request.root_hash), self.bootstrap_root);
+        future::ready(Ok(WithPeerId::new(
+            PeerId::repeat_byte(1),
+            SnapResponse::StorageRanges(StorageRangesMessage {
+                request_id: request.request_id,
+                slots: vec![slots.clone()],
+                proof: Vec::new(),
+            }),
+        )))
     }
-    fn get_byte_codes(&self, _: GetByteCodesMessage) -> Self::Output {
-        panic!("untracked code")
+    fn get_byte_codes(&self, request: GetByteCodesMessage) -> Self::Output {
+        self.get_byte_codes_with_priority(request, Priority::Normal)
     }
-    fn get_byte_codes_with_priority(&self, _: GetByteCodesMessage, _: Priority) -> Self::Output {
-        panic!("untracked code")
+    fn get_byte_codes_with_priority(
+        &self,
+        request: GetByteCodesMessage,
+        _: Priority,
+    ) -> Self::Output {
+        let (_, _, code) = self.tracked_state.as_ref().expect("untracked code");
+        assert_eq!(request.hashes, [keccak256(code)]);
+        future::ready(Ok(WithPeerId::new(
+            PeerId::repeat_byte(1),
+            SnapResponse::ByteCodes(ByteCodesMessage {
+                request_id: request.request_id,
+                codes: vec![code.clone()],
+            }),
+        )))
     }
     fn get_trie_nodes(&self, _: GetTrieNodesMessage) -> Self::Output {
         panic!("trie nodes")

@@ -7,7 +7,9 @@ not interrupt retries or replay.
 
 ## Data Path
 
-1. Resume a verified checkpoint or download a BAL-compatible persisted pivot as before.
+1. Resume a verified checkpoint or download a BAL-compatible pivot. By default selection
+   uses local persistence; an explicit trusted seed enables
+   [peer-backed bootstrap](partial-state-bootstrap.md#peer-backed-trusted-bootstrap).
 2. Resolve the selected head and its ancestry by hash. Local headers are an optional cache;
    missing headers are downloaded and their hashes and parent numbers checked.
 3. Roll back journaled partial transitions to the common ancestor, then replay forward.
@@ -27,14 +29,15 @@ Worker failure is reported even if the executed chain stops producing notificati
 
 - This follows a CL-selected branch; matching BAL and state commitments does **not** prove
   execution validity. The normal engine retains responsibility for Engine API responses.
-- Bootstrap, including restart eligibility checks, still uses local header/persisted-state
-  providers. Out-of-retention reorg recovery still needs a BAL-compatible persisted pivot.
-  Normal execution and full-state storage have not been disabled.
+- Default bootstrap and out-of-retention recovery use local header/persisted-state
+  providers. With an explicit trusted seed they use peer headers and partial tables;
+  recovery that needs a newer seed fails closed rather than using local full state.
+  Normal execution and full-state storage have not been disabled in either mode.
 - BAL download requires an `eth/71`-capable peer when the payload BAL is not retained locally.
   Snap proofs require `snap/1` and availability of the requested historical root.
 - Ancestry buffering and its verified-header cache are each limited to 4096 headers.
   The cache survives target changes to avoid restarting slow ancestry downloads. Larger
-  gaps wait for a newer persisted pivot rather than allocating an unbounded branch.
+  gaps require a newer pivot rather than allocating an unbounded branch.
   Journal retention still bounds rollback.
 - A header available only in an unexecuted payload is not yet a local header cache entry;
   a peer must serve it until normal execution makes it locally available.

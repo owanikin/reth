@@ -9,4 +9,6 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod config;
-pub use config::{BodiesConfig, Config, PartialStateConfig, PruneConfig};
+pub use config::{
+    BodiesConfig, Config, PartialStateConfig, PartialStateTrustedCheckpoint, PruneConfig,
+};

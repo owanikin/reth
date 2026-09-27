@@ -20,6 +20,8 @@ pub struct PartialStateConfig {
     pub contracts_file: Option<PathBuf>,
     /// Number of recent blocks of BAL history to retain.
     pub bal_retention: u64,
+    /// Optional trusted bootstrap seed, configured through `reth.toml`.
+    pub trusted_checkpoint: Option<reth_config::PartialStateTrustedCheckpoint>,
 }
 
 impl PartialStateConfig {
@@ -50,6 +52,9 @@ impl PartialStateConfig {
 
     /// Validates the partial-state configuration.
     pub fn validate(&self) -> eyre::Result<()> {
+        if let Some(checkpoint) = self.trusted_checkpoint {
+            checkpoint.validate()?;
+        }
         if self.enabled && self.bal_retention < MIN_PARTIAL_STATE_BAL_RETENTION {
             eyre::bail!(
                 "partial-state BAL retention must be at least {} blocks, got {}",
@@ -63,10 +68,16 @@ impl PartialStateConfig {
 
     /// Creates a node partial-state config from the persisted TOML config.
     pub fn from_toml_config(config: reth_config::PartialStateConfig) -> eyre::Result<Self> {
-        let reth_config::PartialStateConfig { enabled, contracts, contracts_file, bal_retention } =
-            config;
+        let reth_config::PartialStateConfig {
+            enabled,
+            contracts,
+            contracts_file,
+            bal_retention,
+            trusted_checkpoint,
+        } = config;
 
-        let mut config = Self { enabled, contracts, contracts_file, bal_retention };
+        let mut config =
+            Self { enabled, contracts, contracts_file, bal_retention, trusted_checkpoint };
         config.load_contracts_file()?;
         config.validate()?;
         Ok(config)
@@ -88,6 +99,9 @@ impl PartialStateConfig {
         }
 
         merged.enabled |= self.enabled;
+        if self.trusted_checkpoint.is_some() {
+            merged.trusted_checkpoint = self.trusted_checkpoint;
+        }
         merged.contracts.extend(self.contracts.iter().copied());
 
         if self.contracts_file.is_some() {
@@ -120,6 +134,7 @@ impl Default for PartialStateConfig {
             contracts: BTreeSet::new(),
             contracts_file: None,
             bal_retention: DEFAULT_PARTIAL_STATE_BAL_RETENTION,
+            trusted_checkpoint: None,
         }
     }
 }
@@ -154,7 +169,13 @@ impl PartialStateArgs {
 
         let contracts: BTreeSet<_> = contracts.into_iter().collect();
 
-        let mut config = PartialStateConfig { enabled, contracts, contracts_file, bal_retention };
+        let mut config = PartialStateConfig {
+            enabled,
+            contracts,
+            contracts_file,
+            bal_retention,
+            trusted_checkpoint: None,
+        };
         config.load_contracts_file()?;
         config.validate()?;
         Ok(config)
@@ -318,12 +339,14 @@ mod tests {
             contracts: BTreeSet::from([from_cli]),
             contracts_file: None,
             bal_retention: MIN_PARTIAL_STATE_BAL_RETENTION,
+            trusted_checkpoint: None,
         };
         let toml_config = reth_config::PartialStateConfig {
             enabled: true,
             contracts: BTreeSet::from([from_toml]),
             contracts_file: None,
             bal_retention: 128,
+            trusted_checkpoint: None,
         };
 
         let merged = cli_config.merge_with_toml_config(&toml_config).unwrap();
@@ -344,6 +367,7 @@ mod tests {
             contracts: BTreeSet::from([tracked]),
             contracts_file: None,
             bal_retention: 128,
+            trusted_checkpoint: None,
         };
 
         let merged = cli_config.merge_with_toml_config(&toml_config).unwrap();
@@ -352,6 +376,34 @@ mod tests {
         assert_eq!(merged.contracts, BTreeSet::from([tracked]));
         assert_eq!(merged.bal_retention(), 128);
         assert!(merged.is_contract_tracked(&tracked));
+    }
+
+    #[test]
+    fn merges_trusted_checkpoint_from_toml_with_cli_contracts() {
+        let checkpoint = reth_config::PartialStateTrustedCheckpoint {
+            chain_id: 1,
+            genesis_hash: alloy_primitives::B256::repeat_byte(1),
+            block_number: 10,
+            block_hash: alloy_primitives::B256::repeat_byte(2),
+            state_root: alloy_primitives::B256::repeat_byte(3),
+        };
+        let toml = reth_config::PartialStateConfig {
+            trusted_checkpoint: Some(checkpoint),
+            ..Default::default()
+        };
+        let args = PartialStateArgs {
+            enabled: true,
+            contracts: vec![Address::repeat_byte(1)],
+            ..Default::default()
+        };
+        let merged = args.merge_with_toml_config(&toml).unwrap();
+        assert!(merged.is_enabled());
+        assert_eq!(merged.trusted_checkpoint, Some(checkpoint));
+        assert!(merged.is_contract_tracked(&Address::repeat_byte(1)));
+        assert_eq!(
+            PartialStateArgs::default().merge_with_toml_config(&toml).unwrap().trusted_checkpoint,
+            Some(checkpoint)
+        );
     }
 
     #[test]

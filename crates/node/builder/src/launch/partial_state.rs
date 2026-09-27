@@ -20,7 +20,9 @@ use reth_storage_api::{
 };
 use reth_tracing::tracing::{debug, info, warn};
 use std::time::Duration;
+mod bootstrap;
 mod forkchoice;
+pub(crate) use bootstrap::wait_for_bootstrap;
 pub(crate) use forkchoice::PartialStateAdvancer;
 
 /// A bootstrap decision that does not modify the saved checkpoint or partial tables.
