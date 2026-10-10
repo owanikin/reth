@@ -160,11 +160,21 @@ impl<N: NetworkPrimitives> NetworkState<N> {
         let block_number = status.latest_block.unwrap_or_else(|| {
             self.client.block_number(status.blockhash).ok().flatten().unwrap_or_default()
         });
+        // Hello lists advertised versions, but requests must use the negotiated eth version.
+        // In particular, a remote eth/71 advertisement does not authorize BALs over eth/69.
+        let fetch_capabilities = Capabilities::new(
+            capabilities
+                .capabilities()
+                .iter()
+                .filter(|cap| cap.name != "eth" || cap.version == status.version as usize)
+                .cloned()
+                .collect(),
+        );
         self.state_fetcher.new_active_peer(
             peer,
             status.blockhash,
             block_number,
-            Arc::clone(&capabilities),
+            Arc::new(fetch_capabilities),
             timeout,
             range_info,
         );
@@ -675,7 +685,9 @@ mod tests {
     use reth_eth_wire::{BlockBodies, Capabilities, Capability, EthNetworkPrimitives, EthVersion};
     use reth_ethereum_primitives::BlockBody;
     use reth_network_api::PeerRequestSender;
-    use reth_network_p2p::{bodies::client::BodiesClient, error::RequestError};
+    use reth_network_p2p::{
+        bodies::client::BodiesClient, error::RequestError, BlockAccessListsClient,
+    };
     use reth_network_peers::PeerId;
     use reth_storage_api::noop::NoopProvider;
     use std::{
@@ -701,6 +713,41 @@ mod tests {
 
     fn capabilities() -> Arc<Capabilities> {
         Arc::new(vec![Capability::from(EthVersion::Eth67)].into())
+    }
+
+    #[tokio::test]
+    async fn bal_selection_uses_negotiated_eth_version() {
+        let mut state = state();
+        let client = state.fetch_client();
+        let peer_id = PeerId::random();
+        let (tx, mut session_rx) = mpsc::channel(1);
+        state.on_session_activated(
+            peer_id,
+            Arc::new(vec![Capability::eth_69(), Capability::eth_71()].into()),
+            Arc::new(reth_eth_wire::UnifiedStatus {
+                version: EthVersion::Eth69,
+                ..Default::default()
+            }),
+            PeerRequestSender::new(peer_id, tx),
+            Arc::new(AtomicU64::new(1)),
+            None,
+        );
+        // Keep advertisements for peer reporting, but do not schedule BALs on this session.
+        assert!(state.active_peers[&peer_id].capabilities.supports_eth_v71());
+        let task = tokio::spawn(async move {
+            loop {
+                poll_fn(|cx| state.poll(cx)).await;
+            }
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.get_block_access_lists(vec![B256::random()]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err(), RequestError::UnsupportedCapability);
+        assert!(matches!(session_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        task.abort();
     }
 
     // tests that ongoing requests are answered with connection dropped if the session that received

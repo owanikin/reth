@@ -97,10 +97,12 @@ Configure a newer trusted, serviceable seed and restart the worker via a node re
   its persisted pivot, not arbitrary historical roots. A full node's RPC `latest` header
   does not establish snap availability. Choose a serviceable pivot and arrange for its
   data to remain available throughout bootstrap; pivot discovery is not implemented here.
-- Normal Reth execution and its full-state storage remain enabled. This makes the
+- By default, normal Reth execution and its full-state storage remain enabled. This makes the
   **partial bootstrap path** independent, not the whole node a partial-only follower.
   Automatic genesis initialization is also unchanged. Use the empty-full-table Rust
   tests below as evidence of the bootstrap path's independence, not devnet disk size.
+  The separate opt-in [read-only follower mode](partial-state-follower.md) disables
+  normal execution and backfill, with additional RPC and Engine API restrictions.
 
 ## Verification
 

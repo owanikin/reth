@@ -64,6 +64,8 @@ impl Config {
 pub struct PartialStateConfig {
     /// Enables partial-state mode.
     pub enabled: bool,
+    /// Runs a non-validating, read-only follower instead of the execution engine.
+    pub follower: bool,
     /// Contracts whose storage and bytecode should be retained.
     pub contracts: BTreeSet<Address>,
     /// Optional JSON contract list path.
@@ -79,6 +81,7 @@ impl Default for PartialStateConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            follower: false,
             contracts: BTreeSet::new(),
             contracts_file: None,
             bal_retention: DEFAULT_PARTIAL_STATE_BAL_RETENTION,
@@ -95,6 +98,9 @@ impl PartialStateConfig {
 
     /// Validates the partial-state configuration.
     pub fn validate(&self) -> eyre::Result<()> {
+        if self.follower && self.trusted_checkpoint.is_none() {
+            eyre::bail!("partial-state follower requires a trusted checkpoint");
+        }
         if let Some(checkpoint) = self.trusted_checkpoint {
             checkpoint.validate()?;
         }
@@ -907,6 +913,26 @@ mod tests {
             assert_eq!(config, loaded_config);
             loaded_config.partial_state.validate().unwrap();
         })
+    }
+
+    #[test]
+    fn partial_state_follower_is_opt_in_and_requires_seed() {
+        let old: Config = toml::from_str("[partial_state]\nenabled = true").unwrap();
+        assert!(!old.partial_state.follower);
+        let mut config = old;
+        config.partial_state.follower = true;
+        assert!(config.partial_state.validate().is_err());
+        config.partial_state.trusted_checkpoint = Some(PartialStateTrustedCheckpoint {
+            chain_id: 1,
+            genesis_hash: B256::repeat_byte(1),
+            block_number: 10,
+            block_hash: B256::repeat_byte(2),
+            state_root: B256::repeat_byte(3),
+        });
+        config.partial_state.validate().unwrap();
+        let loaded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(loaded, config);
+        assert!(loaded.partial_state.follower);
     }
 
     #[test]

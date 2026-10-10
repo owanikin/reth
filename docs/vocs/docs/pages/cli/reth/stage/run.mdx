@@ -261,6 +261,11 @@ Networking:
 
           [default: reth/<VERSION>-<SHA>/<ARCH>]
 
+      --enable-eth71
+          Advertise experimental eth/71 support for block access list exchange.
+
+          Both peers must support eth/71 to exchange BALs. Partial-state nodes enable this automatically; full nodes serving them must opt in. Older eth versions remain available.
+
       --p2p-secret-key <PATH>
           Secret key to use for this node.
 

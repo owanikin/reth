@@ -311,6 +311,10 @@ where
     Pool: reth_transaction_pool::TransactionPoolExt<Block = BlockTy<Node::Types>> + Clone + 'static,
     Pool::Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>,
 {
+    // A follower admits no transactions and must not rewrite an existing local transaction backup.
+    if ctx.partial_state_config().follower {
+        return Ok(())
+    }
     spawn_local_backup_task(ctx, pool.clone())?;
     spawn_pool_maintenance_task(ctx, pool, pool_config)?;
     Ok(())

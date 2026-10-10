@@ -138,13 +138,109 @@ impl EngineNodeLauncher {
                 let settings = this.provider_factory().cached_storage_settings();
                 info!(target: "reth::cli", ?settings, "Loaded storage settings");
             })
-            .with_metrics_task()
+            .with_metrics_task();
+        let follower = ctx.configs().partial_state.follower;
+        eyre::ensure!(
+            !follower || installed_exex.is_empty(),
+            "partial-state follower cannot run execution extensions"
+        );
+        let ctx = ctx
             // passing FullNodeTypes as type parameter here so that we can build
             // later the components.
             .with_blockchain_db::<T, _>(move |provider_factory| {
-                Ok(BlockchainProvider::new(provider_factory)?)
+                Ok(BlockchainProvider::new(provider_factory)?.with_partial_state_follower(follower))
             })?
-            .with_components(components_builder, on_component_initialized).await?;
+            .with_components(components_builder, on_component_initialized)
+            .await?;
+
+        if follower {
+            // Branch before constructing the execution engine, backfill pipeline or persistence.
+            warn!(target: "reth::cli", "Starting non-validating partial-state follower: no execution, backfill, transaction admission or block production; Engine API remains SYNCING");
+            let network = ctx.components().network().clone();
+            network.update_sync_state(SyncState::Syncing);
+            let client = network.fetch_client().await?;
+            let (engine_tx, mut engine_rx) = unbounded_channel();
+            let beacon_engine_handle = ConsensusEngineHandle::new(engine_tx);
+            let event_sender = EventSender::default();
+            let add_ons_ctx = AddOnsContext {
+                node: ctx.node_adapter().clone(),
+                config: ctx.node_config(),
+                partial_state: ctx.configs().partial_state.clone(),
+                beacon_engine_handle,
+                jwt_secret: ctx.auth_jwt_secret()?,
+                engine_events: event_sender,
+            };
+            let RpcHandle {
+                rpc_server_handles,
+                rpc_registry,
+                engine_events,
+                beacon_engine_handle,
+                ..
+            } = add_ons.launch_add_ons(add_ons_ctx).await?;
+            let (engine_shutdown, shutdown_rx) = EngineShutdown::new();
+            let (targets, target_rx) = watch::channel(None);
+            let partial = &ctx.configs().partial_state;
+            let mut worker = spawn_partial_state_sync(
+                ctx.task_executor(),
+                client,
+                ctx.provider_factory().clone(),
+                ctx.blockchain_db().clone(),
+                partial.contract_filter(),
+                partial.bal_retention(),
+                target_rx,
+                partial.trusted_checkpoint,
+            );
+            let bals = ctx.provider_factory().bal_store().clone();
+            let (exit, rx) = oneshot::channel();
+            ctx.task_executor().spawn_critical_with_graceful_shutdown_signal(
+                "partial-state follower",
+                move |mut shutdown| async move {
+                    let mut shutdown_rx = shutdown_rx.fuse();
+                    let result = loop {
+                        tokio::select! {
+                            _ = worker.changed() => {
+                                break Err(eyre::eyre!("partial-state follower worker stopped"));
+                            }
+                            message = engine_rx.recv() => {
+                                let Some(message) = message else { break Ok(()) };
+                                super::follower::on_message(message, &targets, &bals);
+                            }
+                            request = &mut shutdown_rx => {
+                                if let Ok(request) = request {
+                                    let _ = request.done_tx.send(());
+                                }
+                                break Ok(());
+                            }
+                            _guard = &mut shutdown => break Ok(()),
+                        }
+                    };
+                    drop(worker);
+                    let _ = exit.send(result);
+                },
+            );
+            let full_node = FullNode {
+                evm_config: ctx.components().evm_config().clone(),
+                pool: ctx.components().pool().clone(),
+                network,
+                provider: ctx.node_adapter().provider.clone(),
+                payload_builder_handle: ctx.components().payload_builder_handle().clone(),
+                task_executor: ctx.task_executor().clone(),
+                config: ctx.node_config().clone(),
+                data_dir: ctx.data_dir().clone(),
+                add_ons_handle: RpcHandle {
+                    rpc_server_handles,
+                    rpc_registry,
+                    engine_events,
+                    beacon_engine_handle,
+                    engine_shutdown,
+                },
+            };
+            on_node_started.on_event(FullNode::clone(&full_node))?;
+            return Ok(NodeHandle {
+                node_exit_future: NodeExitFuture::new(async { rx.await? }),
+                node: full_node,
+            })
+        }
 
         // spawn exexs if any
         let maybe_exex_manager_handle = ctx.launch_exex(installed_exex).await?;
@@ -219,13 +315,11 @@ impl EngineNodeLauncher {
             .build_tree_validator(&add_ons_ctx, engine_tree_config.clone(), changeset_cache.clone())
             .await?;
 
-        // Retain payload BALs before the engine consumes the execution data. Canonical partial
-        // state applies them after forkchoice selects the corresponding block.
-        let payload_bal_store = ctx
-            .configs()
-            .partial_state
-            .is_enabled()
+        // Full eth/71 peers also need retained BALs to answer requests from partial followers.
+        let partial_state_enabled = ctx.configs().partial_state.is_enabled();
+        let bal_store = (partial_state_enabled || ctx.node_config().network.enable_eth71)
             .then(|| ctx.provider_factory().bal_store().clone());
+        let payload_bal_store = bal_store.clone();
         let (partial_state_targets, partial_state_target_rx) = watch::channel(None);
 
         // Create the consensus engine stream with optional reorg
@@ -253,7 +347,7 @@ impl EngineNodeLauncher {
                     BeaconEngineMessage::NewPayload { payload, .. } |
                     BeaconEngineMessage::RethNewPayload { payload, .. } => Some(payload),
                     BeaconEngineMessage::ForkchoiceUpdated { state, .. } => {
-                        if payload_bal_store.is_some() && !state.head_block_hash.is_zero() {
+                        if partial_state_enabled && !state.head_block_hash.is_zero() {
                             partial_state_targets.send_if_modified(|target| {
                                 if *target == Some(state.head_block_hash) {
                                     return false
@@ -356,8 +450,6 @@ impl EngineNodeLauncher {
             .then(|| ctx.configs().partial_state.contract_filter());
         let partial_state_provider_factory = ctx.provider_factory().clone();
         let partial_state_canonical_provider = ctx.blockchain_db().clone();
-        let partial_state_bal_store =
-            partial_state_filter.as_ref().map(|_| ctx.provider_factory().bal_store().clone());
         let partial_state_network_client = network_client.clone();
         let partial_state_task_executor = ctx.task_executor().clone();
         let partial_state_bal_retention = ctx.configs().partial_state.bal_retention();
@@ -450,7 +542,7 @@ impl EngineNodeLauncher {
                         }
                     }
                     payload = built_payloads.select_next_some(), if !built_payloads.is_terminated() => {
-                        if let Some(store) = &partial_state_bal_store &&
+                        if let Some(store) = &bal_store &&
                             let Some(raw_bal) = payload.block_access_list()
                         {
                             retain_payload_bal(
@@ -548,8 +640,7 @@ where
 {
     let mut advancer = PartialStateAdvancer::new(targets);
     let (task_alive, task) = watch::channel(());
-    task_executor.spawn_critical_task("partial-state snap sync", async move {
-        let _task_alive = task_alive;
+    let work = async move {
         let bootstrap = wait_for_bootstrap(
             &client,
             &provider_factory,
@@ -662,6 +753,13 @@ where
                 );
                 return
             }
+        }
+    };
+    task_executor.spawn_critical_task("partial-state snap sync", async move {
+        // Dropping the owner's receiver also cancels bootstrap and peer-availability waits.
+        tokio::select! {
+            _ = task_alive.closed() => {}
+            _ = work => {}
         }
     });
     task

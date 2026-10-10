@@ -168,6 +168,49 @@ fn assert_error(response: &Value, code: i64, message: &str) {
 }
 
 #[tokio::test]
+async fn partial_state_follower_rpc_reads_checkpoint_and_rejects_simulation() {
+    let f = Fixture::new();
+    let provider = BlockchainProvider::with_latest(f.factory.clone(), f.parent.clone())
+        .unwrap()
+        .with_partial_state_follower(true);
+    let api = Fixture::api(provider, true);
+    assert_eq!(rpc(&api, "eth_getBalance", json!([UNTRACKED, "latest"])).await["result"], "0x64");
+    assert_eq!(
+        rpc(&api, "eth_getCode", json!([TRACKED, "latest"])).await["result"],
+        json!(Bytes::from_static(CODE))
+    );
+    for method in ["eth_call", "eth_estimateGas"] {
+        let response = rpc(&api, method, json!([{"to": TRACKED}, "latest"])).await;
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("read-only partial-state follower"),
+            "{response}"
+        );
+    }
+    assert!(rpc(&api, "eth_getBalance", json!([TRACKED, "0x0"])).await.get("error").is_some());
+    let response = rpc(
+        &api,
+        "eth_simulateV1",
+        json!([{"blockStateCalls": [{"calls": [{"to": TRACKED}]}]}, "latest"]),
+    )
+    .await;
+    assert!(
+        response["error"]["message"].as_str().unwrap().contains("read-only partial-state follower"),
+        "{response}"
+    );
+
+    // Valid signed bytes must be refused even though this fixture uses an accepting test pool.
+    let raw = "0x02f871018303579880850555633d1b82520894eee27662c2b8eba3cd936a23f039f3189633e4c887ad591c62bdaeb180c080a07ea72c68abfb8fca1bd964f0f99132ed9280261bdca3e549546c0205e800f7d0a05b4ef3039e9c9b9babc179a1878fb825b5aaf5aed2fa8744854150157b08d6f3";
+    let response = rpc(&api, "eth_sendRawTransaction", json!([raw])).await;
+    assert!(
+        response["error"]["message"].as_str().unwrap().contains("read-only partial-state follower"),
+        "{response}"
+    );
+}
+
+#[tokio::test]
 async fn partial_state_rpc_reads_checkpoint_without_full_state() {
     let f = Fixture::new();
     let ro = f.factory.database_provider_ro().unwrap();

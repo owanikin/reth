@@ -195,6 +195,31 @@ fn assert_unavailable(outcome: TransactionValidationOutcome<EthPooledTransaction
 }
 
 #[test]
+fn partial_state_follower_rejects_admission_even_with_readable_checkpoint() {
+    let mut fixture = Fixture::new();
+    fixture.provider = fixture.provider.with_partial_state_follower(true);
+    for partial in [false, true] {
+        let validator = fixture.validator(partial);
+        for origin in
+            [TransactionOrigin::Local, TransactionOrigin::External, TransactionOrigin::Private]
+        {
+            assert_unavailable(
+                validator.validate_one(origin, transaction(SENDER, 1)),
+                "read-only partial-state follower",
+            );
+            let state = fixture
+                .factory
+                .partial_state_follower_reader(BlockId::latest(), &fixture.filter)
+                .unwrap();
+            assert_unavailable(
+                validator.validate_stateful(origin, transaction(SENDER, 1), state),
+                "read-only partial-state follower",
+            );
+        }
+    }
+}
+
+#[test]
 fn partial_state_txpool_accepts_transfer_to_untracked_contract_without_full_state() {
     let f = Fixture::new();
     let ro = f.factory.database_provider_ro().unwrap();

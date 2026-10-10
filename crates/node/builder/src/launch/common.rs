@@ -149,11 +149,24 @@ impl LaunchContext {
         let toml_config = self.load_toml_config(&config)?;
         let partial_state =
             config.partial_state.merge_with_toml_config(&toml_config.partial_state)?;
+        if partial_state.follower {
+            eyre::ensure!(!config.dev.dev, "partial-state follower cannot run in dev/mining mode");
+            eyre::ensure!(
+                config.debug.tip.is_none() &&
+                    config.debug.max_block.is_none() &&
+                    !config.debug.terminate &&
+                    config.debug.reorg_frequency.is_none() &&
+                    config.debug.skip_fcu.is_none() &&
+                    config.debug.skip_new_payload.is_none(),
+                "partial-state follower does not support execution/backfill debug options"
+            );
+        }
         if partial_state.is_enabled() {
             info!(
                 target: "reth::cli",
                 tracked_contracts = partial_state.contracts.len(),
                 bal_retention = partial_state.bal_retention(),
+                follower = partial_state.follower,
                 contracts_file = ?partial_state.contracts_file,
                 "Partial-state mode configured"
             );
@@ -1337,6 +1350,33 @@ mod tests {
     use reth_node_core::args::PruningArgs;
 
     const EXTENSION: &str = "toml";
+
+    #[tokio::test]
+    async fn partial_state_follower_rejects_mining_and_execution_debug_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("follower.toml");
+        let mut toml = Config::default();
+        toml.partial_state.enabled = true;
+        toml.partial_state.follower = true;
+        toml.partial_state.trusted_checkpoint = Some(reth_config::PartialStateTrustedCheckpoint {
+            chain_id: 1,
+            genesis_hash: alloy_primitives::B256::repeat_byte(1),
+            block_number: 10,
+            block_hash: alloy_primitives::B256::repeat_byte(2),
+            state_root: alloy_primitives::B256::repeat_byte(3),
+        });
+        toml.save(&path).unwrap();
+        let base = NodeConfig::test().with_config(path);
+        let context = || LaunchContext::new(reth_tasks::Runtime::test(), base.datadir());
+        assert!(context().with_loaded_toml_config(base.clone()).is_ok());
+        assert!(context().with_loaded_toml_config(base.clone().dev()).is_err());
+        let mut debug = base.clone();
+        debug.debug.max_block = Some(10);
+        assert!(context().with_loaded_toml_config(debug).is_err());
+        let mut debug = base.clone();
+        debug.debug.reorg_frequency = Some(4);
+        assert!(context().with_loaded_toml_config(debug).is_err());
+    }
 
     fn with_tempdir(filename: &str, proc: fn(&std::path::Path)) {
         let temp_dir = tempfile::tempdir().unwrap();

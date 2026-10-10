@@ -347,6 +347,12 @@ pub trait LoadState:
         &self,
         header: &SealedHeaderFor<Self::Primitives>,
     ) -> Result<EvmEnvFor<Self::Evm>, Self::Error> {
+        if self.provider().is_partial_state_follower() {
+            return Err(EthApiError::PartialStateUnavailable(
+                "EVM simulation is not supported by the read-only partial-state follower".into(),
+            )
+            .into())
+        }
         self.evm_config()
             .evm_env(header)
             .map_err(RethError::other)

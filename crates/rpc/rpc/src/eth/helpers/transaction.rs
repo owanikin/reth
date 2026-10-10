@@ -14,7 +14,7 @@ use reth_rpc_eth_api::{
     FromEvmError, RpcNodeCore,
 };
 use reth_rpc_eth_types::{error::RpcPoolError, EthApiError};
-use reth_storage_api::BlockReaderIdExt;
+use reth_storage_api::{BlockReaderIdExt, StateProviderFactory};
 use reth_transaction_pool::{
     error::Eip4844PoolTransactionError, AddedTransactionOutcome, EthBlobTransactionSidecar,
     EthPoolTransaction, PoolPooledTx, PoolTransaction, TransactionPool,
@@ -41,6 +41,12 @@ where
         origin: reth_transaction_pool::TransactionOrigin,
         tx: WithEncoded<Recovered<PoolPooledTx<Self::Pool>>>,
     ) -> Result<B256, Self::Error> {
+        if self.provider().is_partial_state_follower() {
+            return Err(EthApiError::PartialStateUnavailable(
+                "transaction submission is not supported by the read-only partial-state follower"
+                    .into(),
+            ))
+        }
         let (tx, recovered) = tx.split();
         let mut pool_transaction =
             <Self::Pool as TransactionPool>::Transaction::from_pooled(recovered);

@@ -36,7 +36,7 @@ use reth_rpc_eth_types::{
     simulate::{self, EthSimulateError},
     EthApiError, StateCacheDb,
 };
-use reth_storage_api::{BlockIdReader, ProviderTx, StateProviderBox};
+use reth_storage_api::{BlockIdReader, ProviderTx, StateProviderBox, StateProviderFactory};
 use revm::{
     context::Block,
     context_interface::{result::ResultAndState, Transaction},
@@ -71,6 +71,13 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
         block: Option<BlockId>,
     ) -> impl Future<Output = SimulatedBlocksResult<Self::NetworkTypes, Self::Error>> + Send {
         async move {
+            if self.provider().is_partial_state_follower() {
+                return Err(EthApiError::PartialStateUnavailable(
+                    "EVM simulation is not supported by the read-only partial-state follower"
+                        .into(),
+                )
+                .into())
+            }
             if payload.block_state_calls.len() > self.max_simulate_blocks() as usize {
                 return Err(EthApiError::other(EthSimulateError::TooManyBlocks).into())
             }

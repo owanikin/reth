@@ -142,10 +142,18 @@ pub trait TryIntoHistoricalStateProvider {
 /// to be used, since block `n` was executed on its parent block's state.
 #[auto_impl(&, Box, Arc)]
 pub trait StateProviderFactory: BlockIdReader + Send {
-    /// Opens the completed partial-state checkpoint for the requested canonical block and filter.
+    /// Whether this provider serves a non-validating partial-state follower.
+    /// Such providers cannot supply an executed block context for admission or EVM simulation.
+    fn is_partial_state_follower(&self) -> bool {
+        false
+    }
+
+    /// Opens the completed partial-state checkpoint for the requested block and filter.
     ///
     /// Implementations must reject unavailable state, including a checkpoint that lags the
     /// requested block. They must not substitute full, pending, or different checkpoint state.
+    /// On non-validating followers, `latest` selects the completed partial checkpoint, not an
+    /// executed head. Such providers must reject unsupported canonicality/finality assertions.
     fn partial_state(
         &self,
         _block_id: BlockId,

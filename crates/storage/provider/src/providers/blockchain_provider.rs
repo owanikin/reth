@@ -57,6 +57,8 @@ pub struct BlockchainProvider<N: NodeTypesWithDB> {
     pub(crate) canonical_in_memory_state: CanonicalInMemoryState<N::Primitives>,
     /// Store for BALs associated with this provider view.
     pub(crate) bal_store: BalStoreHandle,
+    /// Restricts this view to explicit checkpoint state reads, never full-state fallbacks.
+    partial_state_follower: bool,
 }
 
 impl<N: NodeTypesWithDB> Clone for BlockchainProvider<N> {
@@ -65,6 +67,7 @@ impl<N: NodeTypesWithDB> Clone for BlockchainProvider<N> {
             database: self.database.clone(),
             canonical_in_memory_state: self.canonical_in_memory_state.clone(),
             bal_store: self.bal_store.clone(),
+            partial_state_follower: self.partial_state_follower,
         }
     }
 }
@@ -119,7 +122,24 @@ impl<N: ProviderNodeTypes> BlockchainProvider<N> {
                 safe_header,
             ),
             bal_store,
+            partial_state_follower: false,
         })
+    }
+
+    /// Selects the read-only partial follower view before components are constructed.
+    pub const fn with_partial_state_follower(mut self, enabled: bool) -> Self {
+        self.partial_state_follower = enabled;
+        self
+    }
+
+    fn ensure_full_state_access(&self) -> ProviderResult<()> {
+        if self.partial_state_follower {
+            return Err(reth_storage_errors::provider::PartialStateReadError::Unsupported(
+                "full, historical, or pending state on a partial-state follower",
+            )
+            .into())
+        }
+        Ok(())
     }
 
     /// Gets a clone of `canonical_in_memory_state`.
@@ -571,12 +591,23 @@ impl<N: NodeTypesWithDB> ChainSpecProvider for BlockchainProvider<N> {
 }
 
 impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
+    fn is_partial_state_follower(&self) -> bool {
+        self.partial_state_follower
+    }
+
     fn partial_state(
         &self,
         block_id: BlockId,
         filter: &ConfiguredContractFilter,
     ) -> ProviderResult<StateProviderBox> {
         use reth_storage_errors::provider::PartialStateReadError;
+
+        if self.partial_state_follower {
+            return self
+                .database
+                .partial_state_follower_reader(block_id, filter)
+                .map(|reader| Box::new(reader) as StateProviderBox)
+        }
 
         if block_id.is_pending() {
             return Err(PartialStateReadError::Unsupported("pending state").into())
@@ -620,6 +651,7 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
 
     /// Storage provider for latest block
     fn latest(&self) -> ProviderResult<StateProviderBox> {
+        self.ensure_full_state_access()?;
         trace!(target: "providers::blockchain", "Getting latest block state provider");
         // use latest state provider if the head state exists
         if let Some(state) = self.canonical_in_memory_state.head_state() {
@@ -666,6 +698,7 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
         &self,
         block_number: BlockNumber,
     ) -> ProviderResult<StateProviderBox> {
+        self.ensure_full_state_access()?;
         trace!(target: "providers::blockchain", ?block_number, "Getting history by block number");
         let provider = self.consistent_provider()?;
         let hash = provider
@@ -675,11 +708,13 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
     }
 
     fn history_by_block_hash(&self, block_hash: BlockHash) -> ProviderResult<StateProviderBox> {
+        self.ensure_full_state_access()?;
         trace!(target: "providers::blockchain", ?block_hash, "Getting history by block hash");
         self.consistent_provider()?.into_state_provider_at_block_hash(block_hash)
     }
 
     fn state_by_block_hash(&self, hash: BlockHash) -> ProviderResult<StateProviderBox> {
+        self.ensure_full_state_access()?;
         trace!(target: "providers::blockchain", ?hash, "Getting state by block hash");
         if let Ok(state) = self.history_by_block_hash(hash) {
             // This could be tracked by a historical block
@@ -698,6 +733,7 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
     /// If there's no pending block available then the latest state provider is returned:
     /// [`Self::latest`]
     fn pending(&self) -> ProviderResult<StateProviderBox> {
+        self.ensure_full_state_access()?;
         trace!(target: "providers::blockchain", "Getting provider for pending state");
 
         if let Some(pending) = self.canonical_in_memory_state.pending_state() {
@@ -710,6 +746,7 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
     }
 
     fn pending_state_by_hash(&self, block_hash: B256) -> ProviderResult<Option<StateProviderBox>> {
+        self.ensure_full_state_access()?;
         if let Some(pending) = self.canonical_in_memory_state.pending_state() &&
             pending.hash() == block_hash
         {
@@ -719,6 +756,7 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
     }
 
     fn maybe_pending(&self) -> ProviderResult<Option<StateProviderBox>> {
+        self.ensure_full_state_access()?;
         if let Some(pending) = self.canonical_in_memory_state.pending_state() {
             return Ok(Some(Box::new(self.block_state_provider(&pending)?)))
         }
@@ -871,6 +909,7 @@ impl<N: ProviderNodeTypes> ChangeSetReader for BlockchainProvider<N> {
 impl<N: ProviderNodeTypes> AccountReader for BlockchainProvider<N> {
     /// Get basic account information.
     fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
+        self.ensure_full_state_access()?;
         self.consistent_provider()?.basic_account(address)
     }
 }

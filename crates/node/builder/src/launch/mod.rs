@@ -6,6 +6,7 @@ pub mod invalid_block_hook;
 
 pub(crate) mod debug;
 pub(crate) mod engine;
+mod follower;
 pub(crate) mod partial_state;
 
 pub use common::LaunchContext;

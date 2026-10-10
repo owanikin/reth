@@ -370,6 +370,16 @@ where
         transaction: Tx,
         maybe_state: &mut Option<Box<dyn AccountInfoReader + Send>>,
     ) -> TransactionValidationOutcome<Tx> {
+        if self.client.is_partial_state_follower() {
+            return TransactionValidationOutcome::Error(
+                *transaction.hash(),
+                Box::new(reth_storage_api::errors::provider::ProviderError::from(
+                    reth_storage_api::errors::provider::PartialStateReadError::Unsupported(
+                        "transaction admission on a read-only partial-state follower",
+                    ),
+                )),
+            )
+        }
         match self.validate_stateless(origin, &transaction) {
             Ok(()) => {
                 // stateless checks passed, pass transaction down stateful validation pipeline
@@ -409,7 +419,7 @@ where
         transaction: Tx,
         state: impl AccountInfoReader,
     ) -> TransactionValidationOutcome<Tx> {
-        if self.partial_state_filter.is_some() {
+        if self.partial_state_filter.is_some() || self.client.is_partial_state_follower() {
             return self.validate_one(origin, transaction)
         }
         if let Err(err) = self.validate_stateless(origin, &transaction) {
@@ -627,7 +637,7 @@ where
     where
         P: AccountInfoReader,
     {
-        if self.partial_state_filter.is_some() {
+        if self.partial_state_filter.is_some() || self.client.is_partial_state_follower() {
             return self.validate_one(origin, transaction)
         }
         self.validate_stateful_with_provider(origin, transaction, state)

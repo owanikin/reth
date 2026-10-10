@@ -56,6 +56,41 @@ async fn sync(fixture: &RecoveryFixture, peer: Arc<Peer>) {
 }
 
 #[tokio::test]
+async fn partial_state_follower_forkchoice_advances_without_full_state() {
+    use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
+    use reth_engine_primitives::BeaconEngineMessage;
+    use reth_ethereum_engine_primitives::EthEngineTypes;
+    use tokio::sync::oneshot;
+
+    let (fixture, peer, _, child) = fixture();
+    sync(&fixture, peer.clone()).await;
+    let (targets, receiver) = watch::channel(None);
+    let mut advancer = PartialStateAdvancer::new(receiver);
+    let mut head = fixture.pivot;
+    let (tx, response) = oneshot::channel();
+    crate::launch::follower::on_message::<EthEngineTypes>(
+        BeaconEngineMessage::ForkchoiceUpdated {
+            state: ForkchoiceState { head_block_hash: child.hash(), ..Default::default() },
+            payload_attrs: Some(Default::default()),
+            tx,
+        },
+        &targets,
+        fixture.factory.bal_store(),
+    );
+    let response = response.await.unwrap().unwrap().await.unwrap();
+    assert_eq!(response.payload_status.status, PayloadStatusEnum::Syncing);
+    assert!(response.payload_id.is_none());
+    advance(&mut advancer, &fixture, &peer, &mut head, 64).await.unwrap();
+    fixture.assert_checkpoint(head);
+    assert_eq!(head.block_hash, child.hash());
+    let ro = fixture.factory.database_provider_ro().unwrap();
+    assert_eq!(ro.tx_ref().entries::<tables::PlainAccountState>().unwrap(), 0);
+    assert_eq!(ro.tx_ref().entries::<tables::PlainStorageState>().unwrap(), 0);
+    assert_eq!(ro.tx_ref().entries::<tables::HashedAccounts>().unwrap(), 0);
+    assert_eq!(ro.tx_ref().entries::<tables::HashedStorages>().unwrap(), 0);
+}
+
+#[tokio::test]
 async fn trusted_bootstrap_downloads_advances_and_resumes_without_local_full_state() {
     let (fixture, peer, trusted, child) = fixture();
     assert_eq!(

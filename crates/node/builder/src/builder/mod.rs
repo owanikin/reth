@@ -998,9 +998,10 @@ impl<Node: FullNodeTypes<Types: NodeTypes<ChainSpec: Hardforks>>> BuilderContext
     {
         let secret_key = self.network_secret(&self.config().datadir())?;
         let default_peers_path = self.config().datadir().known_peers();
-        let builder = self
-            .config()
-            .network
+        let mut network = self.config().network.clone();
+        // Use the merged config so TOML-only followers also negotiate BAL exchange.
+        network.enable_eth71 |= self.partial_state_config().enabled;
+        let builder = network
             .network_config(
                 self.reth_config(),
                 self.config().chain.clone(),

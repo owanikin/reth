@@ -43,6 +43,7 @@ use reth_network::{
         DEFAULT_SOFT_LIMIT_BYTE_SIZE_POOLED_TRANSACTIONS_RESP_ON_PACK_GET_POOLED_TRANSACTIONS_REQ,
         SOFT_LIMIT_BYTE_SIZE_POOLED_TRANSACTIONS_RESPONSE,
     },
+    types::EthVersion,
     HelloMessageWithProtocols, NetworkConfigBuilder, NetworkPrimitives,
 };
 use reth_network_peers::{mainnet_nodes, TrustedPeer};
@@ -270,6 +271,13 @@ pub struct NetworkArgs {
     /// Custom node identity
     #[arg(long, value_name = "IDENTITY", default_value = version_metadata().p2p_client_version.as_ref())]
     pub identity: String,
+
+    /// Advertise experimental eth/71 support for block access list exchange.
+    ///
+    /// Both peers must support eth/71 to exchange BALs. Partial-state nodes enable this
+    /// automatically; full nodes serving them must opt in. Older eth versions remain available.
+    #[arg(long)]
+    pub enable_eth71: bool,
 
     /// Secret key to use for this node.
     ///
@@ -590,11 +598,14 @@ impl NetworkArgs {
             // Configure node identity
             .apply(|builder| {
                 let peer_id = builder.get_peer_id();
-                builder.hello_message(
-                    HelloMessageWithProtocols::builder(peer_id)
-                        .client_version(&self.identity)
-                        .build(),
-                )
+                let mut hello = HelloMessageWithProtocols::builder(peer_id)
+                    .client_version(&self.identity)
+                    .build();
+                if self.enable_eth71 {
+                    // Keep the default versions for connections to peers without BAL support.
+                    let _ = hello.try_add_protocol(EthVersion::Eth71.into());
+                }
+                builder.hello_message(hello)
             })
             // apply discovery settings
             .apply(|builder| {
@@ -721,6 +732,7 @@ impl Default for NetworkArgs {
             dns_retries,
             peers_file: None,
             identity: version_metadata().p2p_client_version.to_string(),
+            enable_eth71: false,
             p2p_secret_key: None,
             p2p_secret_key_hex: None,
             no_persist_peers: false,
@@ -1343,6 +1355,43 @@ mod tests {
         let args = CommandParser::<NetworkArgs>::parse_from(["reth"]).args;
 
         assert_eq!(args, default_args);
+    }
+
+    #[test]
+    fn eth71_requires_opt_in() {
+        let defaults = CommandParser::<NetworkArgs>::parse_from(["reth"]).args;
+        assert!(!defaults.enable_eth71);
+        let enabled = CommandParser::<NetworkArgs>::parse_from(["reth", "--enable-eth71"]).args;
+        assert!(enabled.enable_eth71);
+    }
+
+    #[test]
+    fn eth71_preserves_default_protocols_and_identity() {
+        for enable_eth71 in [false, true] {
+            let args = NetworkArgs {
+                enable_eth71,
+                identity: "test-peer".to_owned(),
+                no_persist_peers: true,
+                ..Default::default()
+            };
+            let config = args
+                .network_config::<reth_network::EthNetworkPrimitives>(
+                    &Config::default(),
+                    MAINNET.clone(),
+                    SecretKey::from_byte_array(&[1; 32]).unwrap(),
+                    PathBuf::new(),
+                    Runtime::test(),
+                )
+                .build_with_noop_provider(MAINNET.clone());
+            let hello = config.hello_message;
+            assert_eq!(hello.client_version, "test-peer");
+            let mut expected =
+                EthVersion::ALL_VERSIONS.iter().copied().map(Into::into).collect::<Vec<_>>();
+            if enable_eth71 {
+                expected.push(EthVersion::Eth71.into());
+            }
+            assert_eq!(hello.protocols, expected);
+        }
     }
 
     #[test]

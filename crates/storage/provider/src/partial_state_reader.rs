@@ -4,6 +4,7 @@ use crate::{
     DatabaseProviderRO, ProviderFactory,
 };
 use alloy_consensus::constants::{EMPTY_ROOT_HASH, KECCAK_EMPTY};
+use alloy_eips::{BlockId, BlockNumberOrTag};
 use alloy_primitives::{keccak256, Address, BlockNumber, Bytes, StorageKey, StorageValue, B256};
 use reth_db_api::{cursor::DbDupCursorRO, tables, transaction::DbTx};
 use reth_primitives_traits::{Account, Bytecode};
@@ -184,6 +185,38 @@ impl<N: ProviderNodeTypes> BytecodeReader for PartialStateReader<N> {
 }
 
 impl<N: ProviderNodeTypes> ProviderFactory<N> {
+    /// Reads the last verified follower checkpoint, not the local executed head.
+    /// `latest` means the completed checkpoint; safe/finalized/pending and canonicality assertions
+    /// are deliberately unsupported. Selection and data reads use the same database snapshot.
+    pub fn partial_state_follower_reader(
+        &self,
+        at: BlockId,
+        filter: &ConfiguredContractFilter,
+    ) -> ProviderResult<PartialStateReader<N>> {
+        let provider = self.database_provider_ro()?;
+        let checkpoint = read_partial_state_checkpoint(&provider)?
+            .ok_or(PartialStateCheckpointError::Unavailable)?;
+        let pivot = checkpoint.pivot;
+        let matches = match at {
+            BlockId::Number(BlockNumberOrTag::Latest) => true,
+            BlockId::Number(BlockNumberOrTag::Number(number)) => number == pivot.block_number,
+            BlockId::Number(BlockNumberOrTag::Earliest) => pivot.block_number == 0,
+            BlockId::Hash(hash) if !hash.require_canonical.unwrap_or_default() => {
+                hash.block_hash == pivot.block_hash
+            }
+            _ => return Err(PartialStateReadError::Unsupported(
+                "pending, safe, finalized, or requireCanonical state on a non-validating follower",
+            )
+            .into()),
+        };
+        if !matches {
+            return Err(
+                PartialStateReadError::Unsupported("state outside the follower checkpoint").into()
+            )
+        }
+        PartialStateReader::new(provider, pivot, filter.clone())
+    }
+
     /// Opens a partial-state snapshot only if its complete checkpoint matches `expected` and
     /// `filter`. The caller must select the desired block explicitly; a lagging checkpoint is not
     /// silently substituted for the requested state. Only the checkpoint's own block hash is
@@ -349,6 +382,56 @@ mod tests {
     const SLOT: B256 = B256::repeat_byte(0x11);
     const CODE: &[u8] = &[0x60, 0x01];
     const UNTRACKED_CODE: &[u8] = &[0x60, 0x02];
+
+    #[test]
+    fn partial_state_follower_reads_checkpoint_not_executed_head() {
+        use crate::providers::BlockchainProvider;
+        use reth_primitives_traits::SealedHeader;
+        use reth_storage_api::StateProviderFactory;
+
+        let (factory, filter, pivot) = setup();
+        // The executed view remains at genesis; no header or full state exists for the checkpoint.
+        let provider = BlockchainProvider::with_latest(factory.clone(), SealedHeader::default())
+            .unwrap()
+            .with_partial_state_follower(true);
+        assert!(provider.clone().is_partial_state_follower());
+        for at in [BlockId::latest(), pivot.block_number.into(), pivot.block_hash.into()] {
+            let state = provider.partial_state(at, &filter).unwrap();
+            assert_eq!(state.account_nonce(&TRACKED).unwrap(), Some(7));
+            assert_eq!(state.storage(TRACKED, SLOT).unwrap(), Some(U256::from(42)));
+            assert!(matches!(
+                state.storage(UNTRACKED, SLOT),
+                Err(ProviderError::StorageNotTracked(_))
+            ));
+            assert!(matches!(
+                state.account_code(&UNTRACKED),
+                Err(ProviderError::CodeNotTracked(_))
+            ));
+        }
+        for at in [
+            BlockId::pending(),
+            BlockId::safe(),
+            BlockId::finalized(),
+            alloy_eips::RpcBlockHash::from_hash(pivot.block_hash, Some(true)).into(),
+            0u64.into(),
+            B256::ZERO.into(),
+        ] {
+            assert!(provider.partial_state(at, &filter).is_err(), "{at:?}");
+        }
+        assert!(provider
+            .partial_state(BlockId::latest(), &ConfiguredContractFilter::new([]))
+            .is_err());
+        assert!(provider.latest().is_err());
+        assert!(provider.basic_account(&TRACKED).is_err());
+        assert!(provider.pending().is_err());
+        assert!(provider.maybe_pending().is_err());
+        assert!(provider.pending_state_by_hash(B256::ZERO).is_err());
+        assert!(provider.history_by_block_number(0).is_err());
+        assert!(provider.history_by_block_hash(B256::ZERO).is_err());
+        assert!(provider.state_by_block_hash(B256::ZERO).is_err());
+        factory.begin_partial_state_sync(pivot, &filter).unwrap();
+        assert!(provider.partial_state(BlockId::latest(), &filter).is_err());
+    }
 
     #[test]
     fn state_provider_exposes_commitments_but_rejects_unavailable_trie_data() {
