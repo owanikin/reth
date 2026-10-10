@@ -1,0 +1,34 @@
+participants:
+  - el_type: reth
+    el_image: reth-partial-statefulness:local
+    el_extra_params:
+      - "--enable-eth71"
+      - "--engine.always-process-payload-attributes-on-canonical-head"
+      - "--engine.allow-unwind-canonical-header"
+    cl_type: lighthouse
+    cl_image: ethpandaops/lighthouse:glamsterdam-devnet-0
+    supernode: true
+    vc_type: lighthouse
+    vc_image: ethpandaops/lighthouse:glamsterdam-devnet-0
+    use_separate_vc: true
+    count: 1
+
+network_params:
+  preset: minimal
+  network_id: "3151908"
+  num_validator_keys_per_node: 64
+  preregistered_validator_count: 0
+  genesis_delay: 120
+  gloas_fork_epoch: 1
+  withdrawal_type: "0x01"
+  validator_balance: 40000
+  seconds_per_slot: 24
+  slot_duration_ms: 24000
+
+ethereum_genesis_generator_params:
+  image: ethpandaops/ethereum-genesis-generator:6.0.3
+  extra_env: {}
+
+global_log_level: info
+disable_peer_scoring: true
+additional_services: []

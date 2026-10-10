@@ -129,8 +129,10 @@ stores. Tests also cover eth/69 fallback and rejection of BAL requests when only
 the remote peer advertised eth/71.
 These tests do not replace a devnet run of the newly built image.
 
-For a devnet check, keep the existing full producer and its database unchanged.
-Launch a separate follower with a trusted serviceable pivot and no validator duties.
-Verify bootstrap, submit a newer trusted target, compare the resulting root to the
-full peer, then test checkpoint resume and peer outages. Expect `SYNCING`, not
-`VALID`, from the follower. The launch warning identifies this mode explicitly.
+The maintained [lifecycle test runbook](../../scripts/partial-state-follower/README.md)
+provides a small devnet configuration, producer preflight, bootstrap/advancement/
+restart smoke test, and an explicitly authorized peer-outage scenario. These host
+scripts leave the full producer unchanged and use a separate test follower.
+They retain machine-readable evidence separately from the source, including root
+comparisons, execution-boundary checks and firewall cleanup results. The host-only
+regression suite runs in CI; live Docker scenarios remain opt-in.
