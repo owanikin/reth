@@ -1,5 +1,8 @@
 use crate::{providers::ProviderNodeTypes, DatabaseProvider, ProviderFactory};
-use alloy_consensus::constants::{EMPTY_ROOT_HASH, KECCAK_EMPTY};
+use alloy_consensus::{
+    constants::{EMPTY_ROOT_HASH, KECCAK_EMPTY},
+    BlockHeader,
+};
 use alloy_eips::{
     eip7928::{compute_block_access_list_hash, AccountChanges},
     BlockNumHash,
@@ -14,18 +17,59 @@ use reth_db_api::{
     tables,
     transaction::{DbTx, DbTxMut},
 };
-use reth_primitives_traits::{Account, Bytecode, StorageEntry};
+use reth_node_types::HeaderTy;
+use reth_primitives_traits::{Account, Bytecode, SealedHeader, StorageEntry};
 use reth_storage_api::{
     ContractFilter, DBProvider, DatabaseProviderFactory, PartialStateCheckpoint,
     PartialStateCheckpointProvider, PartialStateCheckpointStatus, PartialStateRootProvider,
     PartialStateSnapPivot, PartialStateTransition, PartialStateTransitionProvider,
 };
 use reth_storage_errors::provider::{
-    PartialStateCheckpointError, PartialStateTransitionError, ProviderError, ProviderResult,
+    PartialStateCheckpointError, PartialStateReadError, PartialStateTransitionError, ProviderError,
+    ProviderResult,
 };
 use reth_trie_common::TrieAccount;
 
 const PARTIAL_STATE_CHECKPOINT_KEY: u8 = 0;
+
+impl<N: ProviderNodeTypes> ProviderFactory<N> {
+    /// Retains a peer-verified bootstrap header without marking it executed or changing state.
+    /// Readers only use it when its hash and root match a complete checkpoint.
+    pub fn record_partial_state_header(&self, header: &HeaderTy<N>) -> ProviderResult<()> {
+        let provider = self.database_provider_rw()?;
+        provider
+            .tx_ref()
+            .put::<tables::PartialStateHeaders<HeaderTy<N>>>(header.number(), header.clone())?;
+        provider.commit()
+    }
+
+    /// Commits a verified BAL transition and its RPC header context in the same transaction.
+    pub fn apply_partial_state_transition_with_header(
+        &self,
+        transition: PartialStateTransition<'_>,
+        filter: &dyn ContractFilter,
+        header: &HeaderTy<N>,
+    ) -> ProviderResult<B256> {
+        let sealed = SealedHeader::seal_slow(header.clone());
+        if sealed.num_hash() != transition.block ||
+            sealed.parent_hash() != transition.parent_block_hash ||
+            sealed.state_root() != transition.expected_root ||
+            sealed.block_access_list_hash() != Some(transition.expected_bal_hash)
+        {
+            return Err(PartialStateReadError::Unsupported(
+                "partial-state transition header mismatch",
+            )
+            .into())
+        }
+        let provider = self.database_provider_rw()?;
+        let root = apply_partial_state_transition(&provider, transition, filter)?;
+        provider
+            .tx_ref()
+            .put::<tables::PartialStateHeaders<HeaderTy<N>>>(header.number(), header.clone())?;
+        provider.commit()?;
+        Ok(root)
+    }
+}
 
 impl<N> PartialStateCheckpointProvider for ProviderFactory<N>
 where
@@ -637,6 +681,15 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         delete_transition_journal(provider, *number, &account_changes)?;
     }
+    // Keep the oldest revertible checkpoint's EVM history as well as the journal window.
+    let mut headers =
+        provider.tx_ref().cursor_write::<tables::PartialStateHeaders<HeaderTy<N>>>()?;
+    while let Some((number, _)) = headers.first()? {
+        if number >= block_number.saturating_sub(257) {
+            break
+        }
+        headers.delete_current()?;
+    }
     Ok(blocks.len())
 }
 
@@ -665,6 +718,7 @@ where
     TX: DbTx + DbTxMut + 'static,
     N: ProviderNodeTypes,
 {
+    // Header context survives resync selection; readers hash-check it against the new checkpoint.
     // Bytecodes are content-addressed and shared with canonical state, so old entries are harmless.
     provider.tx_ref().clear::<tables::PartialStateCheckpoints>()?;
     provider.tx_ref().clear::<tables::PartialStateStorageChangeSets>()?;
@@ -720,6 +774,7 @@ fn resolved_account_matches_bal(account: &Account, resolved: &TrieAccount) -> bo
 mod tests {
     use super::*;
     use crate::test_utils::create_test_provider_factory;
+    use alloy_consensus::Header;
     use alloy_eip7928::{BalanceChange, CodeChange, NonceChange, SlotChanges, StorageChange};
     use alloy_eips::eip7928::{compute_block_access_list_hash, BlockAccessList};
     use alloy_primitives::{address, U256};
@@ -729,6 +784,121 @@ mod tests {
         PartialStateCheckpointStatus, PartialStateResolvedAccounts, PartialStateSnapWriter,
     };
     use reth_trie::root::{state_root_unsorted, storage_root};
+
+    #[test]
+    fn partial_state_call_context_commits_and_reverts_with_checkpoint() {
+        let factory = create_test_provider_factory();
+        let filter = ConfiguredContractFilter::new([]);
+        let parent =
+            SealedHeader::seal_slow(Header { state_root: EMPTY_ROOT_HASH, ..Default::default() });
+        let pivot = PartialStateSnapPivot {
+            block_number: 0,
+            block_hash: parent.hash(),
+            state_root: parent.state_root,
+        };
+        factory.record_partial_state_header(&parent).unwrap();
+        factory.begin_partial_state_sync(pivot, &filter).unwrap();
+        factory.complete_partial_state_sync(pivot, &filter).unwrap();
+
+        let access_list = BlockAccessList::default();
+        let resolved_accounts = PartialStateResolvedAccounts::default();
+        let child = SealedHeader::seal_slow(Header {
+            number: 1,
+            parent_hash: parent.hash(),
+            state_root: EMPTY_ROOT_HASH,
+            block_access_list_hash: Some(compute_block_access_list_hash(&access_list)),
+            ..Default::default()
+        });
+        let transition = PartialStateTransition {
+            block: child.num_hash(),
+            parent_block_hash: parent.hash(),
+            parent_root: parent.state_root,
+            expected_root: child.state_root,
+            expected_bal_hash: child.block_access_list_hash.unwrap(),
+            access_list: &access_list,
+            resolved_accounts: &resolved_accounts,
+        };
+
+        assert!(factory
+            .apply_partial_state_transition_with_header(transition, &filter, &parent)
+            .is_err());
+        assert_eq!(factory.partial_state_checkpoint().unwrap().unwrap().pivot, pivot);
+        assert!(factory
+            .database_provider_ro()
+            .unwrap()
+            .tx_ref()
+            .get::<tables::PartialStateHeaders>(1)
+            .unwrap()
+            .is_none());
+
+        factory.apply_partial_state_transition_with_header(transition, &filter, &child).unwrap();
+        let (header, snapshot) = factory
+            .partial_state_follower_reader(alloy_eips::BlockId::latest(), &filter)
+            .unwrap()
+            .with_call_context()
+            .unwrap();
+        assert_eq!(header, child);
+        assert_eq!(snapshot.checkpoint().pivot.block_hash, child.hash());
+
+        factory.revert_partial_state_transition(child.num_hash(), &filter).unwrap();
+        let (header, _) = factory
+            .partial_state_follower_reader(alloy_eips::BlockId::latest(), &filter)
+            .unwrap()
+            .with_call_context()
+            .unwrap();
+        assert_eq!(header, parent);
+        assert_eq!(snapshot.checkpoint().pivot.block_hash, child.hash());
+
+        // A correctly identified header is not enough: root failure must roll back its context too.
+        let bad_child = SealedHeader::seal_slow(Header {
+            state_root: B256::repeat_byte(0x99),
+            ..child.clone_header()
+        });
+        let error = factory
+            .apply_partial_state_transition_with_header(
+                PartialStateTransition {
+                    block: bad_child.num_hash(),
+                    expected_root: bad_child.state_root,
+                    ..transition
+                },
+                &filter,
+                &bad_child,
+            )
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::PartialStateTransition(error)
+            if matches!(*error, PartialStateTransitionError::ChildRootMismatch { .. })));
+        assert_eq!(factory.partial_state_checkpoint().unwrap().unwrap().pivot, pivot);
+        assert_eq!(
+            factory
+                .database_provider_ro()
+                .unwrap()
+                .tx_ref()
+                .get::<tables::PartialStateHeaders>(1)
+                .unwrap(),
+            Some(child.clone_header())
+        );
+    }
+
+    #[test]
+    fn partial_state_call_context_prunes_beyond_rollback_blockhash_window() {
+        let factory = create_test_provider_factory();
+        let provider = factory.database_provider_rw().unwrap();
+        for number in 0..=300 {
+            provider
+                .tx_ref()
+                .put::<tables::PartialStateHeaders>(number, Header { number, ..Default::default() })
+                .unwrap();
+        }
+        provider.commit().unwrap();
+
+        // Journal 280 allows rollback to checkpoint 279, whose oldest BLOCKHASH is 23.
+        assert_eq!(factory.prune_partial_state_transition_journal(280).unwrap(), 0);
+        let provider = factory.database_provider_ro().unwrap();
+        assert_eq!(provider.tx_ref().entries::<tables::PartialStateHeaders>().unwrap(), 278);
+        assert!(provider.tx_ref().get::<tables::PartialStateHeaders>(22).unwrap().is_none());
+        assert!(provider.tx_ref().get::<tables::PartialStateHeaders>(23).unwrap().is_some());
+        assert!(provider.tx_ref().get::<tables::PartialStateHeaders>(300).unwrap().is_some());
+    }
 
     #[test]
     fn persists_partial_state_checkpoint_lifecycle() {

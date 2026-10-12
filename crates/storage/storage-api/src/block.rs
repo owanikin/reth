@@ -1,13 +1,14 @@
 use crate::{
-    BlockBodyIndicesProvider, BlockNumReader, HeaderProvider, ReceiptProvider,
-    ReceiptProviderIdExt, TransactionVariant, TransactionsProvider,
+    BlockBodyIndicesProvider, BlockNumReader, ConfiguredContractFilter, HeaderProvider,
+    ReceiptProvider, ReceiptProviderIdExt, StateProviderBox, TransactionVariant,
+    TransactionsProvider,
 };
 use alloc::{sync::Arc, vec::Vec};
 use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumberOrTag};
 use alloy_primitives::{BlockNumber, TxNumber, B256};
 use core::ops::RangeInclusive;
 use reth_primitives_traits::{RecoveredBlock, SealedHeader};
-use reth_storage_errors::provider::ProviderResult;
+use reth_storage_errors::provider::{PartialStateReadError, ProviderResult};
 
 /// A helper enum that represents the origin of the requested block.
 ///
@@ -60,6 +61,16 @@ pub trait BlockReader:
         Body: reth_primitives_traits::BlockBody<Transaction = Self::Transaction>,
         Header = Self::Header,
     >;
+
+    /// Opens follower state and its matching header from one checkpoint snapshot.
+    /// Ancestor hashes must belong to that header's branch, never a moving executed head.
+    fn partial_state_call(
+        &self,
+        _block_id: BlockId,
+        _filter: &ConfiguredContractFilter,
+    ) -> ProviderResult<(SealedHeader<Self::Header>, StateProviderBox)> {
+        Err(PartialStateReadError::Unsupported("checkpoint call context on this provider").into())
+    }
 
     /// Tries to find in the given block source.
     ///
@@ -151,6 +162,14 @@ pub trait BlockReader:
 impl<T: BlockReader + Send + Sync> BlockReader for Arc<T> {
     type Block = T::Block;
 
+    fn partial_state_call(
+        &self,
+        block_id: BlockId,
+        filter: &ConfiguredContractFilter,
+    ) -> ProviderResult<(SealedHeader<Self::Header>, StateProviderBox)> {
+        T::partial_state_call(self, block_id, filter)
+    }
+
     fn find_block_by_hash(
         &self,
         hash: B256,
@@ -211,6 +230,14 @@ impl<T: BlockReader + Send + Sync> BlockReader for Arc<T> {
 
 impl<T: BlockReader + Send + Sync> BlockReader for &T {
     type Block = T::Block;
+
+    fn partial_state_call(
+        &self,
+        block_id: BlockId,
+        filter: &ConfiguredContractFilter,
+    ) -> ProviderResult<(SealedHeader<Self::Header>, StateProviderBox)> {
+        T::partial_state_call(self, block_id, filter)
+    }
 
     fn find_block_by_hash(
         &self,

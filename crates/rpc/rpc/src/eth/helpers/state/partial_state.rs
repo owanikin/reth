@@ -19,8 +19,8 @@ use reth_provider::{
 };
 use reth_rpc_eth_api::{helpers::LoadState, node::RpcNodeCoreAdapter, EthApiServer};
 use reth_storage_api::{
-    BlockWriter, CanonChainTracker, ConfiguredContractFilter, ContractFilter, DBProvider,
-    DatabaseProviderFactory, PartialStateRootProvider,
+    BlockReader, BlockWriter, CanonChainTracker, ConfiguredContractFilter, ContractFilter,
+    DBProvider, DatabaseProviderFactory, PartialStateRootProvider,
 };
 use reth_transaction_pool::test_utils::{testing_pool, TestPool};
 use serde_json::{json, Value};
@@ -119,6 +119,7 @@ impl Fixture {
         for h in [&parent, &header] {
             let block = Block { header: h.clone().unseal(), body: Default::default() };
             rw.insert_block(&block.try_into_recovered().unwrap()).unwrap();
+            tx.put::<tables::PartialStateHeaders>(h.number, h.clone().unseal()).unwrap();
         }
         tx.put::<tables::PartialStateCheckpoints>(
             0,
@@ -152,6 +153,15 @@ impl Fixture {
     async fn rpc(&self, method: &str, params: Value) -> Value {
         rpc(&self.api, method, params).await
     }
+
+    fn follower(&self) -> TestEthApi {
+        Self::api(
+            BlockchainProvider::with_latest(self.factory.clone(), self.parent.clone())
+                .unwrap()
+                .with_partial_state_follower(true),
+            true,
+        )
+    }
 }
 
 async fn rpc(api: &TestEthApi, method: &str, params: Value) -> Value {
@@ -168,26 +178,33 @@ fn assert_error(response: &Value, code: i64, message: &str) {
 }
 
 #[tokio::test]
-async fn partial_state_follower_rpc_reads_checkpoint_and_rejects_simulation() {
+async fn partial_state_follower_rpc_calls_checkpoint_and_rejects_unsupported_workloads() {
     let f = Fixture::new();
-    let provider = BlockchainProvider::with_latest(f.factory.clone(), f.parent.clone())
-        .unwrap()
-        .with_partial_state_follower(true);
-    let api = Fixture::api(provider, true);
+    let api = f.follower();
+    let full = Fixture::new();
+    let rw = full.factory.database_provider_rw().unwrap();
+    for address in [TRACKED, UNTRACKED, EMPTY, NESTED, HASH_READER, SENDER] {
+        let account =
+            rw.tx_ref().get::<tables::PartialStateAccounts>(keccak256(address)).unwrap().unwrap();
+        rw.tx_ref().put::<tables::PlainAccountState>(address, account).unwrap();
+    }
+    rw.tx_ref()
+        .put::<tables::PlainStorageState>(TRACKED, StorageEntry::new(B256::ZERO, U256::from(42)))
+        .unwrap();
+    rw.commit().unwrap();
+    let full_api = Fixture::api(full.provider.clone(), false);
     assert_eq!(rpc(&api, "eth_getBalance", json!([UNTRACKED, "latest"])).await["result"], "0x64");
     assert_eq!(
         rpc(&api, "eth_getCode", json!([TRACKED, "latest"])).await["result"],
         json!(Bytes::from_static(CODE))
     );
-    for method in ["eth_call", "eth_estimateGas"] {
-        let response = rpc(&api, method, json!([{"to": TRACKED}, "latest"])).await;
-        assert!(
-            response["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("read-only partial-state follower"),
-            "{response}"
-        );
+    for block in [json!("latest"), json!("0x1"), json!({"blockHash": f.header.hash()})] {
+        for method in ["eth_call", "eth_estimateGas"] {
+            let params = json!([{"from":SENDER,"to":TRACKED}, block]);
+            let response = rpc(&api, method, params.clone()).await;
+            assert!(response.get("error").is_none(), "{response}");
+            assert_eq!(response, rpc(&full_api, method, params).await);
+        }
     }
     assert!(rpc(&api, "eth_getBalance", json!([TRACKED, "0x0"])).await.get("error").is_some());
     let response = rpc(
@@ -207,6 +224,188 @@ async fn partial_state_follower_rpc_reads_checkpoint_and_rejects_simulation() {
     assert!(
         response["error"]["message"].as_str().unwrap().contains("read-only partial-state follower"),
         "{response}"
+    );
+}
+
+#[tokio::test]
+async fn partial_state_follower_rpc_uses_header_context_and_never_persists_calls() {
+    let f = Fixture::new();
+    let api = f.follower();
+    // Return NUMBER and TIMESTAMP: the executed head is genesis, the checkpoint is block 1.
+    let overrides = json!({(TRACKED.to_string()): {"code":"0x436000524260205260406000f3"}});
+    let response =
+        rpc(&api, "eth_call", json!([{"from":SENDER,"to":TRACKED}, "latest", overrides])).await;
+    let mut expected = vec![0; 64];
+    expected[31] = 1;
+    expected[63] = 1;
+    assert_eq!(response["result"], json!(Bytes::from(expected)), "{response}");
+    let response = rpc(&api, "eth_call", json!([{"from":SENDER,"to":HASH_READER}, "latest"])).await;
+    assert_eq!(response["result"], json!(f.parent.hash()), "{response}");
+
+    // SSTORE(0, 99) affects only the simulation overlay, including during gas search.
+    let overrides = json!({(TRACKED.to_string()): {"code":"0x606360005500"}});
+    for method in ["eth_call", "eth_estimateGas"] {
+        let response =
+            rpc(&api, method, json!([{"from":SENDER,"to":TRACKED}, "latest", overrides])).await;
+        assert!(response.get("error").is_none(), "{response}");
+    }
+    assert_eq!(
+        rpc(&api, "eth_getStorageAt", json!([TRACKED, "0x0", "latest"])).await["result"],
+        json!(B256::from(U256::from(42)))
+    );
+    let ro = f.factory.database_provider_ro().unwrap();
+    assert_eq!(ro.tx_ref().entries::<tables::PlainAccountState>().unwrap(), 0);
+    assert_eq!(ro.tx_ref().entries::<tables::PlainStorageState>().unwrap(), 0);
+    assert_eq!(ro.tx_ref().entries::<tables::HashedAccounts>().unwrap(), 0);
+    assert_eq!(ro.tx_ref().entries::<tables::HashedStorages>().unwrap(), 0);
+    assert_eq!(
+        ro.tx_ref().get::<tables::PartialStateCheckpoints>(0).unwrap().unwrap().block_hash,
+        f.header.hash()
+    );
+}
+
+#[tokio::test]
+async fn partial_state_follower_rpc_rejects_unavailable_data_and_block_selections() {
+    let f = Fixture::new();
+    let api = f.follower();
+    for method in ["eth_call", "eth_estimateGas"] {
+        for target in [UNTRACKED, NESTED] {
+            assert_error(
+                &rpc(&api, method, json!([{"from":SENDER,"to":target},"latest"])).await,
+                -32002,
+                "not tracked",
+            );
+        }
+        for block in [
+            json!("pending"),
+            json!("safe"),
+            json!("finalized"),
+            json!({"blockHash":f.header.hash(),"requireCanonical":true}),
+        ] {
+            assert_error(
+                &rpc(&api, method, json!([{"from":SENDER,"to":TRACKED},block])).await,
+                -32003,
+                "not supported",
+            );
+        }
+        for block in [json!("0x0"), json!({"blockHash": B256::repeat_byte(0xab)})] {
+            assert_error(
+                &rpc(&api, method, json!([{"from":SENDER,"to":TRACKED},block])).await,
+                -32003,
+                "outside",
+            );
+        }
+    }
+    let rw = f.factory.database_provider_rw().unwrap();
+    rw.tx_ref().delete::<tables::Bytecodes>(keccak256(CODE), None).unwrap();
+    rw.commit().unwrap();
+    for method in ["eth_call", "eth_estimateGas"] {
+        assert_error(
+            &rpc(&api, method, json!([{"from":SENDER,"to":TRACKED},"latest"])).await,
+            -32003,
+            "unavailable",
+        );
+    }
+}
+
+#[tokio::test]
+async fn partial_state_follower_rpc_requires_matching_complete_context() {
+    let f = Fixture::new();
+    let api = f.follower();
+    let call = json!([{"from":SENDER,"to":TRACKED}, "latest"]);
+    for method in ["eth_call", "eth_estimateGas"] {
+        let rw = f.factory.database_provider_rw().unwrap();
+        rw.tx_ref().delete::<tables::PartialStateHeaders>(1, None).unwrap();
+        rw.commit().unwrap();
+        // The matching normal header exists, but must not substitute for follower context.
+        assert_error(&rpc(&api, method, call.clone()).await, -32003, "checkpoint header");
+        let rw = f.factory.database_provider_rw().unwrap();
+        rw.tx_ref().put::<tables::PartialStateHeaders>(1, f.parent.clone().unseal()).unwrap();
+        rw.commit().unwrap();
+        assert_error(&rpc(&api, method, call.clone()).await, -32003, "header mismatch");
+    }
+    f.factory.record_partial_state_header(&f.header).unwrap();
+    for (complete, filter_hash, message) in [
+        (
+            false,
+            ConfiguredContractFilter::new([TRACKED, NESTED, HASH_READER]).filter_hash(),
+            "incomplete",
+        ),
+        (true, B256::ZERO, "filter mismatch"),
+    ] {
+        let rw = f.factory.database_provider_rw().unwrap();
+        let mut cp = rw.tx_ref().get::<tables::PartialStateCheckpoints>(0).unwrap().unwrap();
+        cp.sync_complete = complete;
+        cp.filter_hash = filter_hash;
+        rw.tx_ref().put::<tables::PartialStateCheckpoints>(0, cp).unwrap();
+        rw.commit().unwrap();
+        for method in ["eth_call", "eth_estimateGas"] {
+            assert_error(&rpc(&api, method, call.clone()).await, -32003, message);
+        }
+    }
+    let rw = f.factory.database_provider_rw().unwrap();
+    rw.tx_ref().clear::<tables::PartialStateCheckpoints>().unwrap();
+    rw.commit().unwrap();
+    for method in ["eth_call", "eth_estimateGas"] {
+        assert_error(&rpc(&api, method, call.clone()).await, -32003, "checkpoint is unavailable");
+    }
+}
+
+#[tokio::test]
+async fn partial_state_follower_rpc_pins_context_across_checkpoint_changes() {
+    let f = Fixture::new();
+    let provider = f.provider.clone().with_partial_state_follower(true);
+    let filter = ConfiguredContractFilter::new([TRACKED, NESTED, HASH_READER]);
+    let (header, snapshot) = provider.partial_state_call(BlockId::latest(), &filter).unwrap();
+    let rw = f.factory.database_provider_rw().unwrap();
+    // A reset/reorg after snapshot selection cannot replace its state or ancestor hashes.
+    rw.tx_ref().clear::<tables::PartialStateCheckpoints>().unwrap();
+    rw.tx_ref().clear::<tables::PartialStateStorages>().unwrap();
+    rw.tx_ref().clear::<tables::PartialStateHeaders>().unwrap();
+    rw.commit().unwrap();
+    assert_eq!(header, f.header);
+    assert_eq!(snapshot.storage(TRACKED, B256::ZERO).unwrap(), Some(U256::from(42)));
+    assert_eq!(snapshot.block_hash(0).unwrap(), Some(f.parent.hash()));
+    assert!(provider.partial_state_call(BlockId::latest(), &filter).is_err());
+}
+
+#[tokio::test]
+async fn partial_state_follower_rpc_missing_ancestor_is_not_zero_or_full_state() {
+    let f = Fixture::new();
+    let mut checkpoint_header = f.header.clone().unseal();
+    checkpoint_header.number = 2;
+    checkpoint_header.parent_hash = f.header.hash();
+    let checkpoint_header = SealedHeader::seal_slow(checkpoint_header);
+    let rw = f.factory.database_provider_rw().unwrap();
+    let mut cp = rw.tx_ref().get::<tables::PartialStateCheckpoints>(0).unwrap().unwrap();
+    cp.block_number = 2;
+    cp.block_hash = checkpoint_header.hash();
+    rw.tx_ref().put::<tables::PartialStateCheckpoints>(0, cp).unwrap();
+    rw.tx_ref().put::<tables::PartialStateHeaders>(2, checkpoint_header.unseal()).unwrap();
+    // Genesis is still available from normal headers, but the follower's parent link is missing.
+    rw.tx_ref().delete::<tables::PartialStateHeaders>(1, None).unwrap();
+    rw.commit().unwrap();
+    let api = f.follower();
+    for method in ["eth_call", "eth_estimateGas"] {
+        let response = rpc(&api, method, json!([{"from":SENDER,"to":HASH_READER},"latest"])).await;
+        assert_error(&response, -32003, "BLOCKHASH history");
+        let response = rpc(&api, method, json!([{"from":SENDER,"to":TRACKED},"latest"])).await;
+        assert!(response.get("error").is_none(), "{response}");
+    }
+
+    // A header at the right height on another branch cannot supply its ancestor hashes.
+    let rw = f.factory.database_provider_rw().unwrap();
+    rw.tx_ref()
+        .put::<tables::PartialStateHeaders>(
+            1,
+            Header { extra_data: Bytes::from_static(b"other branch"), ..f.header.clone_header() },
+        )
+        .unwrap();
+    rw.commit().unwrap();
+    assert_error(
+        &rpc(&api, "eth_call", json!([{"to":HASH_READER},"latest"])).await,
+        -32003,
+        "BLOCKHASH history",
     );
 }
 

@@ -143,7 +143,7 @@ pub trait TryIntoHistoricalStateProvider {
 #[auto_impl(&, Box, Arc)]
 pub trait StateProviderFactory: BlockIdReader + Send {
     /// Whether this provider serves a non-validating partial-state follower.
-    /// Such providers cannot supply an executed block context for admission or EVM simulation.
+    /// Such providers do not assert execution validity or support normal pool admission.
     fn is_partial_state_follower(&self) -> bool {
         false
     }

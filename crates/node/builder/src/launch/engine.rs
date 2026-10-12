@@ -776,7 +776,11 @@ pub(super) async fn finish_partial_state_advance<N, Client>(
 ) -> eyre::Result<()>
 where
     N: ProviderNodeTypes + 'static,
-    Client: SnapClient + HeadersClient + Clone + Unpin + 'static,
+    Client: SnapClient
+        + HeadersClient<Header = <N::Primitives as NodePrimitives>::BlockHeader>
+        + Clone
+        + Unpin
+        + 'static,
 {
     match outcome? {
         PartialStateAdvanceOutcome::Reconciled { advanced, reverted, pruned }
@@ -872,7 +876,11 @@ async fn resync_partial_state<N, Client>(
 ) -> eyre::Result<(PartialStateSnapPivot, reth_downloaders::snap::PartialStateSnapProgress)>
 where
     N: ProviderNodeTypes + 'static,
-    Client: SnapClient + HeadersClient + Clone + Unpin + 'static,
+    Client: SnapClient
+        + HeadersClient<Header = <N::Primitives as NodePrimitives>::BlockHeader>
+        + Clone
+        + Unpin
+        + 'static,
 {
     let bootstrap = wait_for_bootstrap(
         &client,

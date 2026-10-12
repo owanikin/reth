@@ -76,14 +76,19 @@ def rpc(url, method, params, secret=None):
 
 def db(container, table, key, datadir, chain):
     # The read-only CLI checks static files before reading MDBX. A live writer
-    # can temporarily change their lengths before committing their metadata.
+    # can temporarily change their lengths or commit them ahead of MDBX. The
+    # latter can trigger a repair attempt that the read-only writer guard rejects.
+    retryable_errors = {
+        "Error: File is in an inconsistent state.",
+        "Error: cannot get a writer on a read-only environment.",
+    }
     for attempt in range(1, 6):
         try:
             output = run("docker", "exec", container, "reth", "--quiet", "db",
                          "--datadir", datadir, "--chain", chain, "get", "mdbx", table, key,
                          timeout=15)
         except CommandError as error:
-            if "Error: File is in an inconsistent state." not in error.stderr.splitlines():
+            if retryable_errors.isdisjoint(error.stderr.splitlines()):
                 raise
             if attempt == 5:
                 raise RuntimeError(

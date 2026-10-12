@@ -222,7 +222,9 @@ impl<T: HeaderProvider + BlockNumReader + Sync> PartialStateChain for T {
 async fn advance_partial_state_to_target<N, Client>(
     client: &Client,
     provider_factory: &ProviderFactory<N>,
-    canonical_provider: &impl PartialStateChain,
+    canonical_provider: &impl PartialStateChain<
+        Header = <N::Primitives as reth_primitives_traits::NodePrimitives>::BlockHeader,
+    >,
     filter: &ConfiguredContractFilter,
     head: &mut PartialStateSnapPivot,
     notified_target: BlockNumHash,
@@ -354,7 +356,7 @@ where
         {
             continue
         }
-        let computed_root = provider_factory.apply_partial_state_transition(
+        let computed_root = provider_factory.apply_partial_state_transition_with_header(
             PartialStateTransition {
                 block: BlockNumHash::new(number, block_hash),
                 parent_block_hash: header.parent_hash(),
@@ -365,6 +367,7 @@ where
                 resolved_accounts: &resolved_accounts,
             },
             filter,
+            &header,
         )?;
 
         *head =
@@ -1352,8 +1355,6 @@ mod tests {
             .with_storage_change(SlotChanges::new(slot, vec![StorageChange::new(1, child_value)]))
             .with_balance_change(BalanceChange::new(1, child_account.balance))];
         let bal_hash = compute_block_access_list_hash(&access_list);
-        let parent_hash = B256::repeat_byte(0x42);
-        let child_hash = B256::repeat_byte(0x43);
 
         let provider = factory.database_provider_rw().unwrap();
         {
@@ -1364,6 +1365,7 @@ mod tests {
         provider.commit().unwrap();
 
         let parent_header = Header { number: 0, state_root: parent_root, ..Default::default() };
+        let parent_hash = parent_header.hash_slow();
         let child_header = Header {
             parent_hash,
             number: 1,
@@ -1371,6 +1373,7 @@ mod tests {
             block_access_list_hash: Some(bal_hash),
             ..Default::default()
         };
+        let child_hash = child_header.hash_slow();
         let static_files = factory.static_file_provider();
         let mut writer = static_files.latest_writer(StaticFileSegment::Headers).unwrap();
         writer.append_header(&parent_header, &parent_hash).unwrap();
@@ -1445,10 +1448,8 @@ mod tests {
         let new_root = state_root_unsorted([(account_hash, new_account)]);
         let old_bal = access_list(101, 11);
         let new_bal = access_list(201, 21);
-        let genesis_hash = B256::repeat_byte(0x10);
-        let old_hash = B256::repeat_byte(0xa1);
-        let new_hash = B256::repeat_byte(0xb1);
         let genesis_header = Header { number: 0, state_root: genesis_root, ..Default::default() };
+        let genesis_hash = genesis_header.hash_slow();
         let old_header = Header {
             parent_hash: genesis_hash,
             number: 1,
@@ -1463,6 +1464,8 @@ mod tests {
             block_access_list_hash: Some(compute_block_access_list_hash(&new_bal)),
             ..Default::default()
         };
+        let old_hash = old_header.hash_slow();
+        let new_hash = new_header.hash_slow();
 
         let provider = factory.database_provider_rw().unwrap();
         {
@@ -1607,7 +1610,8 @@ mod tests {
 
         let genesis_account = account(100, 10);
         let genesis_root = state_root_unsorted([(account_hash, genesis_account)]);
-        let genesis_hash = B256::repeat_byte(0x10);
+        let genesis_header = Header { state_root: genesis_root, ..Default::default() };
+        let genesis_hash = genesis_header.hash_slow();
 
         let a1_account = account(101, 11);
         let a2_account = account(102, 12);
@@ -1615,8 +1619,22 @@ mod tests {
         let a2_root = state_root_unsorted([(account_hash, a2_account)]);
         let a1_bal = access_list(101, 11);
         let a2_bal = access_list(102, 12);
-        let a1_hash = B256::repeat_byte(0xa1);
-        let a2_hash = B256::repeat_byte(0xa2);
+        let a1_header = Header {
+            parent_hash: genesis_hash,
+            number: 1,
+            state_root: a1_root,
+            block_access_list_hash: Some(compute_block_access_list_hash(&a1_bal)),
+            ..Default::default()
+        };
+        let a1_hash = a1_header.hash_slow();
+        let a2_header = Header {
+            parent_hash: a1_hash,
+            number: 2,
+            state_root: a2_root,
+            block_access_list_hash: Some(compute_block_access_list_hash(&a2_bal)),
+            ..Default::default()
+        };
+        let a2_hash = a2_header.hash_slow();
 
         let provider = factory.database_provider_rw().unwrap();
         {
@@ -1628,36 +1646,9 @@ mod tests {
 
         let static_files = factory.static_file_provider();
         let mut writer = static_files.latest_writer(StaticFileSegment::Headers).unwrap();
-        writer
-            .append_header(
-                &Header { number: 0, state_root: genesis_root, ..Default::default() },
-                &genesis_hash,
-            )
-            .unwrap();
-        writer
-            .append_header(
-                &Header {
-                    parent_hash: genesis_hash,
-                    number: 1,
-                    state_root: a1_root,
-                    block_access_list_hash: Some(compute_block_access_list_hash(&a1_bal)),
-                    ..Default::default()
-                },
-                &a1_hash,
-            )
-            .unwrap();
-        writer
-            .append_header(
-                &Header {
-                    parent_hash: a1_hash,
-                    number: 2,
-                    state_root: a2_root,
-                    block_access_list_hash: Some(compute_block_access_list_hash(&a2_bal)),
-                    ..Default::default()
-                },
-                &a2_hash,
-            )
-            .unwrap();
+        writer.append_header(&genesis_header, &genesis_hash).unwrap();
+        writer.append_header(&a1_header, &a1_hash).unwrap();
+        writer.append_header(&a2_header, &a2_hash).unwrap();
         writer.commit().unwrap();
         drop(writer);
         let provider = factory.database_provider_rw().unwrap();
@@ -1698,38 +1689,30 @@ mod tests {
         let b2_root = state_root_unsorted([(account_hash, b2_account)]);
         let b1_bal = access_list(201, 21);
         let b2_bal = access_list(202, 22);
-        let b1_hash = B256::repeat_byte(0xb1);
-        let b2_hash = B256::repeat_byte(0xb2);
+        let b1_header = Header {
+            parent_hash: genesis_hash,
+            number: 1,
+            state_root: b1_root,
+            block_access_list_hash: Some(compute_block_access_list_hash(&b1_bal)),
+            ..Default::default()
+        };
+        let b1_hash = b1_header.hash_slow();
+        let b2_header = Header {
+            parent_hash: b1_hash,
+            number: 2,
+            state_root: b2_root,
+            block_access_list_hash: Some(compute_block_access_list_hash(&b2_bal)),
+            ..Default::default()
+        };
+        let b2_hash = b2_header.hash_slow();
 
         let mut writer = static_files.latest_writer(StaticFileSegment::Headers).unwrap();
         writer.prune_headers(2).unwrap();
         writer.commit().unwrap();
         drop(writer);
         let mut writer = static_files.latest_writer(StaticFileSegment::Headers).unwrap();
-        writer
-            .append_header(
-                &Header {
-                    parent_hash: genesis_hash,
-                    number: 1,
-                    state_root: b1_root,
-                    block_access_list_hash: Some(compute_block_access_list_hash(&b1_bal)),
-                    ..Default::default()
-                },
-                &b1_hash,
-            )
-            .unwrap();
-        writer
-            .append_header(
-                &Header {
-                    parent_hash: b1_hash,
-                    number: 2,
-                    state_root: b2_root,
-                    block_access_list_hash: Some(compute_block_access_list_hash(&b2_bal)),
-                    ..Default::default()
-                },
-                &b2_hash,
-            )
-            .unwrap();
+        writer.append_header(&b1_header, &b1_hash).unwrap();
+        writer.append_header(&b2_header, &b2_hash).unwrap();
         writer.commit().unwrap();
         drop(writer);
         history.store_alloy(BlockNumHash::new(1, b1_hash), &b1_bal).unwrap();
@@ -1947,12 +1930,12 @@ mod tests {
             block_access_list_hash: Some(compute_block_access_list_hash(&bal(value))),
             ..Default::default()
         };
-        let first_hash = B256::repeat_byte(0x11);
-        let second_hash = B256::repeat_byte(0x12);
-        let replacement_hash = B256::repeat_byte(0x22);
         let first = make_header(1, genesis_hash, 11);
+        let first_hash = first.hash_slow();
         let second = make_header(2, first_hash, 12);
+        let second_hash = second.hash_slow();
         let replacement = make_header(2, first_hash, 22);
+        let replacement_hash = replacement.hash_slow();
         let files = factory.static_file_provider();
         let mut writer = files.latest_writer(StaticFileSegment::Headers).unwrap();
         writer

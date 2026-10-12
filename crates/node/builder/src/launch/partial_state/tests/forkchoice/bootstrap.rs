@@ -110,12 +110,31 @@ async fn trusted_bootstrap_downloads_advances_and_resumes_without_local_full_sta
     sync(&fixture, peer.clone()).await;
     fixture.assert_checkpoint(fixture.pivot);
 
+    let header = fixture
+        .factory
+        .database_provider_ro()
+        .unwrap()
+        .tx_ref()
+        .get::<tables::PartialStateHeaders>(trusted.block_number)
+        .unwrap()
+        .unwrap();
+    assert_eq!(header.hash_slow(), trusted.block_hash);
+
     let mut head = fixture.pivot;
     let (_sender, receiver) = watch::channel(Some(child.hash()));
     let mut advancer = PartialStateAdvancer::new(receiver);
     advance(&mut advancer, &fixture, &peer, &mut head, 64).await.unwrap();
     assert_eq!(head.block_hash, child.hash());
     fixture.assert_checkpoint(head);
+
+    let provider = fixture.factory.database_provider_rw().unwrap();
+    assert_eq!(
+        provider.tx_ref().get::<tables::PartialStateHeaders>(child.number()).unwrap(),
+        Some(child.header().clone())
+    );
+    // Resuming an older datadir must recover the header as well as the saved state.
+    provider.tx_ref().delete::<tables::PartialStateHeaders>(child.number(), None).unwrap();
+    provider.commit().unwrap();
 
     // Resume the later verified checkpoint, not the original seed, without executed headers.
     assert_eq!(
@@ -133,6 +152,16 @@ async fn trusted_bootstrap_downloads_advances_and_resumes_without_local_full_sta
     );
     assert!(fixture.factory.header(fixture.pivot.block_hash).unwrap().is_none());
     assert!(fixture.factory.header(child.hash()).unwrap().is_none());
+    assert_eq!(
+        fixture
+            .factory
+            .database_provider_ro()
+            .unwrap()
+            .tx_ref()
+            .get::<tables::PartialStateHeaders>(child.number())
+            .unwrap(),
+        Some(child.header().clone())
+    );
     assert_eq!(
         *peer.header_requests.lock().unwrap(),
         [trusted.block_hash, child.hash(), child.hash()]

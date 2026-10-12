@@ -3,11 +3,15 @@ use crate::{
     providers::ProviderNodeTypes,
     DatabaseProviderRO, ProviderFactory,
 };
-use alloy_consensus::constants::{EMPTY_ROOT_HASH, KECCAK_EMPTY};
+use alloy_consensus::{
+    constants::{EMPTY_ROOT_HASH, KECCAK_EMPTY},
+    BlockHeader,
+};
 use alloy_eips::{BlockId, BlockNumberOrTag};
 use alloy_primitives::{keccak256, Address, BlockNumber, Bytes, StorageKey, StorageValue, B256};
 use reth_db_api::{cursor::DbDupCursorRO, tables, transaction::DbTx};
-use reth_primitives_traits::{Account, Bytecode};
+use reth_node_types::HeaderTy;
+use reth_primitives_traits::{Account, Bytecode, SealedHeader};
 use reth_storage_api::{
     AccountReader, BlockHashReader, BytecodeReader, ConfiguredContractFilter, ContractFilter,
     DatabaseProviderFactory, HashedPostStateProvider, PartialStateCheckpoint,
@@ -86,6 +90,45 @@ impl<N: ProviderNodeTypes> PartialStateReader<N> {
     /// Returns the verified block, root, and filter identity represented by this snapshot.
     pub const fn checkpoint(&self) -> PartialStateCheckpoint {
         self.checkpoint
+    }
+
+    /// Captures EVM header context in the same transaction as the verified state. Following
+    /// parent hashes prevents a reorg or the normal executed head from changing BLOCKHASH reads.
+    pub(crate) fn with_call_context(mut self) -> ProviderResult<(SealedHeader<HeaderTy<N>>, Self)> {
+        let pivot = self.checkpoint.pivot;
+        let header = self
+            .provider
+            .tx_ref()
+            .get::<tables::PartialStateHeaders<HeaderTy<N>>>(pivot.block_number)?
+            .ok_or(PartialStateReadError::Unsupported(
+                "unavailable partial-state checkpoint header",
+            ))?;
+        let header = SealedHeader::seal_slow(header);
+        if header.number() != pivot.block_number ||
+            header.hash() != pivot.block_hash ||
+            header.state_root() != pivot.state_root
+        {
+            return Err(PartialStateReadError::Unsupported(
+                "partial-state checkpoint header mismatch",
+            )
+            .into())
+        }
+
+        let mut parent_hash = header.parent_hash();
+        for number in (pivot.block_number.saturating_sub(256)..pivot.block_number).rev() {
+            self.block_hashes.insert(number, parent_hash);
+            let Some(parent) =
+                self.provider.tx_ref().get::<tables::PartialStateHeaders<HeaderTy<N>>>(number)?
+            else {
+                break
+            };
+            let parent = SealedHeader::seal_slow(parent);
+            if parent.number() != number || parent.hash() != parent_hash {
+                break
+            }
+            parent_hash = parent.parent_hash();
+        }
+        Ok((header, self))
     }
 
     /// Returns the account's storage-root commitment, including for untracked accounts.
@@ -246,11 +289,9 @@ impl<N: ProviderNodeTypes> BlockHashReader for PartialStateReader<N> {
         if number > self.checkpoint.pivot.block_number {
             return Ok(None)
         }
-        self.block_hashes
-            .get(&number)
-            .copied()
-            .map(Some)
-            .ok_or_else(|| ProviderError::HeaderNotFound(number.into()))
+        self.block_hashes.get(&number).copied().map(Some).ok_or_else(|| {
+            PartialStateReadError::Unsupported("unavailable BLOCKHASH history").into()
+        })
     }
 
     fn canonical_hashes_range(

@@ -506,6 +506,12 @@ tables! {
         type Value = StoredPartialStateCheckpoint;
     }
 
+    /// Headers retained for checkpoint-backed RPC context, not executed canonical headers.
+    table PartialStateHeaders<H = Header> {
+        type Key = BlockNumber;
+        type Value = H;
+    }
+
     /// Stores metadata for each reversible partial-state transition.
     table PartialStateTransitionJournals {
         type Key = BlockNumber;

@@ -88,10 +88,28 @@ if the checkpoint advances before an exact-block read opens its snapshot.
 Missing or incomplete checkpoints, filter mismatches, untracked state, and missing
 tracked data return errors. Pending, safe, finalized, other historical states, and
 `requireCanonical: true` are unsupported. No read silently falls back to normal
-state tables. EVM simulation and transaction admission/submission are explicitly
-disabled in this mode: their executed-header context and pool maintenance are not
-yet follower-aware. Existing ordinary partial mode retains its current RPC and
-txpool behavior.
+state tables.
+
+`eth_call` and `eth_estimateGas` use the checkpoint's header and state from the same
+database snapshot, even when the ordinary executed head is still genesis. The
+header's hash and state root must match the complete checkpoint. EVM block context
+(including number, timestamp, fees and randomness) is derived from that header.
+State and block overrides are local to the simulation; they never update the
+checkpoint or persisted storage. Calls to unavailable code or storage fail,
+including nested dependencies. A successful call is not execution validation of
+the chain.
+
+Header context is retained separately from executed headers. BAL transitions
+commit it atomically with the checkpoint; rollback selects the ancestor's context.
+`BLOCKHASH` follows the checkpoint header's parent links, never the normal head.
+Unknown in-window history returns an explicit unavailable-state error, not zero
+or a full-state fallback. A fresh bootstrap may lack pre-pivot ancestor headers;
+calls that need that history remain unavailable. Out-of-window `BLOCKHASH` retains
+the EVM's normal zero semantics.
+
+Broader simulation (`eth_simulateV1`, access lists, multi-call and tracing) is not
+enabled by this path. Transaction admission/submission remains disabled. Existing
+ordinary partial mode retains its current RPC and txpool behavior.
 
 Block/header/receipt RPC and `eth_blockNumber` still reflect the ordinary executed
 provider, not the partial checkpoint. On a fresh follower they can remain at
@@ -118,8 +136,8 @@ cargo test -p reth-node-builder -p reth-provider partial_state --lib
 cargo check -p reth --bin reth --no-default-features
 ```
 
-Tests cover opt-in validation, snapshot reads independent of the executed head,
-blocked full-state fallbacks, rejected simulation/admission, `SYNCING` responses,
+Tests cover opt-in validation, snapshot reads and calls independent of the executed
+head, blocked full-state fallbacks, rejected unsupported simulation/admission, `SYNCING` responses,
 duplicate targets, a real launcher with no full-state writes on Engine requests,
 BAL advancement from a verified snapshot with empty full-state tables, and
 negotiated BAL exchange between a TOML-configured follower and an opted-in full
@@ -136,3 +154,5 @@ scripts leave the full producer unchanged and use a separate test follower.
 They retain machine-readable evidence separately from the source, including root
 comparisons, execution-boundary checks and firewall cleanup results. The host-only
 regression suite runs in CI; live Docker scenarios remain opt-in.
+Use the smoke script's `--call-data` option to compare calls and estimates against
+the full producer at the exact checkpoint hash before and after a normal restart.

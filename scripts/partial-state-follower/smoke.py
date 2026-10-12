@@ -27,9 +27,12 @@ def main(argv=None):
     parser.add_argument("--donor-chain", default="/network-configs/genesis.json")
     parser.add_argument("--tracked-contract", default=TRACKED,
                         help="Contract with nonempty code to retain and compare")
+    parser.add_argument("--call-data", help="Also compare eth_call and eth_estimateGas for these hex calldata bytes")
     args = parser.parse_args(argv)
     if not re.fullmatch(r"0x[0-9a-fA-F]{40}", args.tracked_contract):
         parser.error("--tracked-contract must be a 20-byte hex address")
+    if args.call_data is not None and not re.fullmatch(r"0x(?:[0-9a-fA-F]{2})*", args.call_data):
+        parser.error("--call-data must be 0x-prefixed whole bytes")
     donor = inspect(args.donor)
     if not donor["State"]["Running"] or donor["State"]["Paused"]:
         raise RuntimeError("The full peer must already be running and unpaused")
@@ -60,7 +63,7 @@ def main(argv=None):
                "donor": donor["Id"], "donor_started_at": donor["State"]["StartedAt"],
                "image_id": image, "full_rpc": full_rpc,
                "donor_datadir": args.donor_datadir, "donor_chain": args.donor_chain,
-               "tracked_contract": args.tracked_contract}
+               "tracked_contract": args.tracked_contract, "call_data": args.call_data}
     save(directory / "run.json", details)
     print(f"Evidence: {directory}", flush=True)
     created = False
@@ -84,6 +87,23 @@ def main(argv=None):
 
     def checkpoint():
         return db(name, "PartialStateCheckpoints", "0", "/data", "/test/genesis.json")
+
+    def compare_calls(head, label):
+        if args.call_data is None:
+            return
+        request = {"to": args.tracked_contract, "data": args.call_data, "gasPrice": "0x0"}
+        at = {"blockHash": head["block_hash"]}
+        results = {}
+        for method in ("eth_call", "eth_estimateGas"):
+            actual = rpc(follower_rpc, method, [request, at])
+            expected = rpc(full_rpc, method, [request, at])
+            results[method] = {"follower": actual, "producer": expected, "match": actual == expected}
+            save(directory / f"{label}-calls.json", {"block": at, "results": results})
+            if actual != expected:
+                raise RuntimeError(f"Checkpoint RPC comparison failed: {method}")
+        if checkpoint() != head:
+            raise RuntimeError("Checkpoint changed during call comparison")
+        print(f"PASS {label} calls: eth_call and eth_estimateGas match at block={head['block_number']}", flush=True)
 
     def wait_checkpoint(number, expected_hash, label, budget=None):
         deadline = time.monotonic() + (args.timeout if budget is None else budget)
@@ -204,6 +224,7 @@ def main(argv=None):
         if code != expected or code == "0x":
             raise RuntimeError("Tracked code comparison failed")
         save(directory / "tracked-code.json", {"code_bytes": (len(code) - 2) // 2, "match": True})
+        compare_calls(head, "before-restart")
 
         run("docker", "stop", "--time", "30", name)
         after = offline_checksums("after")
@@ -225,6 +246,7 @@ def main(argv=None):
         if logs().count("Partial-state snap sync complete") != old_completions:
             raise RuntimeError("Restart repeated snap sync")
         head = advance("after-restart")
+        compare_calls(head, "after-restart")
         finish = db(name, "StageCheckpoints", '"Finish"', "/data", "/test/genesis.json")
         check_execution_boundary(finish, rpc(follower_rpc, "eth_blockNumber", []))
         if not unchanged(donor, inspect(args.donor)):
@@ -232,6 +254,7 @@ def main(argv=None):
         save(directory / "result.json", {
             "passed": True, "checkpoint": head, "checksums_unchanged_before_restart": True,
             "donor_not_restarted": True, "finish_after_restart": finish,
+            "checkpoint_calls_checked": args.call_data is not None,
         })
         print(f"PASS smoke test. Follower left running: {name}\nEvidence: {directory}", flush=True)
     except BaseException as error:

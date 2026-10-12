@@ -197,8 +197,8 @@ class LifecycleTests(unittest.TestCase):
         self.stack.enter_context(patch.object(outage, "logs", side_effect=self.world.logs))
         self.stack.enter_context(patch("sys.stdout", new_callable=io.StringIO))
 
-    def smoke_run(self):
-        smoke.main(["--donor", "donor", "--output-dir", str(self.directory), "--timeout", "10"])
+    def smoke_run(self, *extra):
+        smoke.main(["--donor", "donor", "--output-dir", str(self.directory), "--timeout", "10", *extra])
         return next(self.directory.iterdir())
 
     def outage_run(self, directory):
@@ -218,6 +218,34 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(json.loads((directory / "run.json").read_text())["engine_rpc"], "http://127.0.0.1:28551")
         self.assertIn(("http://127.0.0.1:28545", "eth_blockNumber"), self.world.rpc_calls)
         self.assertTrue(self.world.follower["State"]["Running"])
+
+    def test_smoke_compares_checkpoint_calls_before_and_after_restart(self):
+        calls = []
+        def rpc(url, method, params, secret=None):
+            if method in ("eth_call", "eth_estimateGas"):
+                calls.append((method, params, self.world.starts))
+                self.assertEqual(params[1], {"blockHash": self.world.cp["block_hash"]})
+                return "0x1234" if method == "eth_call" else "0x6000"
+            return self.world.rpc(url, method, params, secret)
+        with patch.object(smoke, "rpc", side_effect=rpc):
+            directory = self.smoke_run("--call-data", "0x01020304")
+        self.assertEqual(len(calls), 8)
+        self.assertEqual({entry[2] for entry in calls}, {1, 2})
+        self.assertTrue(json.loads((directory / "result.json").read_text())["checkpoint_calls_checked"])
+        self.assertTrue((directory / "before-restart-calls.json").exists())
+        self.assertTrue((directory / "after-restart-calls.json").exists())
+
+    def test_smoke_rejects_call_mismatch(self):
+        def rpc(url, method, params, secret=None):
+            if method in ("eth_call", "eth_estimateGas"):
+                return "0x1234" if url == common.endpoint(self.world.donor, 8545) else "0x5678"
+            return self.world.rpc(url, method, params, secret)
+        with patch.object(smoke, "rpc", side_effect=rpc), self.assertRaisesRegex(RuntimeError, "RPC comparison failed"):
+            self.smoke_run("--call-data", "0x01020304")
+        directory = next(self.directory.iterdir())
+        self.assertFalse((directory / "result.json").exists())
+        self.assertTrue((directory / "before-restart-calls.json").exists())
+        self.assertFalse(self.world.follower["State"]["Running"])
 
     def test_smoke_root_mismatch_fails_and_stops_only_new_follower(self):
         self.world.corrupt_root = True

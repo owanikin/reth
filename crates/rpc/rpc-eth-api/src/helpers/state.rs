@@ -20,7 +20,8 @@ use reth_rpc_eth_types::{
 };
 use reth_rpc_server_types::constants::DEFAULT_MAX_STORAGE_VALUES_SLOTS;
 use reth_storage_api::{
-    BlockIdReader, BlockReaderIdExt, StateProvider, StateProviderBox, StateProviderFactory,
+    BlockIdReader, BlockReader, BlockReaderIdExt, StateProvider, StateProviderBox,
+    StateProviderFactory,
 };
 use reth_transaction_pool::TransactionPool;
 use std::collections::HashMap;
@@ -267,6 +268,38 @@ pub trait LoadState:
         self.provider().partial_state(at, filter).map_err(Self::Error::from_eth_err)
     }
 
+    /// Loads a call's environment and state together. Follower calls must not pair a partial
+    /// checkpoint with the normal executed head, or reopen `latest` after selecting its header.
+    fn call_state_at(
+        &self,
+        at: BlockId,
+    ) -> impl Future<Output = Result<(EvmEnvFor<Self::Evm>, StateProviderBox), Self::Error>> + Send
+    where
+        Self: SpawnBlocking,
+    {
+        async move {
+            if self.provider().is_partial_state_follower() {
+                let filter = self.partial_state_filter().ok_or_else(|| {
+                    EthApiError::PartialStateUnavailable(
+                        "partial-state RPC filter is unavailable".into(),
+                    )
+                })?;
+                let (header, state) = self
+                    .provider()
+                    .partial_state_call(at, filter)
+                    .map_err(Self::Error::from_eth_err)?;
+                let env = self
+                    .evm_config()
+                    .evm_env(&header)
+                    .map_err(RethError::other)
+                    .map_err(Self::Error::from_eth_err)?;
+                return Ok((env, state))
+            }
+            let (env, at) = self.evm_env_at(at).await?;
+            Ok((env, self.state_at_block_id(at).await?))
+        }
+    }
+
     /// Wraps state used by RPC execution so missing partial-state data is reported explicitly.
     fn state_provider_for_rpc_execution(
         &self,
@@ -349,7 +382,7 @@ pub trait LoadState:
     ) -> Result<EvmEnvFor<Self::Evm>, Self::Error> {
         if self.provider().is_partial_state_follower() {
             return Err(EthApiError::PartialStateUnavailable(
-                "EVM simulation is not supported by the read-only partial-state follower".into(),
+                "EVM simulation without checkpoint context is not supported by the read-only partial-state follower".into(),
             )
             .into())
         }

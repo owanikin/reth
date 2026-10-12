@@ -24,7 +24,9 @@ pub(crate) async fn wait_for_bootstrap<N, Client>(
 ) -> eyre::Result<PartialStateBootstrap>
 where
     N: ProviderNodeTypes + 'static,
-    Client: HeadersClient,
+    Client: HeadersClient<
+        Header = <N::Primitives as reth_primitives_traits::NodePrimitives>::BlockHeader,
+    >,
 {
     let Some(trusted) = trusted else {
         return wait_for_partial_state_bootstrap(factory, local, filter, resume).await
@@ -50,7 +52,9 @@ pub(super) async fn select_trusted_bootstrap<N, Client>(
 ) -> eyre::Result<PartialStateBootstrap>
 where
     N: ProviderNodeTypes + 'static,
-    Client: HeadersClient,
+    Client: HeadersClient<
+        Header = <N::Primitives as reth_primitives_traits::NodePrimitives>::BlockHeader,
+    >,
 {
     trusted.validate()?;
     let spec = factory.chain_spec();
@@ -99,6 +103,9 @@ where
     } else {
         PartialStateBootstrap::Sync(pivot)
     };
+    let header_factory = factory.clone();
+    tokio::task::spawn_blocking(move || header_factory.record_partial_state_header(&header))
+        .await??;
     info!(target: "reth::cli", block_number = pivot.block_number,
         block_hash = %pivot.block_hash, state_root = %pivot.state_root,
         resume = saved.is_some(), "Selected peer-backed partial-state bootstrap");

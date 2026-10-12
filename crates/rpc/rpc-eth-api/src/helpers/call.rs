@@ -715,16 +715,16 @@ pub trait Call:
             + 'static,
         R: Send + 'static,
     {
-        async move {
-            let (evm_env, at) = self.evm_env_at(at).await?;
-            self.spawn_with_state_at_block(at, move |this, mut db| {
-                let (evm_env, tx_env) =
-                    this.prepare_call_env(evm_env, request, &mut db, overrides)?;
-
-                f(&mut db, evm_env, tx_env)
-            })
-            .await
-        }
+        self.spawn_blocking_io_fut(async move |this| {
+            let (evm_env, state) = this.call_state_at(at).await?;
+            let mut db = State::builder()
+                .with_database(StateProviderDatabase::new(
+                    this.state_provider_for_rpc_execution(state),
+                ))
+                .build();
+            let (evm_env, tx_env) = this.prepare_call_env(evm_env, request, &mut db, overrides)?;
+            f(&mut db, evm_env, tx_env)
+        })
     }
 
     /// Retrieves the transaction if it exists and executes it.

@@ -50,6 +50,7 @@ impl<H: reth_primitives_traits::BlockHeader> PartialStateAdvancer<H> {
     ) -> eyre::Result<PartialStateAdvanceOutcome>
     where
         N: ProviderNodeTypes + 'static,
+        N::Primitives: reth_primitives_traits::NodePrimitives<BlockHeader = H>,
         Client: SnapClient + HeadersClient<Header = H> + BlockAccessListsClient,
     {
         loop {
@@ -184,7 +185,10 @@ async fn reconcile<N, Client>(
 ) -> eyre::Result<PartialStateAdvanceOutcome>
 where
     N: ProviderNodeTypes + 'static,
-    Client: SnapClient + HeadersClient + BlockAccessListsClient,
+    Client: SnapClient
+        + HeadersClient<
+            Header = <N::Primitives as reth_primitives_traits::NodePrimitives>::BlockHeader,
+        > + BlockAccessListsClient,
 {
     let tip = cached_header(client, local, target, cache).await?;
     if tip.number().saturating_sub(head.block_number) > MAX_BRANCH_HEADERS as u64 {

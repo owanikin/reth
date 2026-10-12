@@ -95,6 +95,11 @@ No fixed host ports or developer-specific paths are embedded. Optional flags:
 - `--tracked-contract ADDRESS`: retain and compare a contract with nonempty code
   (default: the devnet deposit contract).
 - `--timeout SECONDS`: progress budget per phase, not the whole run.
+- `--call-data 0x...`: compare `eth_call` and `eth_estimateGas` against the donor at
+  the exact checkpoint hash, before and after restarting the follower. Supply
+  calldata for a read-only method of the tracked contract whose dependencies are
+  retained. This requires an image with checkpoint-backed follower calls; it is
+  opt-in so the original lifecycle test can still run against older images.
 
 The live checks are:
 
@@ -110,6 +115,20 @@ The live checks are:
 5. Restart that follower, discover its new ports, require checkpoint resume
    without another snap completion, then advance again and check the root and
    execution boundary. Confirm the donor did not restart.
+
+With `--call-data`, require `PASS before-restart calls`, `PASS after-restart calls` and
+`checkpoint_calls_checked: true` in `result.json`. The script retains the paired
+call/estimate responses in `before-restart-calls.json` and `after-restart-calls.json`.
+The follower checkpoint must remain unchanged during each comparison. A mismatch
+or RPC error fails the run; a root match alone is not a passing call test.
+
+For the default deposit contract, `get_deposit_count()` uses calldata `0x621fd130`:
+
+```sh
+python3 scripts/partial-state-follower/smoke.py \
+  --donor "$DONOR" --image reth-partial-statefulness:local --timeout 240 \
+  --call-data 0x621fd130
+```
 
 `PASS smoke test` is the completion marker. The follower stays running so outage
 testing can use it. On failure/interruption, the script attempts to stop only the
@@ -176,9 +195,12 @@ Only `result.json` with `passed: true` records completion of its scenario.
 Each invocation uses a new directory. Evidence includes image/container identities,
 checkpoint comparisons, Engine responses and logs; generated data is never staged
 by these tools. Root mismatches, invalid responses, malformed JSON, permission
-errors and persistent DB inconsistency fail the test. Only the known transient
-static-file consistency error is retried, at most five times, without bypassing
-Reth's checks.
+errors and persistent DB inconsistency fail the test. Live read-only DB queries
+retry only the exact errors `File is in an inconsistent state.` and
+`cannot get a writer on a read-only environment.` The consistency checker can
+report either while static files and MDBX are being committed. The query is retried
+at most five times, without enabling writes or bypassing Reth's checks; a persistent
+failure never supplies a checkpoint.
 
 `*-comparison.json` records the checkpoint and both producer lookups (by hash and
 canonical block number), including unsuccessful comparisons. The error distinguishes

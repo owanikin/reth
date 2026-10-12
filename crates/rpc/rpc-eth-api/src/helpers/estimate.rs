@@ -315,16 +315,11 @@ pub trait EstimateCall: Call {
     where
         Self: LoadPendingBlock,
     {
-        async move {
-            let (evm_env, at) = self.evm_env_at(at).await?;
-
-            self.spawn_blocking_io_fut(async move |this| {
-                let state = this.state_at_block_id(at).await?;
-                let state = this.state_provider_for_rpc_execution(state);
-                EstimateCall::estimate_gas_with(&this, evm_env, request, state, overrides)
-            })
-            .await
-        }
+        self.spawn_blocking_io_fut(async move |this| {
+            let (evm_env, state) = this.call_state_at(at).await?;
+            let state = this.state_provider_for_rpc_execution(state);
+            EstimateCall::estimate_gas_with(&this, evm_env, request, state, overrides)
+        })
     }
 
     /// Executes the requests again after an out of gas error to check if the error is gas related

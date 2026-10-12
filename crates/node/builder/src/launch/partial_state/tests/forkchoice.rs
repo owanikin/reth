@@ -374,6 +374,16 @@ async fn replays_reorg_and_rewind_without_execution_notifications() {
     );
     assert_eq!(head.block_hash, second.hash());
     fixture.assert_checkpoint(head);
+    assert_eq!(
+        fixture
+            .factory
+            .database_provider_ro()
+            .unwrap()
+            .tx_ref()
+            .get::<tables::PartialStateHeaders>(1)
+            .unwrap(),
+        Some(replacement.header().clone())
+    );
     sender.send_replace(Some(replacement.hash()));
     assert_eq!(
         advance(&mut advancer, &fixture, &peer, &mut head, 64).await.unwrap(),
@@ -381,6 +391,16 @@ async fn replays_reorg_and_rewind_without_execution_notifications() {
     );
     assert_eq!(head.block_hash, replacement.hash());
     fixture.assert_checkpoint(head);
+    assert_eq!(
+        fixture
+            .factory
+            .database_provider_ro()
+            .unwrap()
+            .tx_ref()
+            .get::<tables::PartialStateHeaders>(head.block_number)
+            .unwrap(),
+        Some(replacement.header().clone())
+    );
     assert_eq!(fixture.factory.best_block_number().unwrap(), 0);
 }
 

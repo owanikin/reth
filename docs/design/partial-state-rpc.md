@@ -6,6 +6,12 @@ storage, `eth_call`, and `eth_estimateGas`. The normal full-node path is unchang
 
 ## Behavior
 
+These selection rules describe ordinary partial mode alongside normal execution.
+In [follower mode](partial-state-follower.md#read-boundaries), `latest` instead
+selects the verified partial checkpoint. Calls and estimates use its separately
+retained, hash-checked header and state in one snapshot, without executed full state.
+Both modes fail explicitly on unavailable dependencies.
+
 - Account metadata is readable for all accounts. A nonexistent account or an empty
   storage/code commitment is known empty, even if its address is untracked.
 - Nonempty untracked storage returns `-32001`; nonempty untracked code returns `-32002`.
@@ -23,8 +29,8 @@ storage, `eth_call`, and `eth_estimateGas`. The normal full-node path is unchang
   account/storage commitments are not substituted for proofs.
 
 This is RPC integration, not removal of Reth's normal execution state. The prototype
-still maintains that state separately. Txpool integration and a partial-only execution
-path remain separate milestones. This change does not claim coverage of every custom
+still maintains that state separately in ordinary partial mode. The opt-in follower
+does not execute blocks and does not admit transactions. This change does not claim coverage of every custom
 `debug`, `trace`, or `reth` RPC endpoint.
 
 ## Rust Tests
@@ -33,6 +39,8 @@ Run from the Reth repository; Docker and Kurtosis are not required:
 
 ```sh
 cargo test -p reth-rpc partial_state_rpc --lib
+cargo test -p reth-rpc partial_state_follower_rpc --lib
+cargo test -p reth-provider partial_state_call_context --lib
 cargo test -p reth-provider partial_state_reader --lib
 cargo test -p reth-rpc-eth-types partial_state_unavailable_errors_use_stable_codes --lib
 ```

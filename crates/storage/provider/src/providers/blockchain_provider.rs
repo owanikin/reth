@@ -371,6 +371,22 @@ impl<N: ProviderNodeTypes> BlockIdReader for BlockchainProvider<N> {
 impl<N: ProviderNodeTypes> BlockReader for BlockchainProvider<N> {
     type Block = BlockTy<N>;
 
+    fn partial_state_call(
+        &self,
+        block_id: BlockId,
+        filter: &ConfiguredContractFilter,
+    ) -> ProviderResult<(SealedHeader<HeaderTy<N>>, StateProviderBox)> {
+        if !self.partial_state_follower {
+            return Err(reth_storage_errors::provider::PartialStateReadError::Unsupported(
+                "follower call context on a full node",
+            )
+            .into())
+        }
+        let (header, reader) =
+            self.database.partial_state_follower_reader(block_id, filter)?.with_call_context()?;
+        Ok((header, Box::new(reader)))
+    }
+
     fn find_block_by_hash(
         &self,
         hash: B256,
