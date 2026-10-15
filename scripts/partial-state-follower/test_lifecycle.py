@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
+import urllib.error
 
 import common
 import outage
@@ -146,6 +147,10 @@ class DockerWorld:
                      "protocols": {"eth": {"version": self.eth_version}}, "caps": ["eth/71", "snap/1"]}]
         if method == "eth_chainId":
             return "0x123"
+        if method == "engine_exchangeCapabilities":
+            if url != common.endpoint(self.follower, 8551) or secret is None:
+                raise AssertionError("Engine readiness must authenticate at its fresh published port")
+            return ["engine_forkchoiceUpdatedV3"]
         if method == "eth_getBlockByNumber":
             if params[0] == "latest":
                 self.head += 1
@@ -234,6 +239,111 @@ class LifecycleTests(unittest.TestCase):
         self.assertTrue(json.loads((directory / "result.json").read_text())["checkpoint_calls_checked"])
         self.assertTrue((directory / "before-restart-calls.json").exists())
         self.assertTrue((directory / "after-restart-calls.json").exists())
+
+    def test_smoke_waits_for_both_ports_after_start_and_restart(self):
+        polls = {1: 0, 2: 0}
+        def inspect(name):
+            info = self.world.inspect(name)
+            if info["Id"] == "follower" and info["State"]["Running"]:
+                polls[self.world.starts] += 1
+                if polls[self.world.starts] == 1:
+                    info["NetworkSettings"]["Ports"] = None
+                elif polls[self.world.starts] == 2:
+                    info["NetworkSettings"]["Ports"]["8551/tcp"] = None
+            return info
+        with patch.object(smoke, "inspect", side_effect=inspect):
+            directory = self.smoke_run()
+        for label in ("bootstrap-attempt-1", "restart"):
+            ready = json.loads((directory / f"{label}-rpc-ready.json").read_text())
+            self.assertEqual(ready["attempts"], 3)
+        self.assertTrue(json.loads((directory / "result.json").read_text())["passed"])
+        self.assertEqual(self.world.starts, 2)
+
+    def test_smoke_waits_for_http_and_engine_connections_after_restart(self):
+        failures = {"eth_chainId": 0, "engine_exchangeCapabilities": 0}
+        def rpc(url, method, params, secret=None):
+            if self.world.starts == 2 and method in failures and not failures[method]:
+                failures[method] += 1
+                raise urllib.error.URLError(ConnectionRefusedError("listener starting"))
+            return self.world.rpc(url, method, params, secret)
+        with patch.object(smoke, "rpc", side_effect=rpc):
+            directory = self.smoke_run()
+        self.assertEqual(list(failures.values()), [1, 1])
+        self.assertEqual(json.loads((directory / "restart-rpc-ready.json").read_text())["attempts"], 3)
+        self.assertTrue(json.loads((directory / "result.json").read_text())["passed"])
+
+    def test_smoke_missing_restart_ports_times_out_without_passing(self):
+        def inspect(name):
+            info = self.world.inspect(name)
+            if info["Id"] == "follower" and self.world.starts == 2:
+                info["NetworkSettings"]["Ports"] = {}
+            return info
+        with patch.object(smoke, "inspect", side_effect=inspect), self.assertRaisesRegex(RuntimeError, "Timed out waiting for follower RPC"):
+            self.smoke_run()
+        directory = next(self.directory.iterdir())
+        self.assertTrue((directory / "failure.json").exists())
+        self.assertFalse((directory / "result.json").exists())
+        self.assertFalse(self.world.follower["State"]["Running"])
+        self.assertTrue(self.world.donor["State"]["Running"])
+        self.assertEqual(self.world.starts, 2)
+
+    def test_smoke_readiness_fails_if_follower_exits(self):
+        polls = 0
+        def inspect(name):
+            nonlocal polls
+            info = self.world.inspect(name)
+            if info["Id"] == "follower" and self.world.starts == 2:
+                polls += 1
+                info["NetworkSettings"]["Ports"] = {}
+                if polls > 1:
+                    info["State"]["Running"] = False
+            return info
+        with patch.object(smoke, "inspect", side_effect=inspect), self.assertRaisesRegex(RuntimeError, "exited or paused"):
+            self.smoke_run()
+        self.assertFalse((next(self.directory.iterdir()) / "result.json").exists())
+
+    def test_smoke_readiness_rejects_unexpected_restart(self):
+        polls = 0
+        def inspect(name):
+            nonlocal polls
+            info = self.world.inspect(name)
+            if info["Id"] == "follower" and self.world.starts == 2:
+                polls += 1
+                info["NetworkSettings"]["Ports"] = {}
+                if polls > 1:
+                    info["State"]["StartedAt"] = "unexpected restart"
+            return info
+        with patch.object(smoke, "inspect", side_effect=inspect), self.assertRaisesRegex(RuntimeError, "restarted unexpectedly"):
+            self.smoke_run()
+        self.assertFalse((next(self.directory.iterdir()) / "result.json").exists())
+
+    def test_smoke_readiness_does_not_retry_auth_errors(self):
+        attempts = 0
+        error = urllib.error.HTTPError("http://localhost", 401, "Unauthorized", {}, None)
+        self.addCleanup(error.close)
+        def rpc(url, method, params, secret=None):
+            nonlocal attempts
+            if self.world.starts == 2 and method == "engine_exchangeCapabilities":
+                attempts += 1
+                raise error
+            return self.world.rpc(url, method, params, secret)
+        with patch.object(smoke, "rpc", side_effect=rpc), self.assertRaises(urllib.error.HTTPError):
+            self.smoke_run()
+        self.assertEqual(attempts, 1)
+        self.assertFalse((next(self.directory.iterdir()) / "result.json").exists())
+
+    def test_smoke_readiness_does_not_retry_rpc_errors(self):
+        attempts = 0
+        def rpc(url, method, params, secret=None):
+            nonlocal attempts
+            if self.world.starts == 2 and method == "engine_exchangeCapabilities":
+                attempts += 1
+                raise RuntimeError("malformed or rejected RPC response")
+            return self.world.rpc(url, method, params, secret)
+        with patch.object(smoke, "rpc", side_effect=rpc), self.assertRaisesRegex(RuntimeError, "malformed or rejected"):
+            self.smoke_run()
+        self.assertEqual(attempts, 1)
+        self.assertFalse((next(self.directory.iterdir()) / "result.json").exists())
 
     def test_smoke_rejects_call_mismatch(self):
         def rpc(url, method, params, secret=None):

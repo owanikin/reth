@@ -56,7 +56,8 @@ def endpoint(info, port):
     return "http://127.0.0.1:" + binding["HostPort"]
 
 
-def rpc(url, method, params, secret=None):
+def rpc_response(url, method, params, secret=None):
+    """Return a validated JSON-RPC envelope, including expected application errors."""
     headers = {"Content-Type": "application/json"}
     if secret:
         def b64(data):
@@ -69,6 +70,20 @@ def rpc(url, method, params, secret=None):
     request = urllib.request.Request(url, data=body, headers=headers)
     with urllib.request.urlopen(request, timeout=15) as response:
         result = json.load(response)
+    if (not isinstance(result, dict) or result.get("jsonrpc") != "2.0"
+            or type(result.get("id")) is not int or result["id"] != 1
+            or ("result" in result) == ("error" in result)):
+        raise RuntimeError(f"Malformed JSON-RPC response for {method}: {result}")
+    if "error" in result:
+        error = result["error"]
+        if (not isinstance(error, dict) or type(error.get("code")) is not int
+                or not isinstance(error.get("message"), str)):
+            raise RuntimeError(f"Malformed JSON-RPC error for {method}: {result}")
+    return result
+
+
+def rpc(url, method, params, secret=None):
+    result = rpc_response(url, method, params, secret)
     if result.get("error") is not None:
         raise RuntimeError(f"{method}: {result['error']}")
     return result["result"]

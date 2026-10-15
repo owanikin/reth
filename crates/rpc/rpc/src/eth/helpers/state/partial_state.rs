@@ -31,6 +31,7 @@ const EMPTY: Address = Address::repeat_byte(0x33);
 const NESTED: Address = Address::repeat_byte(0x44);
 const HASH_READER: Address = Address::repeat_byte(0x55);
 const SENDER: Address = Address::repeat_byte(0x66);
+const UNTRACKED_STORAGE: Address = Address::repeat_byte(0x88);
 const CODE: &[u8] = &[0x60, 0, 0x54, 0x60, 0, 0x52, 0x60, 0x20, 0x60, 0, 0xf3];
 
 type TestEthApi = EthApi<
@@ -91,6 +92,18 @@ impl Fixture {
         // The reader must never replace this unavailable trie with an empty one.
         tx.put::<tables::PartialStateStorageRoots>(keccak256(UNTRACKED), B256::repeat_byte(0x99))
             .unwrap();
+        // No code is needed to retain a storage commitment. Supplied call code can read this
+        // account, isolating missing storage from the untracked-bytecode account guard.
+        tx.put::<tables::PartialStateAccounts>(
+            keccak256(UNTRACKED_STORAGE),
+            Account { nonce: 1, ..Default::default() },
+        )
+        .unwrap();
+        tx.put::<tables::PartialStateStorageRoots>(
+            keccak256(UNTRACKED_STORAGE),
+            B256::repeat_byte(0x98),
+        )
+        .unwrap();
         let slot = StorageEntry { key: keccak256(B256::ZERO), value: U256::from(42) };
         tx.put::<tables::PartialStateStorages>(keccak256(TRACKED), slot).unwrap();
         tx.put::<tables::PartialStateStorageRoots>(
@@ -183,7 +196,7 @@ async fn partial_state_follower_rpc_calls_checkpoint_and_rejects_unsupported_wor
     let api = f.follower();
     let full = Fixture::new();
     let rw = full.factory.database_provider_rw().unwrap();
-    for address in [TRACKED, UNTRACKED, EMPTY, NESTED, HASH_READER, SENDER] {
+    for address in [TRACKED, UNTRACKED, EMPTY, NESTED, HASH_READER, SENDER, UNTRACKED_STORAGE] {
         let account =
             rw.tx_ref().get::<tables::PartialStateAccounts>(keccak256(address)).unwrap().unwrap();
         rw.tx_ref().put::<tables::PlainAccountState>(address, account).unwrap();
@@ -306,6 +319,133 @@ async fn partial_state_follower_rpc_rejects_unavailable_data_and_block_selection
             "unavailable",
         );
     }
+}
+
+#[tokio::test]
+async fn partial_state_follower_rpc_missing_storage_and_nested_writes_are_not_persisted() {
+    let f = Fixture::new();
+    let api = f.follower();
+    // SSTORE(0, 99), then CALL the untracked account and discard its success flag.
+    let nested = |dependency: Address| {
+        let mut code =
+            vec![0x60, 99, 0x60, 0, 0x55, 0x60, 0, 0x60, 0, 0x60, 0, 0x60, 0, 0x60, 0, 0x73];
+        code.extend_from_slice(dependency.as_slice());
+        code.extend_from_slice(&[
+            0x5a, 0xf1, 0x50, 0x60, 42, 0x60, 0, 0x52, 0x60, 32, 0x60, 0, 0xf3,
+        ]);
+        Bytes::from(code)
+    };
+    let at = json!({"blockHash": f.header.hash()});
+    let checkpoint_before = f
+        .factory
+        .database_provider_ro()
+        .unwrap()
+        .tx_ref()
+        .get::<tables::PartialStateCheckpoints>(0)
+        .unwrap();
+    let bytecodes_before =
+        f.factory.database_provider_ro().unwrap().tx_ref().entries::<tables::Bytecodes>().unwrap();
+
+    for method in ["eth_call", "eth_estimateGas"] {
+        for (target, overrides, expected_code, message, missing_address) in [
+            (
+                UNTRACKED_STORAGE,
+                json!({(UNTRACKED_STORAGE.to_string()): {"code":Bytes::from_static(CODE)}}),
+                -32001,
+                "storage",
+                UNTRACKED_STORAGE,
+            ),
+            (
+                TRACKED,
+                json!({(TRACKED.to_string()): {"code":nested(UNTRACKED)}}),
+                -32002,
+                "bytecode",
+                UNTRACKED,
+            ),
+            (
+                TRACKED,
+                json!({
+                    (TRACKED.to_string()): {"code":nested(UNTRACKED_STORAGE)},
+                    (UNTRACKED_STORAGE.to_string()): {"code":Bytes::from_static(CODE)},
+                }),
+                -32001,
+                "storage",
+                UNTRACKED_STORAGE,
+            ),
+            (
+                UNTRACKED,
+                json!({(UNTRACKED.to_string()): {"code":Bytes::from_static(CODE)}}),
+                -32002,
+                "bytecode",
+                UNTRACKED,
+            ),
+        ] {
+            let response =
+                rpc(&api, method, json!([{"from":SENDER,"to":target},at,overrides])).await;
+            assert_error(&response, expected_code, message);
+            assert!(response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains(&missing_address.to_string().to_lowercase()));
+            assert_eq!(
+                rpc(&api, "eth_getStorageAt", json!([TRACKED, "0x0", at])).await["result"],
+                json!(B256::from(U256::from(42)))
+            );
+            assert_eq!(
+                rpc(&api, "eth_getCode", json!([TRACKED, at])).await["result"],
+                json!(Bytes::from_static(CODE))
+            );
+            let valid = rpc(&api, method, json!([{"from":SENDER,"to":TRACKED},at])).await;
+            assert!(valid.get("error").is_none(), "{valid}");
+        }
+    }
+    let ro = f.factory.database_provider_ro().unwrap();
+    assert_eq!(ro.tx_ref().get::<tables::PartialStateCheckpoints>(0).unwrap(), checkpoint_before);
+    assert_eq!(ro.tx_ref().entries::<tables::Bytecodes>().unwrap(), bytecodes_before);
+    assert_eq!(
+        ro.partial_state_root(&ConfiguredContractFilter::new([TRACKED, NESTED, HASH_READER]))
+            .unwrap(),
+        f.header.state_root
+    );
+    assert_eq!(ro.tx_ref().entries::<tables::PlainAccountState>().unwrap(), 0);
+    assert_eq!(ro.tx_ref().entries::<tables::PlainStorageState>().unwrap(), 0);
+    assert_eq!(ro.tx_ref().entries::<tables::HashedAccounts>().unwrap(), 0);
+    assert_eq!(ro.tx_ref().entries::<tables::HashedStorages>().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn partial_state_follower_rpc_state_diff_and_known_empty_are_not_missing() {
+    let f = Fixture::new();
+    let api = f.follower();
+    let at = json!({"blockHash":f.header.hash()});
+    let value = B256::from(U256::from(99));
+    for method in ["eth_call", "eth_estimateGas"] {
+        let response = rpc(
+            &api,
+            method,
+            json!([
+                {"from":SENDER,"to":TRACKED}, at,
+                {(TRACKED.to_string()): {"stateDiff":{(B256::ZERO.to_string()):value}}},
+            ]),
+        )
+        .await;
+        assert!(response.get("error").is_none(), "{response}");
+        if method == "eth_call" {
+            assert_eq!(response["result"], json!(value));
+        }
+        for target in [EMPTY, Address::repeat_byte(0x77)] {
+            let response = rpc(&api, method, json!([{"from":SENDER,"to":target},at])).await;
+            assert!(response.get("error").is_none(), "{response}");
+            if method == "eth_call" {
+                assert_eq!(response["result"], "0x");
+            }
+        }
+    }
+    assert_eq!(
+        rpc(&api, "eth_getStorageAt", json!([TRACKED, "0x0", at])).await["result"],
+        json!(B256::from(U256::from(42)))
+    );
 }
 
 #[tokio::test]

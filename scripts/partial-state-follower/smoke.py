@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import sys
 import time
+import urllib.error
 import uuid
 
 from common import (
@@ -87,6 +88,54 @@ def main(argv=None):
 
     def checkpoint():
         return db(name, "PartialStateCheckpoints", "0", "/data", "/test/genesis.json")
+
+    def wait_rpc_ready(label):
+        deadline = time.monotonic() + args.timeout
+        initial = None
+        reported = None
+        attempts = 0
+        while True:
+            attempts += 1
+            info = inspect(name)
+            if not info["State"]["Running"] or info["State"]["Paused"]:
+                raise RuntimeError(f"Follower exited or paused while waiting for RPC ({label}); see follower.log")
+            if initial is None:
+                initial = info
+            elif not unchanged(initial, info):
+                raise RuntimeError(f"Follower restarted unexpectedly while waiting for RPC ({label})")
+            # Docker can report a running container before publishing its new ephemeral ports.
+            ports = info["NetworkSettings"].get("Ports") or {}
+            missing = [port for port in (8545, 8551) if not ports.get(f"{port}/tcp")]
+            if missing:
+                reason = f"Docker has not published ports {missing}"
+            else:
+                http, engine = endpoint(info, 8545), endpoint(info, 8551)
+                try:
+                    actual_chain = rpc(http, "eth_chainId", [])
+                    if int(actual_chain, 16) != chain_id:
+                        raise RuntimeError("Follower RPC reports the wrong chain ID")
+                    capabilities = rpc(engine, "engine_exchangeCapabilities", [[]], secret)
+                    if (not isinstance(capabilities, list)
+                            or not all(isinstance(item, str) for item in capabilities)
+                            or "engine_forkchoiceUpdatedV3" not in capabilities):
+                        raise RuntimeError("Follower Engine RPC lacks engine_forkchoiceUpdatedV3")
+                except urllib.error.HTTPError:
+                    # Authentication and HTTP errors are not port-publication races.
+                    raise
+                except (urllib.error.URLError, ConnectionError, TimeoutError) as error:
+                    reason = f"RPC connection not ready: {error}"
+                else:
+                    save(directory / f"{label}-rpc-ready.json", {
+                        "attempts": attempts, "follower_rpc": http, "engine_rpc": engine,
+                        "started_at": info["State"]["StartedAt"],
+                    })
+                    return http, engine
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"Timed out waiting for follower RPC ({label}): {reason}")
+            if reason != reported:
+                print(f"Waiting for follower RPC ({label}): {reason}", flush=True)
+                reported = reason
+            time.sleep(1)
 
     def compare_calls(head, label):
         if args.call_data is None:
@@ -172,9 +221,7 @@ def main(argv=None):
                 if time.monotonic() > deadline or not inspect(name)["State"]["Running"]:
                     raise RuntimeError("Image did not start in follower mode; check its build and follower.log")
                 time.sleep(1)
-            info = inspect(name)
-            follower_rpc = endpoint(info, 8545)
-            engine_rpc = endpoint(info, 8551)
+            follower_rpc, engine_rpc = wait_rpc_ready(f"bootstrap-attempt-{attempt}")
             details.update(follower_rpc=follower_rpc, engine_rpc=engine_rpc)
             save(directory / "run.json", details)
             print(f"Bootstrap attempt {attempt}, pivot={persisted['block_number']}, RPC={follower_rpc}", flush=True)
@@ -233,8 +280,7 @@ def main(argv=None):
         print("PASS full-state boundary: Finish=0; four full-state checksums unchanged", flush=True)
         old_completions = logs().count("Partial-state snap sync complete")
         run("docker", "start", name)
-        info = inspect(name)
-        follower_rpc, engine_rpc = endpoint(info, 8545), endpoint(info, 8551)
+        follower_rpc, engine_rpc = wait_rpc_ready("restart")
         details.update(follower_rpc=follower_rpc, engine_rpc=engine_rpc)
         save(directory / "run.json", details)
         deadline = time.monotonic() + args.timeout

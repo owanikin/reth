@@ -156,3 +156,9 @@ comparisons, execution-boundary checks and firewall cleanup results. The host-on
 regression suite runs in CI; live Docker scenarios remain opt-in.
 Use the smoke script's `--call-data` option to compare calls and estimates against
 the full producer at the exact checkpoint hash before and after a normal restart.
+Then run `scripts/partial-state-follower/rpc_boundaries.py --run <smoke-evidence>`
+to check untracked state reads, direct and nested missing-code errors, known-empty state,
+request-local overrides, and unchanged partial/full-state table checksums. It
+reuses the running follower without sending targets, deploying contracts, or
+restarting nodes; its nested-call fixtures are simulated code overrides. See the
+runbook for fixture prerequisites and the exact passing criteria.

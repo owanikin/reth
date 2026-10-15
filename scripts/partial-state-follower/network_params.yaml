@@ -3,6 +3,8 @@ participants:
     el_image: reth-partial-statefulness:local
     el_extra_params:
       - "--enable-eth71"
+      # RPC boundary fixtures need proofs at the follower's fixed checkpoint.
+      - "--rpc.eth-proof-window=4096"
       - "--engine.always-process-payload-attributes-on-canonical-head"
       - "--engine.allow-unwind-canonical-header"
     cl_type: lighthouse

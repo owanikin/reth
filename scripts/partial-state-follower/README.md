@@ -30,6 +30,12 @@ does not update running containers. The full donor must produce BAL-bearing bloc
 and retain their BALs; advertising eth/71 or having a BAL hash in a header alone
 does not prove BAL serving works.
 
+For RPC boundary tests, the full producer also needs
+`--rpc.eth-proof-window=4096`, as set in the checked-in YAML. Reth defaults to a
+zero-block historical proof window. The fixture checks use `eth_getProof` at the
+follower's fixed checkpoint, which is usually behind the producer's head. This is
+a bounded local-test setting, not a recommendation for public RPC servers.
+
 For a fresh, small network, `network_params.yaml` configures one full producer,
 Lighthouse, and a separate validator client. The test follower is created later,
 without its own consensus client or validators. The supernode setting permits the
@@ -130,9 +136,14 @@ python3 scripts/partial-state-follower/smoke.py \
   --call-data 0x621fd130
 ```
 
-`PASS smoke test` is the completion marker. The follower stays running so outage
-testing can use it. On failure/interruption, the script attempts to stop only the
+`PASS smoke test` is the completion marker. The follower stays running so RPC boundary
+and outage testing can use it. On failure/interruption, the script attempts to stop only the
 new follower and retains evidence/volume. It does not delete data or prune Docker.
+After each start, it waits for fresh HTTP/Engine port mappings and read-only RPC
+readiness probes, bounded by `--timeout`. Connection readiness can retry; exits,
+unexpected restarts, authentication failures and RPC errors fail the run. The
+`*-rpc-ready.json` files record the ports and attempts used. A failed smoke run
+must not be passed to `rpc_boundaries.py`, even if earlier phases passed.
 A missed snap-pivot availability window can retry bootstrap up to three times;
 root mismatches and explicit sync failures do not become successful retries.
 
@@ -141,7 +152,78 @@ the later phase checks the resumed root and execution boundary, not a second
 offline checksum. This is normal-stop recovery, not an abrupt-crash test. Full
 genesis initialization and shared bytecode storage are not counted as zero storage.
 
-## 3. Isolate the follower's peer connection
+## 3. Verify missing-state RPC boundaries
+
+Use a successful `smoke.py --call-data ...` evidence directory while its follower
+and full producer are still running. No image rebuild is needed for host-script
+changes. The image must already support checkpoint-backed calls.
+
+```sh
+export RUN='<absolute-smoke-evidence-directory>'
+python3 scripts/partial-state-follower/rpc_boundaries.py --run "$RUN"
+```
+
+The script discovers current ports and checks the follower's **current** checkpoint
+against the producer's canonical header. It sends no Engine targets, transactions,
+deployments or firewall commands, and never stops or restarts either node. Run it
+alone: concurrent target updates or reorgs invalidate a stationary-checkpoint test.
+If the producer no longer serves that checkpoint's historical state, create a fresh
+smoke follower; do not replace exact-block queries with `latest`.
+
+If `fixture-storage` reports `distance to target block exceeds maximum proof window`,
+the producer rejected a fixture prerequisite, not a missing-state check. Start a
+producer with `--rpc.eth-proof-window=4096`, then run smoke and boundary tests
+against that producer. A new image build is not needed, but editing the YAML does
+not change a running container's arguments. Preserve an existing test run by using
+a new enclave name. With the flag already set, use a fresh smoke checkpoint if the
+old one has fallen more than 4096 blocks behind. The flag permits historical
+proofs; it does not restore pruned state. Proof errors still fail the test and
+are never accepted as expected missing-state responses.
+
+The default untracked fixture is the devnet beacon-roots contract at
+`0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02`, storage slot zero. Use
+`--untracked-contract ADDRESS --untracked-slot 0x...` for another contract. The
+producer must have nonempty code and a nonempty storage trie there. A separate
+`--empty-address` fixture must have empty code and storage, outside the reserved
+low-address range. Invalid or unavailable fixtures fail rather than skip checks.
+
+Checks cover:
+
+- `eth_getCode` and `eth_getStorageAt` reject untracked state with `-32002` and
+  `-32001` respectively, naming the untracked address.
+- Both `eth_call` and `eth_estimateGas` reject direct untracked code access and
+  nested access from a tracked caller. Supplying code for an untracked contract
+  still returns `-32002`: the account guard rejects it before applying overrides.
+- Request-local code overrides implement small SLOAD, SSTORE and CALL fixtures.
+  Nested callers write a tracked slot first and discard the CALL success flag;
+  a missing dependency must still surface as a database error, not a revert,
+  successful empty result or zero gas estimate. The full producer executes the
+  same overridden requests as controls. These are simulated fixtures, not deployed
+  contracts. The live test does not reach an untracked SLOAD through that guard;
+  Rust tests separately use a code-empty account with a nonempty storage commitment
+  to exercise `-32001` during direct and nested EVM storage reads.
+- Successful SSTORE and `stateDiff` overlays return their simulated values but
+  leave normal tracked reads/calls unchanged. Known-empty state returns empty/zero
+  results, not missing-state errors. Calls and estimates still match the producer
+  after the negative cases.
+- Read-only checksums of all eight partial-state tables, the shared bytecode table,
+  the four full-state tables and `StageCheckpoints` remain unchanged. The complete
+  checkpoint must stay fixed, `Finish` and the executed head stay at genesis, and
+  neither node may restart. No write access or consistency-check bypass is used.
+
+Require `PASS RPC boundaries` and `passed: true` in the new
+`rpc-boundaries-*/result.json`. `rpc-observations.json` records exact requests and
+responses, including expected errors and producer controls. Before/after table
+checksums and checkpoint/header comparisons are retained too. Transport failures,
+malformed responses, wrong errors, unexpected successes, changed data, and missing
+producer state fail the run and leave both nodes untouched.
+
+This proves the tested RPC boundaries, not arbitrary contract support, execution
+validity, recovery from missing tracked data, or all behavior during concurrent
+checkpoint changes. The Rust RPC tests separately exercise unavailable tracked
+bytecode and pinned snapshots across checkpoint changes.
+
+## 4. Isolate the follower's peer connection
 
 Run this soon after smoke, while required peer history remains available. `RUN`
 is the exact `Evidence:` directory printed by the maintained `smoke.py`, not a
