@@ -157,6 +157,21 @@ hashes must fail, and untracked state remains explicitly unavailable. These
 synthetic branches test commitment/RPC consistency, not consensus or execution
 validity. No Docker build is required to run this test.
 
+The `partial_state_follower_restart_` tests drop the follower and its runtime,
+reopen the same on-disk database, and then select a competing branch. With retained
+journals, the follower rolls back and replays the replacement BALs without another
+snap download, serves the replacement state/context over HTTP, and continues to
+the next block. Checkpoints, journals, and state are compared across reopening;
+full-state tables stay unchanged and Engine responses remain `SYNCING`.
+
+With insufficient journal retention, recovery stops instead of accepting the
+replacement branch or bootstrapping from local full state. Any completed rollback
+remains durable: the last verified ancestor is readable, but the requested target
+is not. This requires operator recovery with a newer trusted checkpoint. These
+tests cover orderly shutdown and reopen, not process crashes, power loss, or a
+real consensus-client reorg. The scripted peer retains the old checkpoint header
+and replacement BALs/proofs needed for recovery.
+
 The maintained [lifecycle test runbook](../../scripts/partial-state-follower/README.md)
 provides a small devnet configuration, producer preflight, bootstrap/advancement/
 restart smoke test, and an explicitly authorized peer-outage scenario. These host

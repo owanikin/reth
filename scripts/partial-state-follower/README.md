@@ -41,6 +41,25 @@ The peer serves commitment-consistent synthetic branches, not execution-validate
 blocks. This is a deterministic integration test, not a live consensus reorg or
 crash-recovery test, and it does not touch existing devnets.
 
+### Restart with an offline reorg
+
+```sh
+cargo test -p reth-node-builder --test follower \
+  partial_state_follower_restart_ --offline -j 2 -- --test-threads=1
+```
+
+These two tests stop the follower on branch A, drop its runtime and database
+handles, and reopen the same datadir before selecting branch B. The retained-history
+case checks rollback/replay, matching roots, checkpoint-backed storage/calls/gas
+estimates, stale-hash errors, continued advancement, and no repeat snap download.
+The insufficient-history case advances 65 blocks from the common pivot with the
+supported 64-block retention window, allowing the worker to prune its oldest journal.
+After restart it checks a worker failure, no acceptance of branch B, and readable
+verified state at the last successfully rolled-back ancestor.
+Both check durable checkpoints/journals and unchanged normal full-state tables.
+This is graceful restart coverage, not an abrupt-crash or live consensus test.
+No Docker rebuild or Kurtosis run is needed for these test-only changes.
+
 ## Producer setup
 
 You can reuse a healthy existing donor running this branch with `--enable-eth71`.

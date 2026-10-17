@@ -9,7 +9,7 @@ use alloy_eips::{
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadAttributes, PayloadStatusEnum};
 use jsonrpsee::{core::client::ClientT, http_client::HttpClient, rpc_params};
-use reth_chainspec::{ChainSpecBuilder, EthChainSpec};
+use reth_chainspec::{ChainSpec, ChainSpecBuilder, EthChainSpec};
 use reth_db_api::{cursor::DbCursorRO, table::Table, tables, transaction::DbTx, Database};
 use reth_eth_wire_types::{
     snap::{AccountData, AccountRangeMessage, ByteCodesMessage, StorageData, StorageRangesMessage},
@@ -26,8 +26,17 @@ use reth_storage_api::{ConfiguredContractFilter, ContractFilter, PartialStateRoo
 use reth_trie::root::{state_root_unhashed, storage_root};
 use reth_trie_common::{proof::ProofRetainer, HashBuilder, Nibbles, TrieAccount};
 use serde_json::{json, Value};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
 use tokio::{sync::mpsc, task::JoinSet, time::timeout};
+
+#[path = "restart.rs"]
+mod restart;
 
 const TRACKED: Address = Address::repeat_byte(0x11);
 const UNTRACKED: Address = Address::repeat_byte(0x22);
@@ -173,7 +182,18 @@ impl BranchBlock {
     }
 }
 
-async fn serve(mut requests: mpsc::Receiver<IncomingEthRequest>, blocks: Arc<Vec<BranchBlock>>) {
+#[derive(Default)]
+struct PeerRequests {
+    snap_downloads: AtomicUsize,
+    account_proofs: AtomicUsize,
+    bals: Mutex<Vec<B256>>,
+}
+
+async fn serve(
+    mut requests: mpsc::Receiver<IncomingEthRequest>,
+    blocks: Arc<Vec<BranchBlock>>,
+    observed: Arc<PeerRequests>,
+) {
     while let Some(request) = requests.recv().await {
         match request {
             IncomingEthRequest::GetBlockHeaders { request, response, .. } => {
@@ -185,6 +205,7 @@ async fn serve(mut requests: mpsc::Receiver<IncomingEthRequest>, blocks: Arc<Vec
                 response.send(Ok(BlockHeaders(vec![header.header.clone()]))).unwrap();
             }
             IncomingEthRequest::GetBlockAccessLists { request, response, .. } => {
+                observed.bals.lock().unwrap().extend_from_slice(&request.0);
                 let bals = request
                     .0
                     .iter()
@@ -202,6 +223,11 @@ async fn serve(mut requests: mpsc::Receiver<IncomingEthRequest>, blocks: Arc<Vec
                 response.send(Ok(BlockAccessLists(bals))).unwrap();
             }
             IncomingEthRequest::GetAccountRange { request, response, .. } => {
+                if request.starting_hash == request.limit_hash {
+                    observed.account_proofs.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    observed.snap_downloads.fetch_add(1, Ordering::Relaxed);
+                }
                 let block = blocks
                     .iter()
                     .find(|block| block.header.state_root == request.root_hash)
@@ -215,6 +241,7 @@ async fn serve(mut requests: mpsc::Receiver<IncomingEthRequest>, blocks: Arc<Vec
                     .unwrap();
             }
             IncomingEthRequest::GetStorageRanges { request, response, .. } => {
+                observed.snap_downloads.fetch_add(1, Ordering::Relaxed);
                 assert_eq!(
                     request.account_hashes,
                     [keccak256(TRACKED)],
@@ -242,6 +269,7 @@ async fn serve(mut requests: mpsc::Receiver<IncomingEthRequest>, blocks: Arc<Vec
                     .unwrap();
             }
             IncomingEthRequest::GetByteCodes { request, response, .. } => {
+                observed.snap_downloads.fetch_add(1, Ordering::Relaxed);
                 assert_eq!(request.hashes, [keccak256(CODE)], "must not download untracked code");
                 response
                     .send(Ok(ByteCodesMessage {
@@ -311,8 +339,7 @@ fn partial_state_follower_rpc_state_across_reorgs() {
     runtime.block_on(assert_reorg_rpc(&directory));
 }
 
-async fn assert_reorg_rpc(directory: &tempfile::TempDir) {
-    reth_tracing::init_test_tracing();
+fn fixture_chain() -> Arc<ChainSpec> {
     let genesis = serde_json::from_value(json!({
         "gasLimit": "0x1c9c380",
         // Different genesis storage detects accidental fallback to normal state tables.
@@ -327,15 +354,23 @@ async fn assert_reorg_rpc(directory: &tempfile::TempDir) {
         }
     }))
     .unwrap();
-    let chain =
-        Arc::new(ChainSpecBuilder::mainnet().genesis(genesis).amsterdam_activated().build());
+    Arc::new(ChainSpecBuilder::mainnet().genesis(genesis).amsterdam_activated().build())
+}
+
+fn fixture_branches(chain: &ChainSpec) -> Arc<Vec<BranchBlock>> {
     let seed = BranchBlock::new(chain.genesis_header(), [10, 0], 100, [0, 0]);
     let a1 = BranchBlock::new(&seed.header, [11, 111], 101, seed.slots);
     let a2 = BranchBlock::new(&a1.header, [12, 112], 102, a1.slots);
     let b1 = BranchBlock::new(&seed.header, [21, 0], 201, seed.slots);
     let b2 = BranchBlock::new(&b1.header, [22, 0], 202, b1.slots);
     let b3 = BranchBlock::new(&b2.header, [23, 333], 203, b2.slots);
-    let blocks = Arc::new(vec![seed, a1, a2, b1, b2, b3]);
+    Arc::new(vec![seed, a1, a2, b1, b2, b3])
+}
+
+async fn assert_reorg_rpc(directory: &tempfile::TempDir) {
+    reth_tracing::init_test_tracing();
+    let chain = fixture_chain();
+    let blocks = fixture_branches(&chain);
     let seed = &blocks[0];
 
     let mut builder = NetworkConfig::builder_with_rng_secret_key(reth_tasks::Runtime::test())
@@ -353,7 +388,7 @@ async fn assert_reorg_rpc(directory: &tempfile::TempDir) {
     // JoinSet aborts the peer tasks on assertion failure as well as on normal teardown.
     let mut tasks = JoinSet::new();
     tasks.spawn(network);
-    tasks.spawn(serve(requests, blocks.clone()));
+    tasks.spawn(serve(requests, blocks.clone(), Arc::new(PeerRequests::default())));
 
     let mut toml = reth_config::Config::default();
     toml.partial_state.enabled = true;
