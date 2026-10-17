@@ -22,6 +22,25 @@ DB retries, restart detection, protocol checks, secret permissions, checksum
 failures, outage recovery and cleanup. They are **not** a replacement for the live
 commands below. CI runs only this host suite, without a devnet or privileged Docker.
 
+## Rust reorg integration test
+
+```sh
+cargo test -p reth-node-builder --test follower \
+  partial_state_follower_rpc_state_across_reorgs --offline -j 2
+```
+
+This launches an isolated follower with HTTP RPC and a local scripted eth/71 +
+snap peer. It needs loopback sockets but no Docker, Kurtosis, or internet access.
+It bootstraps a verified pivot, switches between equal-height branches, extends,
+rewinds, and replays the old branch. At each target it checks storage, calls, gas
+estimates, block context (including `BLOCKHASH`), explicit untracked-state errors,
+and rejection of stale checkpoint hashes. Roots are computed independently from
+the complete fixture state. Full-state table contents and execution stage
+checkpoints must stay at their genesis baseline; Engine responses stay `SYNCING`.
+The peer serves commitment-consistent synthetic branches, not execution-validated
+blocks. This is a deterministic integration test, not a live consensus reorg or
+crash-recovery test, and it does not touch existing devnets.
+
 ## Producer setup
 
 You can reuse a healthy existing donor running this branch with `--enable-eth71`.

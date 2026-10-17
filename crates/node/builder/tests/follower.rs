@@ -1,5 +1,8 @@
 //! Launches the opt-in follower without an execution engine or full-state backfill.
 
+#[path = "follower/reorg.rs"]
+mod reorg;
+
 use alloy_eips::NumHash;
 use alloy_primitives::{keccak256, Bytes, Sealed, B256};
 use alloy_rpc_types_engine::{

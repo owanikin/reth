@@ -147,6 +147,16 @@ stores. Tests also cover eth/69 fallback and rejection of BAL requests when only
 the remote peer advertised eth/71.
 These tests do not replace a devnet run of the newly built image.
 
+The `partial_state_follower_rpc_state_across_reorgs` integration test launches the
+follower and queries its HTTP RPC server after equal-height branch replacement,
+extension, rewind and replay. A scripted network peer serves headers, BALs and
+account proofs for full-state fixtures; the follower must compute the same roots
+without changing its normal full-state tables or execution checkpoints. Storage,
+call results and block context must follow the selected branch, stale checkpoint
+hashes must fail, and untracked state remains explicitly unavailable. These
+synthetic branches test commitment/RPC consistency, not consensus or execution
+validity. No Docker build is required to run this test.
+
 The maintained [lifecycle test runbook](../../scripts/partial-state-follower/README.md)
 provides a small devnet configuration, producer preflight, bootstrap/advancement/
 restart smoke test, and an explicitly authorized peer-outage scenario. These host
