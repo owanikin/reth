@@ -14,10 +14,7 @@ import common
 UNTRACKED = "0x000f3df6d732807ef1319fb7b8bb8522d0beac02"
 EMPTY = "0x00000000000000000000000000000000feedbeef"
 EMPTY_ROOT = "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
-STATE_TABLES = (*common.FULL_TABLES, "Bytecodes", "PartialStateAccounts",
-                "PartialStateStorageRoots", "PartialStateStorages", "PartialStateCheckpoints",
-                "PartialStateHeaders", "PartialStateTransitionJournals",
-                "PartialStateAccountChangeSets", "PartialStateStorageChangeSets", "StageCheckpoints")
+STATE_TABLES = common.STATE_TABLES
 WORD = re.compile(r"0x[0-9a-fA-F]{64}")
 DATA = re.compile(r"0x(?:[0-9a-fA-F]{2})*")
 
@@ -142,17 +139,7 @@ def main(argv=None):
                 raise RuntimeError("A tested node restarted, stopped or paused")
 
     def checksums(label):
-        values = {}
-        for table in STATE_TABLES:
-            output = common.run("docker", "exec", follower["Id"], "reth", "--color", "never",
-                                "db", "--datadir", "/data", "--chain", "/test/genesis.json",
-                                "checksum", "mdbx", table)
-            (directory / f"{label}-{table}.txt").write_text(output)
-            matches = re.findall(rf"Checksum for table `{table}`: (0x[0-9a-fA-F]+)", output)
-            if len(matches) != 1:
-                raise RuntimeError(f"Missing or ambiguous checksum for {table}")
-            values[table] = matches[0]
-            common.save(directory / f"{label}-checksums.json", values)
+        values = common.table_checksums(follower["Id"], STATE_TABLES, directory, label)
         stable()
         return values
 

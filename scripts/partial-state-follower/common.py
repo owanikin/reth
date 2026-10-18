@@ -16,6 +16,10 @@ import urllib.request
 ZERO = "0x" + "00" * 32
 TRACKED = "0x00000000219ab540356cBB839Cbe05303d7705Fa"
 FULL_TABLES = ("PlainAccountState", "PlainStorageState", "HashedAccounts", "HashedStorages")
+STATE_TABLES = (*FULL_TABLES, "Bytecodes", "PartialStateAccounts",
+                "PartialStateStorageRoots", "PartialStateStorages", "PartialStateCheckpoints",
+                "PartialStateHeaders", "PartialStateTransitionJournals",
+                "PartialStateAccountChangeSets", "PartialStateStorageChangeSets", "StageCheckpoints")
 DEFAULT_OUTPUT = Path(__file__).resolve().parents[2] / "target" / "partial-state-follower"
 
 
@@ -120,6 +124,22 @@ def db(container, table, key, datadir, chain):
 
 def save(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
+
+
+def table_checksums(container, tables, directory, label):
+    """Read tables on a stationary follower; callers must check checkpoint stability."""
+    values = {}
+    for table in tables:
+        output = run("docker", "exec", container, "reth", "--color", "never",
+                     "db", "--datadir", "/data", "--chain", "/test/genesis.json",
+                     "checksum", "mdbx", table)
+        (directory / f"{label}-{table}.txt").write_text(output)
+        matches = re.findall(rf"Checksum for table `{re.escape(table)}`: (0x[0-9a-fA-F]+)", output)
+        if len(matches) != 1:
+            raise RuntimeError(f"Missing or ambiguous checksum for {table}")
+        values[table] = matches[0]
+        save(directory / f"{label}-checksums.json", values)
+    return values
 
 
 def container_logs(container, since=None):

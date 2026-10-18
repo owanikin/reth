@@ -174,8 +174,9 @@ and replacement BALs/proofs needed for recovery.
 
 The maintained [lifecycle test runbook](../../scripts/partial-state-follower/README.md)
 provides a small devnet configuration, producer preflight, bootstrap/advancement/
-restart smoke test, and an explicitly authorized peer-outage scenario. These host
-scripts leave the full producer unchanged and use a separate test follower.
+restart smoke test, and explicitly authorized peer-outage and abrupt-restart
+scenarios. These host scripts leave the full producer unchanged and use a separate
+test follower.
 They retain machine-readable evidence separately from the source, including root
 comparisons, execution-boundary checks and firewall cleanup results. The host-only
 regression suite runs in CI; live Docker scenarios remain opt-in.
@@ -187,3 +188,15 @@ request-local overrides, and unchanged partial/full-state table checksums. It
 reuses the running follower without sending targets, deploying contracts, or
 restarting nodes; its nested-call fixtures are simulated code overrides. See the
 runbook for fixture prerequisites and the exact passing criteria.
+
+`scripts/partial-state-follower/abrupt_restart.py` reuses a successful smoke run
+with calls enabled. It requires `--allow-abrupt-stop` before sending SIGKILL to
+the labeled test follower, confirms termination, and starts the same container
+with the same data volume. The complete checkpoint, tracked RPC results, and
+partial/full-state table checksums (including rollback journals) must survive
+unchanged. It then selects a newer target and checks root/RPC consistency,
+`SYNCING` responses, and no normal full-state advancement. The producer remains
+running throughout; evidence is kept under the smoke directory.
+This tests termination after a committed checkpoint, not interruption inside a
+commit, power loss, or reorg replay after SIGKILL. The host-only tests mock process
+termination; a separate opt-in Docker run is needed to demonstrate live recovery.

@@ -19,8 +19,9 @@ python3 -m unittest discover -s scripts/partial-state-follower -p 'test_*.py' -v
 These tests mock Docker and RPC to exercise the actual orchestration, including
 failure paths. They test root/canonical checks, honest Engine responses, read-only
 DB retries, restart detection, protocol checks, secret permissions, checksum
-failures, outage recovery and cleanup. They are **not** a replacement for the live
-commands below. CI runs only this host suite, without a devnet or privileged Docker.
+failures, outage recovery, abrupt-stop authorization and cleanup. They are **not**
+a replacement for the live commands below. CI runs only this host suite, without
+a devnet or privileged Docker.
 
 ## Rust reorg integration test
 
@@ -308,6 +309,67 @@ Require `RESTORED=...`, not `RESTORE FAILED`. If the helper already exited witho
 restoration, inspect the named `chain` in the follower namespace before further
 testing; do not clear unrelated firewall rules or stop the producer.
 
+## 5. Recover after abrupt termination
+
+Use a recent successful `smoke.py --call-data` run. No image rebuild is needed for
+this host-script change. Keep its full producer, Lighthouse and validator running;
+do not send concurrent Engine targets or run outage/RPC-boundary scripts against
+the same follower during this test. Only the labeled smoke-test follower will be
+killed and restarted. Its container, config and data volume must still match the
+smoke evidence; automatic restart and auto-remove must be disabled.
+
+Set `RUN` to the **actual** `Evidence:` directory printed by that smoke run:
+
+```sh
+export RUN='<absolute-smoke-evidence-directory>'
+python3 scripts/partial-state-follower/abrupt_restart.py \
+  --run "$RUN" --timeout 240 --allow-abrupt-stop
+```
+
+On macOS, prefix the `python3` command with `caffeinate -dimsu`. Without
+`--allow-abrupt-stop`, the runner refuses to access Docker. It never deletes or
+replaces data, restarts the producer, or changes firewall rules.
+
+The scenario:
+
+1. Catch up to a recent canonical target, verify its checkpoint root, and compare
+   tracked code, slot zero, `eth_call` and `eth_estimateGas` with the producer at
+   that exact block hash. Require `Finish=0` and `eth_blockNumber=0x0`.
+2. Record all 14 table checksums used by the RPC-boundary test, including partial
+   state, headers, checkpoint, journals, changesets and shared bytecode. The four
+   full-state tables must still match smoke's post-genesis checksums.
+3. Send `docker kill --signal SIGKILL` to the follower's exact container ID.
+   Confirm it stopped with exit code 137, without an OOM kill or automatic restart.
+4. Start that same container and discover its fresh HTTP/Engine ports. Require a
+   checkpoint-resume log from **after** the kill, not a previous startup, and no
+   repeat snap bootstrap. The complete checkpoint, RPC results and all 14 table
+   checksums must match the pre-kill observations.
+5. Send a newer producer target, require `SYNCING` without a valid hash/payload ID,
+   and verify advancement and RPC results against that block. Full-state checksums
+   must remain at their genesis baseline, normal execution must remain at zero,
+   and the producer must not have restarted or stalled.
+
+Require `PASS abrupt restart` and `passed: true` in the new
+`abrupt-restart-*/result.json`. Checkpoint/header comparisons, RPC results,
+checksums, container states (including termination evidence), and logs are retained.
+The recovered follower stays running. A producer reorg that invalidates the selected
+checkpoint fails this scenario; it is not silently accepted as crash recovery.
+
+Failures retain `failure.json` and never become a pass just because cleanup worked.
+If interrupted between killing and restarting, the runner attempts one start of
+the same follower. A failed start is not retried in a loop. Inspect `failure.json`,
+`cleanup.json` when present, `follower-final.json` and `follower.log` before manually
+starting that test container. If the Python process itself is killed or Docker
+becomes unavailable, cleanup cannot be guaranteed. The producer is never stopped
+and the follower volume is never removed.
+
+This deliberately kills an idle process **after a verified committed checkpoint**.
+It does not inject a fault inside an MDBX commit, kill the Docker VM, simulate
+power loss, or prove every possible crash interleaving. It also does not exercise
+rollback after the kill; the Rust restart/reorg tests separately cover journal
+replay after orderly shutdown. Passing host-only mocks is not evidence of live
+SIGKILL recovery: run this opt-in scenario to obtain that evidence.
+
 ## Evidence and limits
 
 Only `result.json` with `passed: true` records completion of its scenario.
@@ -335,8 +397,10 @@ JWT in `jwt.hex` (mode 0600). Publish selected result/comparison JSON and review
 logs instead. `target/` may be removed by `cargo clean`; archive selected evidence
 elsewhere when preparing a report. Do not force-add generated evidence to Git.
 
-These checks cover a bounded outage within peer retention and a normal restart.
-They do not establish deep-reorg recovery, crash consistency, arbitrary historical
-state availability, state expiry, disk savings, or execution validity. Scripts
-assume a local IPv4 Docker network, a serving peer on TCP/30303, and accessible
+These checks cover a bounded outage within peer retention, a normal restart, and
+an opt-in SIGKILL/reopen scenario after a committed checkpoint. They do not
+establish deep-reorg recovery, arbitrary mid-commit crash consistency, power-loss
+durability, arbitrary historical state availability, state expiry, disk savings,
+or execution validity. Scripts assume a local IPv4 Docker network, a serving peer
+on TCP/30303, and accessible
 `eth`/`admin` RPC plus `reth db` in the image.
