@@ -17,7 +17,9 @@ use reth_storage_api::{
     PartialStateSnapProvider, PartialStateSnapStorage, PartialStateSnapStorageRanges,
     PartialStateSnapTrieNodes, PartialStateSnapTriePath, PartialStateSnapWriter,
 };
-use reth_storage_errors::provider::{ProviderError, SnapStateRootUnavailableError};
+use reth_storage_errors::provider::{
+    PartialStateReadError, ProviderError, SnapStateRootUnavailableError,
+};
 use reth_trie::root::{StateRootBuilder, StorageRootBuilder};
 use reth_trie_common::{proof::verify_proof, MultiProofTargets, Nibbles, TrieAccount, TrieNode};
 
@@ -115,6 +117,8 @@ where
         account_hash: B256,
         account: TrieAccount,
     ) -> Result<(), Self::Error> {
+        // An account response alone cannot establish completeness of its storage or code.
+        self.provider.tx_ref().delete::<tables::PartialStateAvailability>(account_hash, None)?;
         let storage_root = account.storage_root;
         self.provider
             .tx_ref()
@@ -366,6 +370,10 @@ where
     N: NodeTypesForProvider,
 {
     fn partial_state_root(&self, filter: &dyn ContractFilter) -> Result<B256, ProviderError> {
+        let complete = self
+            .tx_ref()
+            .get::<tables::PartialStateCheckpoints>(0)?
+            .is_some_and(|checkpoint| checkpoint.sync_complete);
         let mut account_cursor = self.tx_ref().cursor_read::<tables::PartialStateAccounts>()?;
         let mut commitment_cursor =
             self.tx_ref().cursor_read::<tables::PartialStateStorageRoots>()?;
@@ -384,7 +392,16 @@ where
                 next_commitment = commitment_cursor.next()?;
             }
 
-            let storage_root = if filter.should_sync_storage_by_hash(&account_hash) {
+            let available = if complete {
+                self.tx_ref()
+                    .get::<tables::PartialStateAvailability>(account_hash)?
+                    .ok_or(PartialStateReadError::MissingAvailability(account_hash))?
+                    .storage
+            } else {
+                // Bootstrap must verify downloaded slots, not accept their advertised commitments.
+                true
+            };
+            let storage_root = if filter.should_sync_storage_by_hash(&account_hash) && available {
                 let mut storage_root_builder = StorageRootBuilder::default();
                 let mut next_slot = storage_cursor.seek_by_key_subkey(account_hash, B256::ZERO)?;
                 while let Some(entry) = next_slot {

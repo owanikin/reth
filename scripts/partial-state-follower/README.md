@@ -63,6 +63,11 @@ No Docker rebuild or Kurtosis run is needed for these test-only changes.
 
 ## Producer setup
 
+Availability metadata adds two tables to the lifecycle checks. Existing completed
+partial checkpoints from before this change need a fresh follower volume; do not
+reuse them as test runs for this version. See the
+[availability design](../../docs/design/partial-state-availability.md).
+
 You can reuse a healthy existing donor running this branch with `--enable-eth71`.
 Both donor and follower must use the **same immutable image ID**. Rebuilding a tag
 does not update running containers. The full donor must produce BAL-bearing blocks
@@ -335,14 +340,14 @@ The scenario:
 1. Catch up to a recent canonical target, verify its checkpoint root, and compare
    tracked code, slot zero, `eth_call` and `eth_estimateGas` with the producer at
    that exact block hash. Require `Finish=0` and `eth_blockNumber=0x0`.
-2. Record all 14 table checksums used by the RPC-boundary test, including partial
+2. Record all 16 table checksums used by the RPC-boundary test, including partial
    state, headers, checkpoint, journals, changesets and shared bytecode. The four
    full-state tables must still match smoke's post-genesis checksums.
 3. Send `docker kill --signal SIGKILL` to the follower's exact container ID.
    Confirm it stopped with exit code 137, without an OOM kill or automatic restart.
 4. Start that same container and discover its fresh HTTP/Engine ports. Require a
    checkpoint-resume log from **after** the kill, not a previous startup, and no
-   repeat snap bootstrap. The complete checkpoint, RPC results and all 14 table
+   repeat snap bootstrap. The complete checkpoint, RPC results and all 16 table
    checksums must match the pre-kill observations.
 5. Send a newer producer target, require `SYNCING` without a valid hash/payload ID,
    and verify advancement and RPC results against that block. Full-state checksums

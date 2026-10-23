@@ -14,7 +14,7 @@ use reth_provider::BlockNumReader;
 use reth_provider::{providers::ProviderNodeTypes, HeaderProvider, ProviderFactory};
 use reth_storage_api::{
     errors::provider::{PartialStateTransitionError, ProviderError},
-    BalProvider, BalStoreHandle, ConfiguredContractFilter, DatabaseProviderFactory,
+    BalProvider, BalStoreHandle, ConfiguredContractFilter, ContractFilter, DatabaseProviderFactory,
     PartialStateCheckpointProvider, PartialStateSnapPivot, PartialStateSnapProvider,
     PartialStateTransition, PartialStateTransitionProvider,
 };
@@ -343,11 +343,13 @@ where
             })?;
         decoded_bal.ensure_hash(expected_bal_hash)?;
 
+        let local_storage =
+            local_storage_filter(provider_factory, *head, filter, decoded_bal.as_bal())?;
         let resolved_accounts = resolve_partial_state_accounts(
             client,
             header.state_root(),
             decoded_bal.as_bal(),
-            filter,
+            &local_storage,
         )
         .await?;
         // Network requests yield long enough for forkchoice to replace the target branch.
@@ -533,11 +535,13 @@ where
                 })?;
             decoded_bal.ensure_hash(expected_bal_hash)?;
 
+            let local_storage =
+                local_storage_filter(provider_factory, *head, filter, decoded_bal.as_bal())?;
             let resolved_accounts = resolve_partial_state_accounts(
                 client,
                 block.state_root(),
                 decoded_bal.as_bal(),
-                filter,
+                &local_storage,
             )
             .await?;
             let computed_root = provider_factory.apply_partial_state_transition(
@@ -581,6 +585,31 @@ where
     let retain_from = head.block_number.saturating_add(1).saturating_sub(retention.max(1));
     let pruned = provider_factory.prune_partial_state_transition_journal(retain_from)?;
     Ok(PartialStateAdvanceOutcome::Reconciled { advanced, reverted, pruned })
+}
+
+/// The resolver needs commitments for unavailable storage, even if the account is configured
+/// for retention. This request-local filter must never replace the checkpoint's policy identity.
+fn local_storage_filter<N: ProviderNodeTypes>(
+    factory: &ProviderFactory<N>,
+    head: PartialStateSnapPivot,
+    filter: &ConfiguredContractFilter,
+    access_list: &[alloy_eips::eip7928::AccountChanges],
+) -> eyre::Result<ConfiguredContractFilter> {
+    if factory.partial_state_checkpoint()?.is_none() {
+        // Uncheckpointed snapshots are verified against the configured filter before applying BALs.
+        return Ok(filter.clone())
+    }
+    let reader = factory.partial_state_reader(head, filter)?;
+    let mut available = Vec::new();
+    for changes in access_list {
+        if !changes.storage_changes.is_empty() &&
+            filter.should_sync_storage(&changes.address) &&
+            reader.state_availability(&changes.address)?.storage
+        {
+            available.push(changes.address);
+        }
+    }
+    Ok(ConfiguredContractFilter::new(available))
 }
 
 #[cfg(test)]
@@ -1326,6 +1355,47 @@ mod tests {
             assert!(!commitment_is_unavailable(&eyre::Report::new(ProviderError::from(error))));
         }
         assert!(!commitment_is_unavailable(&eyre::eyre!("database failure")));
+    }
+
+    #[test]
+    fn partial_availability_controls_commitment_resolution_without_changing_policy() {
+        let fixture = RecoveryFixture::new();
+        let address = RecoveryFixture::ADDRESS;
+        let filter = ConfiguredContractFilter::new([address]);
+        fixture.factory.begin_partial_state_sync(fixture.pivot, &filter).unwrap();
+        let provider = fixture.factory.database_provider_rw().unwrap();
+        let mut writer = provider.partial_state_snap_writer();
+        writer.write_account(keccak256(address), RecoveryFixture::account(10)).unwrap();
+        writer.write_storage(keccak256(address), keccak256([0u8; 32]), U256::from(10)).unwrap();
+        provider.commit().unwrap();
+        fixture.factory.complete_partial_state_sync(fixture.pivot, &filter).unwrap();
+        let bal = vec![AccountChanges::new(address).with_storage_change(SlotChanges::new(
+            U256::ZERO,
+            vec![StorageChange::new(1, U256::from(11))],
+        ))];
+        assert!(local_storage_filter(&fixture.factory, fixture.pivot, &filter, &bal)
+            .unwrap()
+            .should_sync_storage(&address));
+        let provider = fixture.factory.database_provider_rw().unwrap();
+        provider
+            .tx_ref()
+            .put::<tables::PartialStateAvailability>(
+                keccak256(address),
+                reth_db_api::models::StoredPartialStateAvailability {
+                    storage: false,
+                    bytecode: true,
+                },
+            )
+            .unwrap();
+        provider.commit().unwrap();
+        assert!(!local_storage_filter(&fixture.factory, fixture.pivot, &filter, &bal)
+            .unwrap()
+            .should_sync_storage(&address));
+        assert!(filter.should_sync_storage(&address));
+        assert_eq!(
+            fixture.factory.partial_state_checkpoint().unwrap().unwrap().filter_hash,
+            filter.filter_hash()
+        );
     }
 
     #[tokio::test]

@@ -41,3 +41,23 @@ pub struct StoredPartialStateTransition {
 
 #[cfg(any(test, feature = "reth-codec"))]
 reth_codecs::impl_compression_for_compact!(StoredPartialStateTransition);
+
+/// Availability of complete storage and bytecode for one partial-state account.
+///
+/// This is independent of the configured retention filter. `false` never means empty:
+/// emptiness is determined by the account's storage-root and code-hash commitments.
+/// A missing record is unknown availability, not permission to read local state.
+#[derive(Debug, Default, Eq, PartialEq, Clone, Copy)]
+#[cfg_attr(any(test, feature = "arbitrary"), derive(arbitrary::Arbitrary))]
+#[cfg_attr(any(test, feature = "reth-codec"), derive(reth_codecs::Compact))]
+#[cfg_attr(any(test, feature = "reth-codec"), reth_codecs::add_arbitrary_tests(compact))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct StoredPartialStateAvailability {
+    /// All slots of the committed storage trie are retained locally.
+    pub storage: bool,
+    /// The committed bytecode is retained locally.
+    pub bytecode: bool,
+}
+
+#[cfg(any(test, feature = "reth-codec"))]
+reth_codecs::impl_compression_for_compact!(StoredPartialStateAvailability);

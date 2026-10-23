@@ -9,7 +9,9 @@ use alloy_consensus::{
 };
 use alloy_eips::{BlockId, BlockNumberOrTag};
 use alloy_primitives::{keccak256, Address, BlockNumber, Bytes, StorageKey, StorageValue, B256};
-use reth_db_api::{cursor::DbDupCursorRO, tables, transaction::DbTx};
+use reth_db_api::{
+    cursor::DbDupCursorRO, models::StoredPartialStateAvailability, tables, transaction::DbTx,
+};
 use reth_node_types::HeaderTy;
 use reth_primitives_traits::{Account, Bytecode, SealedHeader};
 use reth_storage_api::{
@@ -64,7 +66,12 @@ impl<N: ProviderNodeTypes> PartialStateReader<N> {
         for hash in filter.contract_hashes() {
             if let Some(account) = provider.tx_ref().get::<tables::PartialStateAccounts>(*hash)? &&
                 let Some(code_hash) = account.bytecode_hash &&
-                code_hash != KECCAK_EMPTY
+                code_hash != KECCAK_EMPTY &&
+                provider
+                    .tx_ref()
+                    .get::<tables::PartialStateAvailability>(*hash)?
+                    .ok_or(PartialStateReadError::MissingAvailability(*hash))?
+                    .bytecode
             {
                 tracked_code_hashes.insert(code_hash);
             }
@@ -90,6 +97,22 @@ impl<N: ProviderNodeTypes> PartialStateReader<N> {
     /// Returns the verified block, root, and filter identity represented by this snapshot.
     pub const fn checkpoint(&self) -> PartialStateCheckpoint {
         self.checkpoint
+    }
+
+    /// Availability in this checkpoint's database snapshot, independent of retention policy.
+    /// Absent accounts are known empty. Missing metadata for an existing account is an error.
+    pub fn state_availability(
+        &self,
+        address: &Address,
+    ) -> ProviderResult<StoredPartialStateAvailability> {
+        let hash = keccak256(address);
+        if self.provider.tx_ref().get::<tables::PartialStateAccounts>(hash)?.is_none() {
+            return Ok(StoredPartialStateAvailability { storage: true, bytecode: true })
+        }
+        self.provider
+            .tx_ref()
+            .get::<tables::PartialStateAvailability>(hash)?
+            .ok_or_else(|| PartialStateReadError::MissingAvailability(hash).into())
     }
 
     /// Captures EVM header context in the same transaction as the verified state. Following
@@ -165,6 +188,9 @@ impl<N: ProviderNodeTypes> PartialStateReader<N> {
         if !self.filter.should_sync_storage(&address) {
             return Err(ProviderError::StorageNotTracked(address))
         }
+        if !self.state_availability(&address)?.storage {
+            return Err(PartialStateReadError::StorageUnavailable(address).into())
+        }
 
         let slot_hash = keccak256(storage_key);
         let mut cursor =
@@ -185,6 +211,9 @@ impl<N: ProviderNodeTypes> PartialStateReader<N> {
         }
         if !self.filter.should_sync_code(address) {
             return Err(ProviderError::CodeNotTracked(*address))
+        }
+        if !self.state_availability(address)?.bytecode {
+            return Err(PartialStateReadError::CodeUnavailable(*address).into())
         }
         self.bytecode_by_hash(&code_hash)
     }
@@ -409,8 +438,8 @@ mod tests {
     use reth_primitives_traits::StorageEntry;
     use reth_storage_api::{
         AccountInfoReader, DBProvider, PartialStateCheckpointProvider,
-        PartialStateCheckpointStatus, PartialStateResolvedAccounts, PartialStateSnapWriter,
-        PartialStateTransition, PartialStateTransitionProvider,
+        PartialStateCheckpointStatus, PartialStateResolvedAccounts, PartialStateRootProvider,
+        PartialStateSnapWriter, PartialStateTransition, PartialStateTransitionProvider,
     };
     use reth_trie::root::{state_root_unsorted, storage_root};
     use reth_trie_common::TrieAccount;
@@ -535,8 +564,14 @@ mod tests {
     fn setup(
     ) -> (ProviderFactory<MockNodeTypesWithDB>, ConfiguredContractFilter, PartialStateSnapPivot)
     {
+        setup_with_filter(ConfiguredContractFilter::new([TRACKED, ABSENT]))
+    }
+
+    fn setup_with_filter(
+        filter: ConfiguredContractFilter,
+    ) -> (ProviderFactory<MockNodeTypesWithDB>, ConfiguredContractFilter, PartialStateSnapPivot)
+    {
         let factory = create_test_provider_factory();
-        let filter = ConfiguredContractFilter::new([TRACKED, ABSENT]);
         let accounts = accounts();
         let pivot = PartialStateSnapPivot {
             block_number: 7,
@@ -597,6 +632,20 @@ mod tests {
         assert_eq!(reader.account_code(&EMPTY).unwrap(), None);
         assert_eq!(reader.bytecode_by_hash(&KECCAK_EMPTY).unwrap(), None);
         assert_eq!(reader.storage(SHARED, SLOT).unwrap(), None);
+        assert_eq!(
+            reader.state_availability(&TRACKED).unwrap(),
+            StoredPartialStateAvailability { storage: true, bytecode: true }
+        );
+        assert_eq!(
+            reader.state_availability(&UNTRACKED).unwrap(),
+            StoredPartialStateAvailability::default()
+        );
+        for address in [EMPTY, ABSENT] {
+            assert_eq!(
+                reader.state_availability(&address).unwrap(),
+                StoredPartialStateAvailability { storage: true, bytecode: true }
+            );
+        }
         // Seeking a missing key may return the next larger slot, which must not be treated as a
         // hit.
         let absent_slot = (0..=u8::MAX)
@@ -856,5 +905,334 @@ mod tests {
         ));
         assert_eq!(child_reader.checkpoint().pivot, child);
         assert_eq!(child_reader.storage(TRACKED, SLOT).unwrap(), Some(U256::from(43)));
+    }
+
+    #[test]
+    fn partial_availability_is_snapshot_backed_and_distinct_from_tracking() {
+        let (factory, filter, pivot) = setup();
+        let original = factory.partial_state_reader(pivot, &filter).unwrap();
+        let provider = factory.database_provider_rw().unwrap();
+        // Model unavailable data without deleting it: stale rows and shared code must not grant
+        // access, even when the configured filter still selects this account.
+        provider
+            .tx_ref()
+            .put::<tables::PartialStateAvailability>(
+                keccak256(TRACKED),
+                StoredPartialStateAvailability::default(),
+            )
+            .unwrap();
+        provider.commit().unwrap();
+        let reader = factory.partial_state_reader(pivot, &filter).unwrap();
+        assert_eq!(
+            reader.state_availability(&TRACKED).unwrap(),
+            StoredPartialStateAvailability::default()
+        );
+        assert!(matches!(reader.storage(TRACKED, SLOT),
+            Err(ProviderError::PartialStateRead(error))
+                if *error == PartialStateReadError::StorageUnavailable(TRACKED)));
+        assert!(matches!(reader.account_code(&TRACKED),
+            Err(ProviderError::PartialStateRead(error))
+                if *error == PartialStateReadError::CodeUnavailable(TRACKED)));
+        assert!(reader.bytecode_by_hash(&keccak256(CODE)).is_err());
+        assert_eq!(factory.partial_state_root(&filter).unwrap(), pivot.state_root);
+        assert_eq!(original.storage(TRACKED, SLOT).unwrap(), Some(U256::from(42)));
+        assert!(original.account_code(&TRACKED).unwrap().is_some());
+
+        // Completing the same checkpoint again must not re-enable unavailable state.
+        factory.complete_partial_state_sync(pivot, &filter).unwrap();
+        assert_eq!(
+            factory
+                .partial_state_reader(pivot, &filter)
+                .unwrap()
+                .state_availability(&TRACKED)
+                .unwrap(),
+            StoredPartialStateAvailability::default()
+        );
+        factory.reset_partial_state().unwrap();
+        let provider = factory.database_provider_ro().unwrap();
+        assert_eq!(provider.tx_ref().entries::<tables::PartialStateAvailability>().unwrap(), 0);
+        assert_eq!(
+            provider.tx_ref().entries::<tables::PartialStateAvailabilityChangeSets>().unwrap(),
+            0
+        );
+        assert_eq!(
+            original.state_availability(&TRACKED).unwrap(),
+            StoredPartialStateAvailability { storage: true, bytecode: true }
+        );
+        assert_eq!(
+            reader.state_availability(&TRACKED).unwrap(),
+            StoredPartialStateAvailability::default()
+        );
+    }
+
+    #[test]
+    fn partial_availability_requires_verified_storage_and_code() {
+        let (factory, filter, pivot) = setup();
+        factory.begin_partial_state_sync(pivot, &filter).unwrap();
+        let provider = factory.database_provider_rw().unwrap();
+        for (address, account) in accounts() {
+            provider
+                .partial_state_snap_writer()
+                .write_account(keccak256(address), account)
+                .unwrap();
+        }
+        provider.tx_ref().delete::<tables::Bytecodes>(keccak256(CODE), None).unwrap();
+        provider.commit().unwrap();
+        assert!(factory.complete_partial_state_sync(pivot, &filter).is_err());
+
+        let provider = factory.database_provider_rw().unwrap();
+        provider
+            .partial_state_snap_writer()
+            .write_storage(keccak256(TRACKED), keccak256(SLOT), U256::from(42))
+            .unwrap();
+        provider.commit().unwrap();
+        assert!(matches!(factory.complete_partial_state_sync(pivot, &filter),
+            Err(ProviderError::PartialStateRead(error))
+                if *error == PartialStateReadError::MissingBytecode(keccak256(CODE))));
+        let provider = factory.database_provider_ro().unwrap();
+        assert_eq!(provider.tx_ref().entries::<tables::PartialStateAvailability>().unwrap(), 0);
+        drop(provider);
+        assert_eq!(
+            factory.partial_state_checkpoint().unwrap().unwrap().status,
+            PartialStateCheckpointStatus::Syncing
+        );
+
+        let provider = factory.database_provider_rw().unwrap();
+        provider
+            .partial_state_snap_writer()
+            .write_bytecode(keccak256(CODE), UNTRACKED_CODE)
+            .unwrap();
+        provider.commit().unwrap();
+        assert!(matches!(factory.complete_partial_state_sync(pivot, &filter),
+            Err(ProviderError::PartialStateRead(error))
+                if matches!(*error, PartialStateReadError::BytecodeHashMismatch { .. })));
+        let provider = factory.database_provider_rw().unwrap();
+        provider.partial_state_snap_writer().write_bytecode(keccak256(CODE), CODE).unwrap();
+        // The full root can match using downloaded tracked slots even if their advertised
+        // commitment was wrong. Never let that make the reader treat a nonempty trie as empty.
+        provider
+            .tx_ref()
+            .delete::<tables::PartialStateStorageRoots>(keccak256(TRACKED), None)
+            .unwrap();
+        provider.commit().unwrap();
+        assert!(matches!(factory.complete_partial_state_sync(pivot, &filter),
+            Err(ProviderError::PartialStateRead(error))
+                if matches!(*error, PartialStateReadError::StorageRootMismatch { .. })));
+        let provider = factory.database_provider_rw().unwrap();
+        assert_eq!(provider.tx_ref().entries::<tables::PartialStateAvailability>().unwrap(), 0);
+        provider
+            .tx_ref()
+            .put::<tables::PartialStateStorageRoots>(
+                keccak256(TRACKED),
+                accounts()[0].1.storage_root,
+            )
+            .unwrap();
+        provider.commit().unwrap();
+        factory.complete_partial_state_sync(pivot, &filter).unwrap();
+        assert!(
+            factory
+                .partial_state_reader(pivot, &filter)
+                .unwrap()
+                .state_availability(&TRACKED)
+                .unwrap()
+                .storage
+        );
+    }
+
+    #[test]
+    fn partial_availability_is_per_account_for_shared_code() {
+        let (factory, filter, pivot) =
+            setup_with_filter(ConfiguredContractFilter::new([TRACKED, SHARED]));
+        let provider = factory.database_provider_rw().unwrap();
+        provider
+            .tx_ref()
+            .put::<tables::PartialStateAvailability>(
+                keccak256(TRACKED),
+                StoredPartialStateAvailability { storage: true, bytecode: false },
+            )
+            .unwrap();
+        provider.commit().unwrap();
+        let reader = factory.partial_state_reader(pivot, &filter).unwrap();
+        assert!(reader.bytecode_by_hash(&keccak256(CODE)).unwrap().is_some());
+        assert!(reader.account_code(&SHARED).unwrap().is_some());
+        assert!(
+            matches!(reader.account_code(&TRACKED), Err(ProviderError::PartialStateRead(error))
+            if *error == PartialStateReadError::CodeUnavailable(TRACKED))
+        );
+        assert_eq!(factory.partial_state_root(&filter).unwrap(), pivot.state_root);
+    }
+
+    #[test]
+    fn partial_availability_missing_metadata_fails_closed() {
+        let (factory, filter, pivot) = setup();
+        let provider = factory.database_provider_rw().unwrap();
+        provider.tx_ref().clear::<tables::PartialStateAvailability>().unwrap();
+        provider.commit().unwrap();
+        assert!(matches!(factory.partial_state_reader(pivot, &filter),
+            Err(ProviderError::PartialStateRead(error))
+                if *error == PartialStateReadError::MissingAvailability(keccak256(TRACKED))));
+        assert!(matches!(factory.partial_state_root(&filter),
+            Err(ProviderError::PartialStateRead(error))
+                if matches!(*error, PartialStateReadError::MissingAvailability(_))));
+        assert!(factory.complete_partial_state_sync(pivot, &filter).is_err());
+        assert_eq!(factory.partial_state_checkpoint().unwrap().unwrap().pivot, pivot);
+    }
+
+    #[test]
+    fn partial_availability_creation_is_reverted_with_the_account() {
+        let factory = create_test_provider_factory();
+        let filter = ConfiguredContractFilter::new([ABSENT]);
+        let pivot = PartialStateSnapPivot {
+            block_number: 0,
+            block_hash: B256::repeat_byte(1),
+            state_root: EMPTY_ROOT_HASH,
+        };
+        factory.begin_partial_state_sync(pivot, &filter).unwrap();
+        factory.complete_partial_state_sync(pivot, &filter).unwrap();
+        let account = TrieAccount { balance: U256::from(10), ..Default::default() };
+        let bal = vec![alloy_eip7928::AccountChanges::new(ABSENT)
+            .with_balance_change(BalanceChange::new(1, account.balance))];
+        let child = PartialStateSnapPivot {
+            block_number: 1,
+            block_hash: B256::repeat_byte(2),
+            state_root: state_root_unsorted([(keccak256(ABSENT), account)]),
+        };
+        factory
+            .apply_partial_state_transition(
+                PartialStateTransition {
+                    block: BlockNumHash::new(1, child.block_hash),
+                    parent_block_hash: pivot.block_hash,
+                    parent_root: pivot.state_root,
+                    expected_root: child.state_root,
+                    expected_bal_hash: compute_block_access_list_hash(&bal),
+                    access_list: &bal,
+                    resolved_accounts: &PartialStateResolvedAccounts::new(),
+                },
+                &filter,
+            )
+            .unwrap();
+        assert_eq!(
+            factory
+                .partial_state_reader(child, &filter)
+                .unwrap()
+                .state_availability(&ABSENT)
+                .unwrap(),
+            StoredPartialStateAvailability { storage: true, bytecode: true }
+        );
+        factory
+            .revert_partial_state_transition(BlockNumHash::new(1, child.block_hash), &filter)
+            .unwrap();
+        let provider = factory.database_provider_ro().unwrap();
+        assert_eq!(provider.tx_ref().entries::<tables::PartialStateAccounts>().unwrap(), 0);
+        assert_eq!(provider.tx_ref().entries::<tables::PartialStateAvailability>().unwrap(), 0);
+        assert_eq!(
+            provider.tx_ref().entries::<tables::PartialStateAvailabilityChangeSets>().unwrap(),
+            0
+        );
+        assert_eq!(factory.partial_state_checkpoint().unwrap().unwrap().pivot, pivot);
+    }
+
+    #[test]
+    fn partial_availability_survives_bal_failure_and_revert() {
+        let (factory, filter, pivot) = setup();
+        let provider = factory.database_provider_rw().unwrap();
+        provider
+            .tx_ref()
+            .put::<tables::PartialStateAvailability>(
+                keccak256(TRACKED),
+                StoredPartialStateAvailability::default(),
+            )
+            .unwrap();
+        provider.commit().unwrap();
+        let parent = factory.partial_state_reader(pivot, &filter).unwrap();
+        let mut child_accounts = accounts();
+        child_accounts[0].1.storage_root = storage_root([(keccak256(SLOT), U256::from(43))]);
+        child_accounts[0].1.code_hash = keccak256(UNTRACKED_CODE);
+        let child = PartialStateSnapPivot {
+            block_number: pivot.block_number + 1,
+            block_hash: B256::repeat_byte(0x88),
+            state_root: state_root_unsorted(
+                child_accounts.iter().map(|(address, account)| (keccak256(address), *account)),
+            ),
+        };
+        let bal = vec![alloy_eip7928::AccountChanges::new(TRACKED)
+            .with_storage_change(SlotChanges::new(
+                U256::from_be_bytes(SLOT.0),
+                vec![StorageChange::new(1, U256::from(43))],
+            ))
+            .with_code_change(CodeChange::new(1, Bytes::from_static(UNTRACKED_CODE)))];
+        let resolved = PartialStateResolvedAccounts::from([(TRACKED, Some(child_accounts[0].1))]);
+        let transition = PartialStateTransition {
+            block: BlockNumHash::new(child.block_number, child.block_hash),
+            parent_block_hash: pivot.block_hash,
+            parent_root: pivot.state_root,
+            expected_root: child.state_root,
+            expected_bal_hash: compute_block_access_list_hash(&bal),
+            access_list: &bal,
+            resolved_accounts: &resolved,
+        };
+        assert!(factory
+            .apply_partial_state_transition(
+                PartialStateTransition { expected_root: B256::ZERO, ..transition },
+                &filter
+            )
+            .is_err());
+        let provider = factory.database_provider_ro().unwrap();
+        assert_eq!(
+            provider.tx_ref().entries::<tables::PartialStateAvailabilityChangeSets>().unwrap(),
+            0
+        );
+        drop(provider);
+        assert_eq!(
+            factory
+                .partial_state_reader(pivot, &filter)
+                .unwrap()
+                .state_availability(&TRACKED)
+                .unwrap(),
+            StoredPartialStateAvailability::default()
+        );
+
+        factory.apply_partial_state_transition(transition, &filter).unwrap();
+        let reader = factory.partial_state_reader(child, &filter).unwrap();
+        assert_eq!(
+            reader.state_availability(&TRACKED).unwrap(),
+            StoredPartialStateAvailability { storage: false, bytecode: true }
+        );
+        assert!(reader.storage(TRACKED, SLOT).is_err());
+        assert_eq!(
+            reader.account_code(&TRACKED).unwrap().unwrap().original_bytes().as_ref(),
+            UNTRACKED_CODE
+        );
+        assert_eq!(factory.partial_state_root(&filter).unwrap(), child.state_root);
+        let provider = factory.database_provider_ro().unwrap();
+        assert_eq!(
+            provider.tx_ref().entries::<tables::PartialStateStorageChangeSets>().unwrap(),
+            0
+        );
+        drop(provider);
+        factory.revert_partial_state_transition(transition.block, &filter).unwrap();
+        assert_eq!(factory.partial_state_root(&filter).unwrap(), pivot.state_root);
+        assert_eq!(
+            factory
+                .partial_state_reader(pivot, &filter)
+                .unwrap()
+                .state_availability(&TRACKED)
+                .unwrap(),
+            StoredPartialStateAvailability::default()
+        );
+        assert_eq!(
+            parent.state_availability(&TRACKED).unwrap(),
+            StoredPartialStateAvailability::default()
+        );
+        assert!(reader.state_availability(&TRACKED).unwrap().bytecode);
+        assert_eq!(
+            factory
+                .database_provider_ro()
+                .unwrap()
+                .tx_ref()
+                .entries::<tables::PartialStateAvailabilityChangeSets>()
+                .unwrap(),
+            0
+        );
     }
 }

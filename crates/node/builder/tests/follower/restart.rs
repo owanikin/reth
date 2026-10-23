@@ -27,12 +27,14 @@ impl Snapshot {
             partial: json!({
                 "accounts": rows::<tables::PartialStateAccounts>(&tx),
                 "storage": rows::<tables::PartialStateStorages>(&tx),
+                "availability": rows::<tables::PartialStateAvailability>(&tx),
                 "roots": rows::<tables::PartialStateStorageRoots>(&tx),
                 "checkpoint": rows::<tables::PartialStateCheckpoints>(&tx),
                 "headers": rows::<tables::PartialStateHeaders>(&tx),
                 "journals": rows::<tables::PartialStateTransitionJournals>(&tx),
                 "account_changes": rows::<tables::PartialStateAccountChangeSets>(&tx),
                 "storage_changes": rows::<tables::PartialStateStorageChangeSets>(&tx),
+                "availability_changes": rows::<tables::PartialStateAvailabilityChangeSets>(&tx),
                 "code": rows::<tables::Bytecodes>(&tx),
             }),
         }

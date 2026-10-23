@@ -300,9 +300,13 @@ async fn trusted_bootstrap_rejects_bad_download_and_corrupt_saved_state() {
         alloy_rlp::encode(RecoveryFixture::account(10)).into();
     sync(&fixture, peer.clone()).await;
     let provider = fixture.factory.database_provider_rw().unwrap();
+    // Corrupt the saved commitment without invalidating availability through the snap writer.
     provider
-        .partial_state_snap_writer()
-        .write_account(keccak256(RecoveryFixture::ADDRESS), RecoveryFixture::account(99))
+        .tx_ref()
+        .put::<tables::PartialStateStorageRoots>(
+            keccak256(RecoveryFixture::ADDRESS),
+            RecoveryFixture::account(99).storage_root,
+        )
         .unwrap();
     provider.commit().unwrap();
     assert!(select_trusted_bootstrap(&peer, &fixture.factory, &fixture.filter, true, trusted)

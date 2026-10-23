@@ -29,4 +29,6 @@ pub use client_version::ClientVersion;
 
 /// Partial-state persistence models.
 pub mod partial_state;
-pub use partial_state::{StoredPartialStateCheckpoint, StoredPartialStateTransition};
+pub use partial_state::{
+    StoredPartialStateAvailability, StoredPartialStateCheckpoint, StoredPartialStateTransition,
+};

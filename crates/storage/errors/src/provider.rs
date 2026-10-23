@@ -353,6 +353,25 @@ impl From<PartialStateCheckpointError> for ProviderError {
 /// Error returned when a partial-state snapshot cannot satisfy a read.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PartialStateReadError {
+    /// Legacy or incomplete metadata cannot establish whether local data is complete.
+    #[error("partial-state availability for account {0} is missing; a fresh partial-state bootstrap is required")]
+    MissingAvailability(B256),
+    /// The contract is tracked, but its complete storage is not retained.
+    #[error("storage for address {0} is unavailable at this partial-state checkpoint")]
+    StorageUnavailable(Address),
+    /// The contract is tracked, but its bytecode is not retained.
+    #[error("bytecode for address {0} is unavailable at this partial-state checkpoint")]
+    CodeUnavailable(Address),
+    /// Retained slots disagree with the account's preserved commitment.
+    #[error("partial-state storage root mismatch for {account_hash}: expected {expected}, computed {computed}")]
+    StorageRootMismatch {
+        /// Hash of the account address.
+        account_hash: B256,
+        /// Root from the account response.
+        expected: B256,
+        /// Root reconstructed from the downloaded slots.
+        computed: B256,
+    },
     /// The snapshot cannot supply the requested operation without unavailable state.
     #[error("{0} is not supported by the partial-state checkpoint reader")]
     Unsupported(&'static str),

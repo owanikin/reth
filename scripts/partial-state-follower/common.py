@@ -19,7 +19,8 @@ FULL_TABLES = ("PlainAccountState", "PlainStorageState", "HashedAccounts", "Hash
 STATE_TABLES = (*FULL_TABLES, "Bytecodes", "PartialStateAccounts",
                 "PartialStateStorageRoots", "PartialStateStorages", "PartialStateCheckpoints",
                 "PartialStateHeaders", "PartialStateTransitionJournals",
-                "PartialStateAccountChangeSets", "PartialStateStorageChangeSets", "StageCheckpoints")
+                "PartialStateAccountChangeSets", "PartialStateStorageChangeSets",
+                "PartialStateAvailability", "PartialStateAvailabilityChangeSets", "StageCheckpoints")
 DEFAULT_OUTPUT = Path(__file__).resolve().parents[2] / "target" / "partial-state-follower"
 
 

@@ -22,8 +22,8 @@ use crate::{
         blocks::{HeaderHash, StoredBlockOmmers},
         storage_sharded_key::StorageShardedKey,
         AccountBeforeTx, ClientVersion, CompactU256, IntegerList, PartialStateAccountBefore,
-        ShardedKey, StoredBlockBodyIndices, StoredBlockWithdrawals, StoredPartialStateCheckpoint,
-        StoredPartialStateTransition,
+        ShardedKey, StoredBlockBodyIndices, StoredBlockWithdrawals, StoredPartialStateAvailability,
+        StoredPartialStateCheckpoint, StoredPartialStateTransition,
     },
     table::{Decode, DupSort, Encode, Table, TableInfo},
 };
@@ -498,6 +498,13 @@ tables! {
         type SubKey = B256;
     }
 
+    /// Availability of complete local storage and code, independent of the configured filter.
+    /// Missing rows must not be interpreted as available state.
+    table PartialStateAvailability {
+        type Key = B256;
+        type Value = StoredPartialStateAvailability;
+    }
+
     /// Stores the single durable checkpoint for the partial-state tables.
     ///
     /// Key `0` is reserved for the active checkpoint.
@@ -523,6 +530,13 @@ tables! {
         type Key = BlockNumber;
         type Value = PartialStateAccountBefore;
         type SubKey = Address;
+    }
+
+    /// Availability before each changed account's BAL transition. Account change sets determine
+    /// whether the account existed; the value for a previously absent account is ignored.
+    table PartialStateAvailabilityChangeSets {
+        type Key = BlockNumberAddress;
+        type Value = StoredPartialStateAvailability;
     }
 
     /// Stores retained storage values before partial-state transitions.

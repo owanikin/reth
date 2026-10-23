@@ -11,8 +11,8 @@ use alloy_primitives::{keccak256, Address, BlockNumber, Bytes, B256};
 use reth_db_api::{
     cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW},
     models::{
-        BlockNumberAddress, PartialStateAccountBefore, StoredPartialStateCheckpoint,
-        StoredPartialStateTransition,
+        BlockNumberAddress, PartialStateAccountBefore, StoredPartialStateAvailability,
+        StoredPartialStateCheckpoint, StoredPartialStateTransition,
     },
     tables,
     transaction::{DbTx, DbTxMut},
@@ -116,6 +116,9 @@ where
             .into())
         }
 
+        if checkpoint.status == PartialStateCheckpointStatus::Syncing {
+            initialize_availability(&provider, filter)?;
+        }
         let checkpoint = PartialStateCheckpoint {
             pivot,
             filter_hash: filter.filter_hash(),
@@ -288,6 +291,11 @@ where
         .into())
     }
 
+    // Uncheckpointed parent snapshots must establish availability only after root verification.
+    if read_partial_state_checkpoint(provider)?.is_none() {
+        initialize_availability(provider, filter)?;
+    }
+
     let bal_hash = compute_block_access_list_hash(transition.access_list);
     if bal_hash != transition.expected_bal_hash {
         return Err(PartialStateTransitionError::BalHashMismatch {
@@ -324,6 +332,61 @@ where
         },
     )?;
     Ok(computed_root)
+}
+
+/// Called only after reconstructing and verifying the snapshot using the configured filter.
+fn initialize_availability<TX, N>(
+    provider: &DatabaseProvider<TX, N>,
+    filter: &dyn ContractFilter,
+) -> ProviderResult<()>
+where
+    TX: DbTx + DbTxMut + Send + Sync + 'static,
+    N: ProviderNodeTypes,
+{
+    let mut cursor = provider.tx_ref().cursor_read::<tables::PartialStateAccounts>()?;
+    for entry in cursor.walk(None)? {
+        let (hash, account) = entry?;
+        let storage_root = provider
+            .tx_ref()
+            .get::<tables::PartialStateStorageRoots>(hash)?
+            .unwrap_or(EMPTY_ROOT_HASH);
+        if filter.should_sync_storage_by_hash(&hash) {
+            let computed = provider.partial_storage_root_by_hash(hash)?;
+            if computed != storage_root {
+                return Err(PartialStateReadError::StorageRootMismatch {
+                    account_hash: hash,
+                    expected: storage_root,
+                    computed,
+                }
+                .into())
+            }
+        }
+        let code_hash = account.get_bytecode_hash();
+        let bytecode = code_hash == KECCAK_EMPTY || filter.should_sync_code_by_hash(&hash);
+        if bytecode && code_hash != KECCAK_EMPTY {
+            let code = provider
+                .tx_ref()
+                .get::<tables::Bytecodes>(code_hash)?
+                .ok_or(PartialStateReadError::MissingBytecode(code_hash))?;
+            let computed = keccak256(code.original_bytes());
+            if computed != code_hash {
+                return Err(PartialStateReadError::BytecodeHashMismatch {
+                    expected: code_hash,
+                    computed,
+                }
+                .into())
+            }
+        }
+        provider.tx_ref().put::<tables::PartialStateAvailability>(
+            hash,
+            StoredPartialStateAvailability {
+                storage: storage_root == EMPTY_ROOT_HASH ||
+                    filter.should_sync_storage_by_hash(&hash),
+                bytecode,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn journal_transition<TX, N>(
@@ -379,6 +442,14 @@ where
     journal_account_before(provider, transition.block.number, address, account_hash)?;
     let mut account =
         provider.tx_ref().get::<tables::PartialStateAccounts>(account_hash)?.unwrap_or_default();
+    let mut availability = provider
+        .tx_ref()
+        .get::<tables::PartialStateAvailability>(account_hash)?
+        .unwrap_or_default();
+    let storage_empty =
+        provider.tx_ref().get::<tables::PartialStateStorageRoots>(account_hash)?.is_none();
+    let retain_storage =
+        filter.should_sync_storage(&address) && (availability.storage || storage_empty);
 
     if let Some(change) =
         changes.balance_changes.iter().max_by_key(|change| change.block_access_index)
@@ -399,10 +470,11 @@ where
                 .map_err(ProviderError::other)?;
             provider.tx_ref().put::<tables::Bytecodes>(code_hash, bytecode)?;
         }
+        availability.bytecode = filter.should_sync_code(&address) || code_hash == KECCAK_EMPTY;
     }
 
     let storage_root = if has_storage_changes {
-        if filter.should_sync_storage(&address) {
+        if retain_storage {
             apply_tracked_storage_changes(
                 provider,
                 transition.block.number,
@@ -440,7 +512,7 @@ where
             account = Account::from(*resolved);
             resolved.storage_root
         }
-    } else if filter.should_sync_storage(&address) {
+    } else if retain_storage {
         provider.partial_storage_root_by_hash(account_hash)?
     } else {
         provider
@@ -449,11 +521,14 @@ where
             .unwrap_or(EMPTY_ROOT_HASH)
     };
 
+    availability.storage = retain_storage || storage_root == EMPTY_ROOT_HASH;
+    availability.bytecode |= account.bytecode_hash.is_none();
     if account.is_empty() && storage_root == EMPTY_ROOT_HASH {
         delete_account(provider, account_hash)?;
     } else {
         provider.tx_ref().put::<tables::PartialStateAccounts>(account_hash, account)?;
         write_storage_commitment(provider, account_hash, storage_root)?;
+        provider.tx_ref().put::<tables::PartialStateAvailability>(account_hash, availability)?;
     }
     Ok(())
 }
@@ -474,11 +549,24 @@ where
         return Ok(())
     }
 
+    let account = provider.tx_ref().get::<tables::PartialStateAccounts>(account_hash)?;
+    let availability = if account.is_some() {
+        provider
+            .tx_ref()
+            .get::<tables::PartialStateAvailability>(account_hash)?
+            .ok_or(PartialStateReadError::MissingAvailability(account_hash))?
+    } else {
+        StoredPartialStateAvailability::default()
+    };
+    provider.tx_ref().put::<tables::PartialStateAvailabilityChangeSets>(
+        BlockNumberAddress((block_number, address)),
+        availability,
+    )?;
     journal.upsert(
         block_number,
         &PartialStateAccountBefore {
             address,
-            account: provider.tx_ref().get::<tables::PartialStateAccounts>(account_hash)?,
+            account,
             storage_root: provider
                 .tx_ref()
                 .get::<tables::PartialStateStorageRoots>(account_hash)?,
@@ -594,8 +682,19 @@ where
         let account_hash = keccak256(change.address);
         if let Some(account) = change.account {
             provider.tx_ref().put::<tables::PartialStateAccounts>(account_hash, account)?;
+            let availability = provider
+                .tx_ref()
+                .get::<tables::PartialStateAvailabilityChangeSets>(BlockNumberAddress((
+                    block.number,
+                    change.address,
+                )))?
+                .ok_or(PartialStateReadError::MissingAvailability(account_hash))?;
+            provider
+                .tx_ref()
+                .put::<tables::PartialStateAvailability>(account_hash, availability)?;
         } else {
             provider.tx_ref().delete::<tables::PartialStateAccounts>(account_hash, None)?;
+            provider.tx_ref().delete::<tables::PartialStateAvailability>(account_hash, None)?;
         }
         if let Some(storage_root) = change.storage_root {
             provider
@@ -703,6 +802,10 @@ where
     N: ProviderNodeTypes,
 {
     for change in account_changes {
+        provider.tx_ref().delete::<tables::PartialStateAvailabilityChangeSets>(
+            BlockNumberAddress((block_number, change.address)),
+            None,
+        )?;
         provider.tx_ref().delete::<tables::PartialStateStorageChangeSets>(
             BlockNumberAddress((block_number, change.address)),
             None,
@@ -723,10 +826,12 @@ where
     provider.tx_ref().clear::<tables::PartialStateCheckpoints>()?;
     provider.tx_ref().clear::<tables::PartialStateStorageChangeSets>()?;
     provider.tx_ref().clear::<tables::PartialStateAccountChangeSets>()?;
+    provider.tx_ref().clear::<tables::PartialStateAvailabilityChangeSets>()?;
     provider.tx_ref().clear::<tables::PartialStateTransitionJournals>()?;
     provider.tx_ref().clear::<tables::PartialStateStorages>()?;
     provider.tx_ref().clear::<tables::PartialStateStorageRoots>()?;
     provider.tx_ref().clear::<tables::PartialStateAccounts>()?;
+    provider.tx_ref().clear::<tables::PartialStateAvailability>()?;
     Ok(())
 }
 
@@ -740,6 +845,7 @@ where
 {
     provider.tx_ref().delete::<tables::PartialStateAccounts>(account_hash, None)?;
     provider.tx_ref().delete::<tables::PartialStateStorageRoots>(account_hash, None)?;
+    provider.tx_ref().delete::<tables::PartialStateAvailability>(account_hash, None)?;
     let mut storage = provider.tx_ref().cursor_dup_write::<tables::PartialStateStorages>()?;
     if storage.seek_exact(account_hash)?.is_some() {
         storage.delete_current_duplicates()?;
@@ -1255,6 +1361,16 @@ mod tests {
         assert_eq!(factory.prune_partial_state_transition_journal(2).unwrap(), 1);
 
         let provider = factory.database_provider_ro().unwrap();
+        assert!(provider
+            .tx_ref()
+            .get::<tables::PartialStateAvailabilityChangeSets>(BlockNumberAddress((1, address)))
+            .unwrap()
+            .is_none());
+        assert!(provider
+            .tx_ref()
+            .get::<tables::PartialStateAvailabilityChangeSets>(BlockNumberAddress((2, address)))
+            .unwrap()
+            .is_some());
         assert_eq!(
             provider.tx_ref().get::<tables::PartialStateTransitionJournals>(1).unwrap(),
             None
@@ -1582,6 +1698,10 @@ mod tests {
         assert_eq!(root, EMPTY_ROOT_HASH);
 
         let provider = factory.database_provider_ro().unwrap();
+        assert_eq!(
+            provider.tx_ref().get::<tables::PartialStateAvailability>(account_hash).unwrap(),
+            None
+        );
         assert_eq!(
             provider.tx_ref().get::<tables::PartialStateAccounts>(account_hash).unwrap(),
             None

@@ -31,7 +31,7 @@ impl StateProviderTraitObjWrapper {
         Self { inner, partial_state_tracker: None }
     }
 
-    /// Creates a new wrapper that rejects untracked storage and bytecode reads.
+    /// Creates a wrapper that enforces tracking and the provider's address-level code availability.
     pub fn with_partial_state_tracker(
         inner: StateProviderBox,
         is_tracked: impl Fn(&Address) -> bool + Send + Sync + 'static,
@@ -136,13 +136,19 @@ impl reth_storage_api::AccountReader for StateProviderTraitObjWrapper {
         address: &Address,
     ) -> reth_errors::ProviderResult<Option<reth_primitives_traits::Account>> {
         let account = self.inner.basic_account(address)?;
-        if !self.is_tracked(address) &&
-            account
-                .as_ref()
-                .and_then(|account| account.bytecode_hash)
-                .is_some_and(|code_hash| code_hash != KECCAK_EMPTY)
+        if account
+            .as_ref()
+            .and_then(|account| account.bytecode_hash)
+            .is_some_and(|code_hash| code_hash != KECCAK_EMPTY)
         {
-            return Err(ProviderError::CodeNotTracked(*address))
+            if !self.is_tracked(address) {
+                return Err(ProviderError::CodeNotTracked(*address))
+            }
+            if self.partial_state_tracker.is_some() {
+                // Check address-level availability before revm can reuse code cached by hash
+                // from another account sharing the same bytecode.
+                self.inner.account_code(address)?;
+            }
         }
         Ok(account)
     }
@@ -235,6 +241,8 @@ mod tests {
     struct TestStateProvider {
         accounts: BTreeMap<Address, Account>,
         storage: BTreeMap<(Address, B256), U256>,
+        unavailable_code: Option<Address>,
+        bytecode: Option<reth_primitives_traits::Bytecode>,
     }
 
     impl AccountReader for TestStateProvider {
@@ -347,6 +355,21 @@ mod tests {
     }
 
     impl StateProvider for TestStateProvider {
+        fn account_code(
+            &self,
+            address: &Address,
+        ) -> ProviderResult<Option<reth_primitives_traits::Bytecode>> {
+            if self.unavailable_code == Some(*address) {
+                return Err(
+                    reth_storage_api::errors::provider::PartialStateReadError::CodeUnavailable(
+                        *address,
+                    )
+                    .into(),
+                )
+            }
+            Ok(self.bytecode.clone())
+        }
+
         fn storage(
             &self,
             account: Address,
@@ -361,8 +384,31 @@ mod tests {
             &self,
             _code_hash: &B256,
         ) -> ProviderResult<Option<reth_primitives_traits::Bytecode>> {
-            Ok(None)
+            Ok(self.bytecode.clone())
         }
+    }
+
+    #[test]
+    fn partial_state_wrapper_rejects_unavailable_code_even_when_hash_is_available() {
+        let address = Address::with_last_byte(1);
+        let code = reth_primitives_traits::Bytecode::default();
+        let hash = B256::with_last_byte(4);
+        let provider = TestStateProvider {
+            accounts: BTreeMap::from([(
+                address,
+                Account { bytecode_hash: Some(hash), ..Default::default() },
+            )]),
+            unavailable_code: Some(address),
+            bytecode: Some(code),
+            ..Default::default()
+        };
+        let wrapper =
+            StateProviderTraitObjWrapper::with_partial_state_tracker(Box::new(provider), |_| true);
+        assert!(wrapper.bytecode_by_hash(&hash).unwrap().is_some());
+        assert!(
+            matches!(wrapper.basic_account(&address), Err(ProviderError::PartialStateRead(error))
+            if matches!(*error, reth_storage_api::errors::provider::PartialStateReadError::CodeUnavailable(found) if found == address))
+        );
     }
 
     #[test]
