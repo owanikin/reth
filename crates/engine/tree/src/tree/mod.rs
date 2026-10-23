@@ -2155,6 +2155,15 @@ where
             .sealed_block_with_senders(hash.into(), TransactionVariant::WithHash)?
             .ok_or_else(|| ProviderError::HeaderNotFound(hash.into()))?
             .split_sealed();
+        // Genesis state already lives on disk. A rewind may retain its header in memory, but
+        // there is no parent execution or trie transition to reconstruct and overlay.
+        if block.number() == 0 {
+            return Ok(ExecutedBlock::new(
+                Arc::new(RecoveredBlock::new_sealed(block, senders)),
+                Default::default(),
+                ComputedTrieData::default(),
+            ))
+        }
         let mut execution_output = self
             .provider
             .get_state(block.header().number())?

@@ -1209,17 +1209,30 @@ async fn test_fcu_with_canonical_ancestor_updates_latest_block() {
 
 #[tokio::test]
 async fn test_repeated_forkchoice_recovers_missing_ancestor_after_canonical_unwind() {
-    assert_canonical_unwind_retains_executed_ancestors(false).await;
+    assert_canonical_unwind_retains_executed_ancestors(8, false).await;
 }
 
 #[tokio::test]
 async fn test_canonical_unwind_retains_ancestors_during_persistence() {
-    assert_canonical_unwind_retains_executed_ancestors(true).await;
+    assert_canonical_unwind_retains_executed_ancestors(8, true).await;
 }
 
-async fn assert_canonical_unwind_retains_executed_ancestors(persistence_in_progress: bool) {
+#[tokio::test]
+async fn test_genesis_state_after_canonical_unwind() {
+    assert_canonical_unwind_retains_executed_ancestors(0, false).await;
+}
+
+#[tokio::test]
+async fn test_genesis_state_after_canonical_unwind_during_persistence() {
+    assert_canonical_unwind_retains_executed_ancestors(0, true).await;
+}
+
+async fn assert_canonical_unwind_retains_executed_ancestors(
+    ancestor_number: usize,
+    persistence_in_progress: bool,
+) {
     use reth_provider::{
-        providers::BlockchainProvider, test_utils::create_test_provider_factory,
+        providers::BlockchainProvider, test_utils::create_test_provider_factory, AccountReader,
         BlockExecutionWriter, BlockHashReader, DBProvider, SaveBlocksMode,
     };
 
@@ -1228,11 +1241,11 @@ async fn assert_canonical_unwind_retains_executed_ancestors(persistence_in_progr
     let factory = create_test_provider_factory();
     let mut block_builder = TestBlockBuilder::eth().with_state();
     let signer = block_builder.signer;
-    let blocks: Vec<_> = block_builder.get_executed_blocks(0..11).collect();
+    let blocks: Vec<_> = block_builder.get_executed_blocks(0..ancestor_number as u64 + 3).collect();
     let genesis = blocks[0].recovered_block().num_hash();
-    let ancestor = blocks[8].recovered_block().num_hash();
-    let missing = blocks[9].recovered_block().num_hash();
-    let tip = blocks[10].recovered_block().num_hash();
+    let ancestor = blocks[ancestor_number].recovered_block().num_hash();
+    let missing = blocks[ancestor_number + 1].recovered_block().num_hash();
+    let tip = blocks[ancestor_number + 2].recovered_block().num_hash();
     {
         let provider = factory.database_provider_rw().unwrap();
         provider.save_blocks(vec![blocks[0].clone()], SaveBlocksMode::Full).unwrap();
@@ -1314,8 +1327,8 @@ async fn assert_canonical_unwind_retains_executed_ancestors(persistence_in_progr
     tree.on_canonical_chain_update(NewCanonicalChain::Commit { new: blocks[1..].to_vec() });
 
     // Optionally delay the save acknowledgement until after the rewind to exercise an in-flight
-    // persistence job. Otherwise block 9 is already evicted from memory when the rewind starts.
-    tree.persist_blocks(blocks[1..10].to_vec());
+    // persistence job. Otherwise the intermediate block is already evicted when the rewind starts.
+    tree.persist_blocks(blocks[1..ancestor_number + 2].to_vec());
     complete_persistence(persistence_rx.recv_timeout(Duration::from_secs(1)).unwrap());
     if !persistence_in_progress {
         assert!(tree.try_poll_persistence().unwrap());
@@ -1327,6 +1340,8 @@ async fn assert_canonical_unwind_retains_executed_ancestors(persistence_in_progr
     let expected_account =
         factory.history_by_block_hash(missing.hash).unwrap().basic_account(&signer).unwrap();
     assert!(expected_account.is_some());
+    let ancestor_account =
+        factory.history_by_block_hash(ancestor.hash).unwrap().basic_account(&signer).unwrap();
 
     let forkchoice = |head_block_hash| ForkchoiceState {
         head_block_hash,
@@ -1342,6 +1357,26 @@ async fn assert_canonical_unwind_retains_executed_ancestors(persistence_in_progr
     assert_eq!(tree.canonical_in_memory_state.get_canonical_head().num_hash(), ancestor);
     assert!(tree.state.tree_state.contains_hash(&missing.hash));
 
+    // Disk is still ahead of the rewound head. Both latest and explicit historical reads must
+    // use the ancestor's state, including genesis which has no parent state.
+    let assert_ancestor_state = || {
+        assert_eq!(provider.basic_account(&signer).unwrap(), ancestor_account);
+        assert_eq!(provider.latest().unwrap().basic_account(&signer).unwrap(), ancestor_account);
+        assert_eq!(
+            provider.state_by_block_hash(ancestor.hash).unwrap().basic_account(&signer).unwrap(),
+            ancestor_account,
+        );
+        assert_eq!(
+            provider
+                .history_by_block_number(ancestor.number)
+                .unwrap()
+                .basic_account(&signer)
+                .unwrap(),
+            ancestor_account,
+        );
+    };
+    assert_ancestor_state();
+
     if persistence_in_progress {
         assert!(tree.try_poll_persistence().unwrap());
     }
@@ -1352,6 +1387,13 @@ async fn assert_canonical_unwind_retains_executed_ancestors(persistence_in_progr
     assert!(tree.try_poll_persistence().unwrap());
     assert_eq!(tree.persistence_state.last_persisted_block, ancestor);
     assert_eq!(factory.block_hash(missing.number).unwrap(), None);
+    assert_ancestor_state();
+
+    for _ in 0..3 {
+        let result = tree.on_forkchoice_updated(forkchoice(ancestor.hash), None).unwrap();
+        assert!(result.outcome.await.unwrap().payload_status.is_valid());
+        assert_ancestor_state();
+    }
 
     let (persisted_parent, retained) = tree.state.tree_state.blocks_by_hash(tip.hash).unwrap();
     assert_eq!(persisted_parent, ancestor.hash);

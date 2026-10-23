@@ -111,22 +111,6 @@ impl<N: ProviderNodeTypes> ConsistentProvider<N> {
         }
     }
 
-    fn history_by_block_hash_ref<'a>(
-        &'a self,
-        block_hash: BlockHash,
-    ) -> ProviderResult<Box<dyn StateProvider + 'a>> {
-        trace!(target: "providers::blockchain", ?block_hash, "Getting history by block hash");
-
-        self.get_in_memory_or_storage_by_block(
-            block_hash.into(),
-            |_| self.storage_provider.history_by_block_hash(block_hash),
-            |block_state| {
-                let state_provider = self.block_state_provider_ref(block_state)?;
-                Ok(Box::new(state_provider))
-            },
-        )
-    }
-
     /// Fetches a range of data from both in-memory state and persistent storage while a predicate
     /// is met.
     ///
@@ -246,7 +230,8 @@ impl<N: ProviderNodeTypes> ConsistentProvider<N> {
         state: &BlockState<N::Primitives>,
     ) -> ProviderResult<MemoryOverlayStateProviderRef<'_, N::Primitives>> {
         let anchor_hash = state.anchor().hash;
-        let latest_historical = self.history_by_block_hash_ref(anchor_hash)?;
+        // The anchor is persisted state, even when genesis is also the in-memory head.
+        let latest_historical = self.storage_provider.history_by_block_hash(anchor_hash)?;
         let in_memory = state.chain().map(|block_state| block_state.block()).collect();
         Ok(MemoryOverlayStateProviderRef::new(latest_historical, in_memory))
     }

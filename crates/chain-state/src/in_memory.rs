@@ -613,12 +613,19 @@ impl<N: NodePrimitives> BlockState<N> {
     }
 
     /// Returns the hash and block of the on disk block this state can be traced back to.
+    ///
+    /// Genesis is its own anchor: its state is initialized on disk, not executed over a parent.
     pub fn anchor(&self) -> BlockNumHash {
         let mut current = self;
         while let Some(parent) = &current.parent {
             current = parent;
         }
-        current.block.recovered_block().parent_num_hash()
+        let block = current.block.recovered_block();
+        if block.number() == 0 {
+            block.num_hash()
+        } else {
+            block.parent_num_hash()
+        }
     }
 
     /// Returns the executed block that determines the state.
@@ -1348,6 +1355,25 @@ mod tests {
             state.pending_block_and_receipts().unwrap(),
             (block2.recovered_block().clone(), vec![])
         );
+    }
+
+    #[test]
+    fn test_block_state_genesis_anchor() {
+        let mut builder = TestBlockBuilder::eth();
+        let genesis = builder.get_executed_block_with_number(0, B256::ZERO);
+        let genesis_num_hash = genesis.recovered_block().num_hash();
+        let child = builder.get_executed_block_with_number(1, genesis_num_hash.hash);
+        let genesis_state = Arc::new(BlockState::new(genesis));
+        assert_eq!(genesis_state.anchor(), genesis_num_hash);
+        assert_eq!(
+            BlockState::with_parent(child.clone(), Some(genesis_state)).anchor(),
+            genesis_num_hash,
+        );
+        assert_eq!(BlockState::new(child).anchor(), genesis_num_hash);
+
+        let persisted_hash = B256::repeat_byte(3);
+        let next = builder.get_executed_block_with_number(4, persisted_hash);
+        assert_eq!(BlockState::new(next).anchor(), BlockNumHash::new(3, persisted_hash));
     }
 
     #[test]
