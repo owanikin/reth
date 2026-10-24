@@ -46,6 +46,9 @@ pub use partial_snap::PartialStateSnapDbWriter;
 
 mod partial_state;
 
+mod partial_state_expiry;
+pub use partial_state_expiry::PartialStateStorageExpiryOutcome;
+
 mod partial_state_reader;
 pub use partial_state_reader::PartialStateReader;
 

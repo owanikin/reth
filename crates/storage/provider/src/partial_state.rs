@@ -600,7 +600,10 @@ where
         let previous = cursor
             .seek_by_key_subkey(account_hash, slot_hash)?
             .filter(|entry| entry.key == slot_hash);
-        if journal.seek_by_key_subkey(journal_key, slot_hash)?.is_none() {
+        if journal
+            .seek_by_key_subkey(journal_key, slot_hash)?
+            .is_none_or(|entry| entry.key != slot_hash)
+        {
             journal.upsert(
                 journal_key,
                 &StorageEntry::new(
