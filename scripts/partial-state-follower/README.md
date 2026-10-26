@@ -61,6 +61,28 @@ Both check durable checkpoints/journals and unchanged normal full-state tables.
 This is graceful restart coverage, not an abrupt-crash or live consensus test.
 No Docker rebuild or Kurtosis run is needed for these test-only changes.
 
+### Explicit storage expiry
+
+```sh
+cargo test -p reth-node-builder --test follower storage_expiry \
+  --offline -j 2 -- --test-threads=1
+```
+
+This test bootstraps a real follower, advances along branch A, and warms its HTTP
+storage/call/estimate paths. It invokes `expire_partial_state_storage` on the node's
+database in a blocking task, without adding an administrative RPC method. At the
+same checkpoint, storage reads (including previously absent slots), calls and gas
+estimates that need expired storage must return `-32003`, while code, balance and
+nonce remain readable. Untracked-state errors remain distinct.
+
+The follower then advances using peer-resolved account commitments, shuts down,
+reopens the same database without another snap download, and replays branch B.
+Every reached root is compared to the full fixture's independently computed root.
+Expired slots and journal before-images must stay deleted, RPC must not mutate
+persisted state, normal full-state tables must remain unchanged, and Engine responses
+must remain `SYNCING`. This is an isolated Rust integration test with a scripted
+peer, not a live Kurtosis expiry test or an automatic expiry policy.
+
 ## Producer setup
 
 Availability metadata adds two tables to the lifecycle checks. Existing completed

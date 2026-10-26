@@ -3,6 +3,9 @@
 
 use super::*;
 
+#[path = "expiry.rs"]
+mod expiry;
+
 const RETENTION: u64 = 64;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -43,15 +46,15 @@ impl Snapshot {
 
 #[test]
 fn partial_state_follower_restart_replays_offline_reorg() {
-    assert_restart(2);
+    assert_restart(2, false);
 }
 
 #[test]
 fn partial_state_follower_restart_rejects_reorg_beyond_retention() {
-    assert_restart(RETENTION + 1);
+    assert_restart(RETENTION + 1, false);
 }
 
-fn assert_restart(reorg_depth: u64) {
+fn assert_restart(reorg_depth: u64, expire_storage: bool) {
     reth_tracing::init_test_tracing();
     let directory = tempfile::tempdir().unwrap();
     let chain = fixture_chain();
@@ -68,6 +71,14 @@ fn assert_restart(reorg_depth: u64) {
             3000 + index,
             parent.slots,
         );
+        blocks.push(child);
+        old_tip = blocks.len() - 1;
+    }
+    if expire_storage {
+        // A3 changes both expired slots, requiring a fresh commitment before restart.
+        let blocks = Arc::get_mut(&mut blocks).unwrap();
+        let parent = &blocks[old_tip];
+        let child = BranchBlock::new(&parent.header, [13, 113], 103, parent.slots);
         blocks.push(child);
         old_tip = blocks.len() - 1;
     }
@@ -93,7 +104,14 @@ fn assert_restart(reorg_depth: u64) {
             .enable_all()
             .build()
             .unwrap();
-        runtime.block_on(run_phase(&directory, chain.clone(), blocks.clone(), old_tip, saved))
+        runtime.block_on(run_phase(
+            &directory,
+            chain.clone(),
+            blocks.clone(),
+            old_tip,
+            saved,
+            expire_storage,
+        ))
     };
     let saved = phase(None);
     let recovered = phase(Some(&saved));
@@ -133,6 +151,7 @@ async fn run_phase(
     blocks: Arc<Vec<BranchBlock>>,
     old_tip: usize,
     saved: Option<&Snapshot>,
+    expire_storage: bool,
 ) -> Snapshot {
     let restarted = saved.is_some();
     let pruned_history = blocks[old_tip].header.number - blocks[0].header.number > RETENTION;
@@ -180,10 +199,17 @@ async fn run_phase(
     let read_checkpoint = || db.tx().unwrap().get::<tables::PartialStateCheckpoints>(0).unwrap();
     let filter = ConfiguredContractFilter::new([TRACKED]);
     let before = Snapshot::read(&db);
+    let mut storage_expired = restarted && expire_storage;
+    let mut downloads_after_expiry = None;
     if let Some(saved) = saved {
         assert_eq!(&before, saved, "relaunch must not reset the saved checkpoint");
         assert_eq!(read_checkpoint().unwrap().block_hash, blocks[old_tip].header.hash_slow());
-        timeout(WAIT, assert_rpc_state(&client, &blocks[old_tip])).await.unwrap();
+        if storage_expired {
+            expiry::assert_persisted(&db, &blocks[old_tip]);
+            timeout(WAIT, expiry::assert_rpc(&client, &blocks[old_tip])).await.unwrap();
+        } else {
+            timeout(WAIT, assert_rpc_state(&client, &blocks[old_tip])).await.unwrap();
+        }
         assert_eq!(Snapshot::read(&db), before, "reads before recovery must not modify state");
     } else {
         let tx = db.tx().unwrap();
@@ -204,7 +230,10 @@ async fn run_phase(
     }
 
     // B2 becomes the selected target while the follower is offline on branch A.
-    let targets: &[usize] = if !restarted {
+    let expiry_targets = [2, old_tip];
+    let targets: &[usize] = if !restarted && expire_storage {
+        &expiry_targets
+    } else if !restarted {
         std::slice::from_ref(&old_tip)
     } else if insufficient_history {
         &[4]
@@ -268,7 +297,16 @@ async fn run_phase(
             expected.header.state_root
         );
         let before_rpc = Snapshot::read(&db);
-        timeout(WAIT, assert_rpc_state(&client, expected)).await.unwrap();
+        if storage_expired {
+            expiry::assert_persisted(&db, expected);
+            timeout(WAIT, expiry::assert_rpc(&client, expected)).await.unwrap();
+            assert!(
+                observed.account_proof_hashes.lock().unwrap().contains(&keccak256(TRACKED)),
+                "expired storage changes must resolve the tracked account from the peer"
+            );
+        } else {
+            timeout(WAIT, assert_rpc_state(&client, expected)).await.unwrap();
+        }
         if restarted {
             let rejected = if insufficient_history { target } else { &blocks[old_tip] };
             timeout(WAIT, assert_unavailable_checkpoint(&client, rejected.header.hash_slow()))
@@ -306,6 +344,30 @@ async fn run_phase(
                     .unwrap()
                     .block_hash,
                 expected.header.hash_slow()
+            );
+        }
+        drop(tx);
+        if expire_storage && !restarted && index == 2 {
+            // Warm the RPC path above, then expire at the same checkpoint to catch stale caches.
+            expiry::expire(db.clone(), &handle.node.provider, expected).await;
+            let after = Snapshot::read(&db);
+            expiry::assert_only_storage_removed(&before_rpc, &after);
+            expiry::assert_persisted(&db, expected);
+            assert_eq!(read_checkpoint().unwrap(), checkpoint);
+            assert_eq!(
+                handle.node.provider.partial_state_root(&filter).unwrap(),
+                expected.header.state_root
+            );
+            timeout(WAIT, expiry::assert_rpc(&client, expected)).await.unwrap();
+            assert_eq!(Snapshot::read(&db), after, "post-expiry RPC changed state");
+            storage_expired = true;
+            downloads_after_expiry = Some(observed.snap_downloads.load(Ordering::Relaxed));
+        }
+        if let Some(downloads) = downloads_after_expiry {
+            assert_eq!(
+                observed.snap_downloads.load(Ordering::Relaxed),
+                downloads,
+                "advancement must not silently re-download expired storage"
             );
         }
     }

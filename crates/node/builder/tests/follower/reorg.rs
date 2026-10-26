@@ -186,6 +186,7 @@ impl BranchBlock {
 struct PeerRequests {
     snap_downloads: AtomicUsize,
     account_proofs: AtomicUsize,
+    account_proof_hashes: Mutex<Vec<B256>>,
     bals: Mutex<Vec<B256>>,
 }
 
@@ -225,6 +226,7 @@ async fn serve(
             IncomingEthRequest::GetAccountRange { request, response, .. } => {
                 if request.starting_hash == request.limit_hash {
                     observed.account_proofs.fetch_add(1, Ordering::Relaxed);
+                    observed.account_proof_hashes.lock().unwrap().push(request.starting_hash);
                 } else {
                     observed.snap_downloads.fetch_add(1, Ordering::Relaxed);
                 }
