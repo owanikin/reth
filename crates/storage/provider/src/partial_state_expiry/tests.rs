@@ -223,6 +223,72 @@ fn snapshot(factory: &ProviderFactory<MockNodeTypesWithDB>) -> Vec<String> {
 }
 
 #[test]
+fn expiry_preview_is_read_only_and_matches_apply_with_journals() {
+    let mut fixture = Fixture::new();
+    fixture.apply(&[(EXPIRED, [11, 21]), (RETAINED, [31, 41])], false);
+    let before = snapshot(&fixture.factory);
+    let addresses = [EXPIRED, EXPIRED];
+    let preview = fixture
+        .factory
+        .preview_partial_state_storage_expiry(fixture.pivot, &fixture.filter, &addresses)
+        .unwrap();
+    assert_eq!(before, snapshot(&fixture.factory));
+    assert_eq!(preview.accounts_expired, 1);
+    assert_eq!(preview.slots_deleted, 2);
+    assert_eq!(preview.journal_slots_deleted, 2);
+    assert_eq!(preview, fixture.expire(&addresses).unwrap());
+    fixture.assert_unavailable();
+    assert_eq!(
+        fixture
+            .factory
+            .preview_partial_state_storage_expiry(fixture.pivot, &fixture.filter, &addresses,)
+            .unwrap(),
+        PartialStateStorageExpiryOutcome::default()
+    );
+}
+
+#[test]
+fn expiry_preview_rejects_bad_checkpoint_filter_targets_and_metadata() {
+    let mut fixture = Fixture::new();
+    fixture.apply(&[(EXPIRED, [11, 21])], false);
+    let before = snapshot(&fixture.factory);
+    let mut wrong_pivot = fixture.pivot;
+    wrong_pivot.block_hash = B256::ZERO;
+    assert!(fixture
+        .factory
+        .preview_partial_state_storage_expiry(wrong_pivot, &fixture.filter, &[EXPIRED],)
+        .is_err());
+    assert!(fixture
+        .factory
+        .preview_partial_state_storage_expiry(
+            fixture.pivot,
+            &ConfiguredContractFilter::default(),
+            &[EXPIRED],
+        )
+        .is_err());
+    assert!(fixture
+        .factory
+        .preview_partial_state_storage_expiry(fixture.pivot, &fixture.filter, &[UNTRACKED],)
+        .is_err());
+    assert_eq!(before, snapshot(&fixture.factory));
+    let provider = fixture.factory.database_provider_rw().unwrap();
+    provider
+        .tx_ref()
+        .delete::<tables::PartialStateAvailabilityChangeSets>(
+            BlockNumberAddress((1, EXPIRED)),
+            None,
+        )
+        .unwrap();
+    provider.commit().unwrap();
+    let before = snapshot(&fixture.factory);
+    assert!(fixture
+        .factory
+        .preview_partial_state_storage_expiry(fixture.pivot, &fixture.filter, &[EXPIRED],)
+        .is_err());
+    assert_eq!(before, snapshot(&fixture.factory));
+}
+
+#[test]
 fn expiry_deletes_only_selected_storage_and_is_idempotent() {
     let fixture = Fixture::new();
     let before = snapshot(&fixture.factory);

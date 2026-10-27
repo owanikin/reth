@@ -1,7 +1,7 @@
 use crate::{
     partial_state::{ensure_complete_checkpoint, read_partial_state_checkpoint},
     providers::ProviderNodeTypes,
-    ProviderFactory,
+    DatabaseProvider, ProviderFactory,
 };
 use alloy_consensus::constants::EMPTY_ROOT_HASH;
 use alloy_primitives::{keccak256, Address};
@@ -35,6 +35,24 @@ pub struct PartialStateStorageExpiryOutcome {
 }
 
 impl<N: ProviderNodeTypes> ProviderFactory<N> {
+    /// Validates and counts an explicit storage expiry without opening a write transaction.
+    ///
+    /// This is a snapshot preview, not a reservation. Applying expiry must revalidate the pivot
+    /// and filter, and may report different counts if another retention operation ran meanwhile.
+    pub fn preview_partial_state_storage_expiry(
+        &self,
+        expected: PartialStateSnapPivot,
+        filter: &dyn ContractFilter,
+        addresses: &[Address],
+    ) -> ProviderResult<PartialStateStorageExpiryOutcome> {
+        inspect_expiry(
+            &self.database_provider_ro()?,
+            expected,
+            filter,
+            &addresses.iter().copied().collect(),
+        )
+    }
+
     /// Expires storage for explicitly selected tracked addresses at a verified checkpoint.
     ///
     /// Deletes current slots and their retained rollback before-images, and updates current and
@@ -58,26 +76,9 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
         addresses: &[Address],
     ) -> ProviderResult<PartialStateStorageExpiryOutcome> {
         let addresses: BTreeSet<_> = addresses.iter().copied().collect();
-        for address in &addresses {
-            if !filter.should_sync_storage(address) {
-                return Err(ProviderError::StorageNotTracked(*address))
-            }
-        }
-
         let provider = self.database_provider_rw()?;
-        let checkpoint = read_partial_state_checkpoint(&provider)?
-            .ok_or(PartialStateCheckpointError::Unavailable)?;
-        ensure_complete_checkpoint(checkpoint, expected, filter)?;
-        let computed = provider.partial_state_root(filter)?;
-        if computed != expected.state_root {
-            return Err(PartialStateCheckpointError::RootMismatch {
-                expected: expected.state_root,
-                computed,
-            }
-            .into())
-        }
+        let outcome = inspect_expiry(&provider, expected, filter, &addresses)?;
 
-        let mut outcome = PartialStateStorageExpiryOutcome::default();
         for address in &addresses {
             let hash = keccak256(address);
             if provider.tx_ref().get::<tables::PartialStateAccounts>(hash)?.is_some() {
@@ -89,18 +90,9 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
                     .tx_ref()
                     .get::<tables::PartialStateStorageRoots>(hash)?
                     .unwrap_or(EMPTY_ROOT_HASH);
-                let known_empty = root == EMPTY_ROOT_HASH;
-                if availability.storage && !known_empty {
-                    outcome.accounts_expired += 1;
-                }
-                availability.storage = known_empty;
+                availability.storage = root == EMPTY_ROOT_HASH;
                 provider.tx_ref().put::<tables::PartialStateAvailability>(hash, availability)?;
             }
-            outcome.slots_deleted += provider
-                .tx_ref()
-                .cursor_dup_read::<tables::PartialStateStorages>()?
-                .walk_dup(Some(hash), None)?
-                .try_fold(0, |count, entry| entry.map(|_| count + 1))?;
             provider.tx_ref().delete::<tables::PartialStateStorages>(hash, None)?;
         }
 
@@ -122,11 +114,6 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
             provider
                 .tx_ref()
                 .put::<tables::PartialStateAvailabilityChangeSets>(key, availability)?;
-            outcome.journal_slots_deleted += provider
-                .tx_ref()
-                .cursor_dup_read::<tables::PartialStateStorageChangeSets>()?
-                .walk_dup(Some(key), None)?
-                .try_fold(0, |count, entry| entry.map(|_| count + 1))?;
             provider.tx_ref().delete::<tables::PartialStateStorageChangeSets>(key, None)?;
         }
         drop(journal);
@@ -142,6 +129,70 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
         provider.commit()?;
         Ok(outcome)
     }
+}
+
+fn inspect_expiry<TX: DbTx + Send + Sync + 'static, N: ProviderNodeTypes>(
+    provider: &DatabaseProvider<TX, N>,
+    expected: PartialStateSnapPivot,
+    filter: &dyn ContractFilter,
+    addresses: &BTreeSet<Address>,
+) -> ProviderResult<PartialStateStorageExpiryOutcome> {
+    for address in addresses {
+        if !filter.should_sync_storage(address) {
+            return Err(ProviderError::StorageNotTracked(*address))
+        }
+    }
+    let checkpoint =
+        read_partial_state_checkpoint(provider)?.ok_or(PartialStateCheckpointError::Unavailable)?;
+    ensure_complete_checkpoint(checkpoint, expected, filter)?;
+    let computed = provider.partial_state_root(filter)?;
+    if computed != expected.state_root {
+        return Err(PartialStateCheckpointError::RootMismatch {
+            expected: expected.state_root,
+            computed,
+        }
+        .into())
+    }
+
+    let mut outcome = PartialStateStorageExpiryOutcome::default();
+    for address in addresses {
+        let hash = keccak256(address);
+        if provider.tx_ref().get::<tables::PartialStateAccounts>(hash)?.is_some() {
+            let availability = provider
+                .tx_ref()
+                .get::<tables::PartialStateAvailability>(hash)?
+                .ok_or(PartialStateReadError::MissingAvailability(hash))?;
+            let root = provider
+                .tx_ref()
+                .get::<tables::PartialStateStorageRoots>(hash)?
+                .unwrap_or(EMPTY_ROOT_HASH);
+            if availability.storage && root != EMPTY_ROOT_HASH {
+                outcome.accounts_expired += 1;
+            }
+        }
+        outcome.slots_deleted += provider
+            .tx_ref()
+            .cursor_dup_read::<tables::PartialStateStorages>()?
+            .walk_dup(Some(hash), None)?
+            .try_fold(0, |count, entry| entry.map(|_| count + 1))?;
+    }
+    let mut journal = provider.tx_ref().cursor_read::<tables::PartialStateAccountChangeSets>()?;
+    for entry in journal.walk(None)? {
+        let (number, before) = entry?;
+        if addresses.contains(&before.address) {
+            let key = BlockNumberAddress((number, before.address));
+            provider
+                .tx_ref()
+                .get::<tables::PartialStateAvailabilityChangeSets>(key)?
+                .ok_or(PartialStateReadError::MissingAvailability(keccak256(before.address)))?;
+            outcome.journal_slots_deleted += provider
+                .tx_ref()
+                .cursor_dup_read::<tables::PartialStateStorageChangeSets>()?
+                .walk_dup(Some(key), None)?
+                .try_fold(0, |count, entry| entry.map(|_| count + 1))?;
+        }
+    }
+    Ok(outcome)
 }
 
 #[cfg(test)]

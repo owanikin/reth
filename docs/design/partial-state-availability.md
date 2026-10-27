@@ -1,7 +1,7 @@
 # Partial-state availability
 
 Availability metadata is the groundwork for explicit storage expiry. There is no
-automatic expiry policy, deletion command, timer, on-demand reacquisition, or
+automatic expiry policy, timer, on-demand reacquisition, or
 shared-bytecode garbage collection.
 
 `PartialStateAvailability` records whether each account's complete storage and
@@ -40,7 +40,8 @@ availability so a later revert cannot re-enable deleted storage.
 expires the selected tracked contracts' storage. It returns counts of accounts
 newly made unavailable, current slots deleted, and journal slots deleted.
 The caller explicitly chooses the addresses; age-based selection is not implemented.
-This provider API is not exposed as a CLI command or RPC method.
+The offline `reth db partial-state-expire` command exposes this operation for
+stopped followers. There is no expiry RPC method.
 
 The operation takes one write transaction, requires the expected complete checkpoint
 and filter identity, and verifies the partial root before and after deletion. It
@@ -65,6 +66,48 @@ complete storage from that known-empty base. Expiry is not a permanent blacklist
 or a change to the configured tracking policy. General verified reacquisition is
 still separate work.
 
+### Offline operator command
+
+Stop the follower before previewing or applying expiry. Both modes require exclusive
+MDBX access, including against processes in other container PID namespaces. Keep the
+full producer running. Use the same binary/image, datadir, chain, and complete
+follower configuration used to launch the follower; do not point this command at the
+producer's database. A backup is recommended: general storage reacquisition is not
+implemented.
+
+```sh
+reth --quiet db --datadir "$DATADIR" --chain "$CHAIN" --config "$CONFIG" \
+  partial-state-expire --address "$ADDRESS"
+```
+
+Preview opens MDBX read-only and prints JSON with `applied: false`, the checkpoint,
+filter hash, deduplicated addresses, and the proposed counts. No state rows change.
+Copy the returned `block_hash` into `CHECKPOINT_HASH`, then explicitly apply:
+
+```sh
+reth --quiet db --datadir "$DATADIR" --chain "$CHAIN" --config "$CONFIG" \
+  partial-state-expire --address "$ADDRESS" \
+  --apply --expected-block-hash "$CHECKPOINT_HASH"
+```
+
+`--address` is repeatable or comma-separated. The command requires `enabled = true`
+and `follower = true` in the config and reads the full filter from that config (and
+its optional contracts file). CLI-only launch overrides are not inferred; use an
+explicit configuration matching the checkpoint filter. Relative contracts-file
+paths resolve from the working directory, as on node launch.
+
+Missing/malformed config, wrong chain/genesis, advanced normal `Finish`, incomplete
+or stale checkpoints, mismatched filters/headers, corrupt state and untracked targets
+are rejected. Apply verifies the root before and after the atomic mutation; preview
+checks the current root and journal metadata. Neither mode initializes genesis,
+creates missing stores/tables, migrates data, or repairs/unwinds storage. Auxiliary
+stores are read-only (RocksDB may create temporary secondary-reader files); applying
+also uses the usual MDBX lock file. Logical deletion is not a file-size guarantee.
+
+Restart the follower on the same database afterwards. Non-empty expired storage
+must return explicit unavailable-state errors, while subsequent BALs can advance
+its preserved commitments. Offline CLI tests are not a live Kurtosis expiry run.
+
 This is a blocking research API: it computes the partial root twice and scans
 retained account journals. Async callers must use a blocking task. An in-flight
 transition resolved before expiry may need to retry resolution for newly unavailable
@@ -85,6 +128,7 @@ hand. Full-node state tables and their encoding are unchanged.
 ```sh
 cargo test -p reth-provider partial_ --lib --offline -j 2
 cargo test -p reth-provider partial_state_expiry --lib --offline -j 2 -- --test-threads=1
+cargo test -p reth-cli-commands partial_state_expire --lib --offline -j 2 -- --test-threads=1
 cargo test -p reth-node-builder partial_availability --lib --offline -j 2
 cargo test -p reth-node-builder --test follower --offline -j 2 -- --test-threads=1
 python3 -m unittest discover -s scripts/partial-state-follower -p 'test_*.py'

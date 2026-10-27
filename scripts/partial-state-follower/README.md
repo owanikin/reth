@@ -83,6 +83,17 @@ persisted state, normal full-state tables must remain unchanged, and Engine resp
 must remain `SYNCING`. This is an isolated Rust integration test with a scripted
 peer, not a live Kurtosis expiry test or an automatic expiry policy.
 
+An offline operator command is also available: `reth db partial-state-expire`.
+It previews by default and requires `--apply --expected-block-hash` to delete
+selected storage. Both modes require the follower to be stopped; they do not stop
+containers for you. See [offline expiry](../../docs/design/partial-state-availability.md#offline-operator-command)
+for configuration, safety checks and usage. Ordinary smoke tests do not invoke it.
+
+```sh
+cargo test -p reth-cli-commands partial_state_expire \
+  --lib --offline -j 2 -- --test-threads=1
+```
+
 ## Producer setup
 
 Availability metadata adds two tables to the lifecycle checks. Existing completed

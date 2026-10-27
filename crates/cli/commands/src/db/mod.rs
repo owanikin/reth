@@ -17,6 +17,7 @@ mod diff;
 mod get;
 mod list;
 mod migrate_v2;
+mod partial_state_expire;
 mod prune_checkpoints;
 mod repair_trie;
 mod settings;
@@ -81,6 +82,8 @@ pub enum Subcommands {
     /// Migrate storage layout from v1 (MDBX-only) to v2 (static files + RocksDB)
     #[command(name = "migrate-v2")]
     MigrateV2(migrate_v2::Command),
+    /// Preview or apply storage expiry on a stopped partial-state follower
+    PartialStateExpire(partial_state_expire::Command),
 }
 
 impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C> {
@@ -117,6 +120,13 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C>
         eyre::ensure!(db_path.is_dir(), "Database does not exist: {:?}", db_path);
 
         match self.command {
+            Subcommands::PartialStateExpire(command) => {
+                let report = tokio::task::spawn_blocking(move || {
+                    command.execute::<C, N>(&self.env, ctx.task_executor)
+                })
+                .await??;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
             // TODO: We'll need to add this on the DB trait.
             Subcommands::Stats(command) => {
                 let access_rights = if command.skip_consistency_checks {
